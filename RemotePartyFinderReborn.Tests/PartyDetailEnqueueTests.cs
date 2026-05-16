@@ -1,0 +1,75 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Xunit;
+
+namespace RemotePartyFinderReborn.Tests;
+
+public sealed class PartyDetailEnqueueTests {
+    [Fact]
+    public void BuildDetailEnqueueSet_includes_leader_and_nonzero_members() {
+        var payload = new UploadablePartyDetail {
+            LeaderContentId = 111UL,
+            MemberContentIds = [0UL, 222UL, 333UL, 222UL, 0UL],
+        };
+
+        var contentIds = PartyDetailContentIdEnrichment.BuildContentIdsForResolve(payload);
+
+        Assert.Equal(new HashSet<ulong> { 111UL, 222UL, 333UL }, contentIds.ToHashSet());
+    }
+
+    [Fact]
+    public void BuildDetailEnqueueSet_includes_alliance_members_without_truncating_to_eight() {
+        var memberContentIds = Enumerable.Range(0, 24)
+            .Select(index => 10_000UL + (ulong)index)
+            .ToList();
+
+        var payload = new UploadablePartyDetail {
+            LeaderContentId = 10_000UL,
+            MemberContentIds = memberContentIds,
+        };
+
+        var contentIds = PartyDetailContentIdEnrichment.BuildContentIdsForResolve(payload);
+
+        Assert.DoesNotContain(0UL, contentIds);
+        Assert.Contains(10_008UL, contentIds);
+        Assert.Contains(10_023UL, contentIds);
+        Assert.Equal(24, contentIds.Count);
+    }
+
+    [Fact]
+    public void DetailUpload_path_continues_when_enrichment_is_disabled() {
+        var payload = new UploadablePartyDetail {
+            LeaderContentId = 111UL,
+            MemberContentIds = [0UL, 222UL],
+        };
+
+        List<ulong>? captured = null;
+        var exception = Record.Exception(() => {
+            var enqueued = PartyDetailContentIdEnrichment.TryEnqueueForResolve(payload, contentIds => {
+                captured = contentIds.ToList();
+                throw new InvalidOperationException("enrichment disabled");
+            });
+
+            Assert.False(enqueued);
+        });
+
+        Assert.Null(exception);
+        Assert.Equal([111UL, 222UL], captured);
+    }
+
+    [Fact]
+    public void SnapshotValidity_requires_nonzero_member_content() {
+        var payload = new UploadablePartyDetail {
+            ListingId = 9001U,
+            LeaderContentId = 111UL,
+            LeaderName = "Leader",
+            HomeWorld = 77,
+            MemberContentIds = [0UL, 0UL],
+            MemberJobs = [19, 24],
+            SlotFlags = ["0x0", "0x0"],
+        };
+
+        Assert.False(PartyDetailUploadPolicy.IsSnapshotReadyForEnqueue(payload));
+    }
+}

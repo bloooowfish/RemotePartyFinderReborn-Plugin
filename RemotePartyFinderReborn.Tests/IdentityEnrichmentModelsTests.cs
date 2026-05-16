@@ -1,0 +1,248 @@
+using System.Text.Json;
+using Xunit;
+
+namespace RemotePartyFinderReborn.Tests;
+
+public sealed class IdentityEnrichmentModelsTests {
+    [Fact]
+    public void Enqueue_skips_duplicate_content_ids_when_already_inflight() {
+        var nowUtc = new DateTime(2026, 4, 12, 12, 0, 0, DateTimeKind.Utc);
+        var queue = new ContentIdResolveQueue();
+
+        Assert.True(queue.Enqueue(1001UL, nowUtc));
+        Assert.True(queue.TryStartNext(nowUtc, out var request));
+        Assert.Equal(1001UL, request.ContentId);
+        Assert.Equal(ResolveState.InFlight, queue.GetState(1001UL));
+
+        Assert.False(queue.Enqueue(1001UL, nowUtc.AddSeconds(1)));
+    }
+
+    [Fact]
+    public void Build_identity_payload_includes_world_name_when_present() {
+        var observedAtUtc = new DateTime(2026, 4, 12, 12, 30, 0, DateTimeKind.Utc);
+        var snapshot = new CharacterIdentitySnapshot(
+            2002UL,
+            "Alpha Beta",
+            74,
+            "Tonberry",
+            observedAtUtc
+        );
+
+        var payload = CharacterIdentityUploadPayload.FromSnapshot(snapshot, observedAtUtc);
+
+        Assert.Equal(snapshot.ContentId, payload.ContentId);
+        Assert.Equal(snapshot.Name, payload.Name);
+        Assert.Equal(snapshot.HomeWorld, payload.HomeWorld);
+        Assert.Equal("Tonberry", payload.WorldName);
+        Assert.Equal("chara_card", payload.Source);
+        Assert.Equal(observedAtUtc, payload.ObservedAtUtc);
+    }
+
+    [Fact]
+    public void IdentityUploadPayload_serializes_content_name_world_and_source() {
+        var observedAtUtc = new DateTime(2026, 4, 12, 12, 30, 0, DateTimeKind.Utc);
+        var snapshot = new CharacterIdentitySnapshot(
+            9009UL,
+            "Sigma Taro",
+            74,
+            "Tonberry",
+            observedAtUtc
+        );
+
+        var payload = CharacterIdentityUploadPayload.FromSnapshot(snapshot, observedAtUtc, "party_detail");
+        var json = JsonSerializer.Serialize(payload);
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+
+        Assert.Equal(9009UL, root.GetProperty("content_id").GetUInt64());
+        Assert.Equal("Sigma Taro", root.GetProperty("name").GetString());
+        Assert.Equal((uint)74, root.GetProperty("home_world").GetUInt32());
+        Assert.Equal("Tonberry", root.GetProperty("world_name").GetString());
+        Assert.Equal("party_detail", root.GetProperty("source").GetString());
+        Assert.Equal("2026-04-12T12:30:00Z", root.GetProperty("observed_at").GetString());
+    }
+
+    [Fact]
+    public void IdentityUploadPayload_normalizes_observed_at_to_utc_before_serialization() {
+        var localObservedAt = DateTime.SpecifyKind(new DateTime(2026, 4, 12, 21, 30, 0), DateTimeKind.Local);
+        var snapshot = new CharacterIdentitySnapshot(
+            9010UL,
+            "Utc Normalized",
+            74,
+            "Tonberry",
+            localObservedAt.ToUniversalTime()
+        );
+
+        var payload = CharacterIdentityUploadPayload.FromSnapshot(snapshot, localObservedAt, "party_detail");
+        var json = JsonSerializer.Serialize(payload);
+        using var document = JsonDocument.Parse(json);
+
+        Assert.Equal(DateTimeKind.Utc, payload.ObservedAtUtc.Kind);
+        Assert.Equal(localObservedAt.ToUniversalTime(), payload.ObservedAtUtc);
+        Assert.EndsWith("Z", document.RootElement.GetProperty("observed_at").GetString());
+    }
+
+    [Fact]
+    public void IdentityUploadPayload_treats_unspecified_observed_at_as_already_utc() {
+        var unspecifiedObservedAt = DateTime.SpecifyKind(
+            new DateTime(2026, 4, 12, 12, 30, 0),
+            DateTimeKind.Unspecified
+        );
+        var snapshot = new CharacterIdentitySnapshot(
+            9011UL,
+            "Utc Unspecified",
+            74,
+            "Tonberry",
+            DateTime.SpecifyKind(unspecifiedObservedAt, DateTimeKind.Utc)
+        );
+
+        var payload = CharacterIdentityUploadPayload.FromSnapshot(snapshot, unspecifiedObservedAt, "party_detail");
+        var json = JsonSerializer.Serialize(payload);
+        using var document = JsonDocument.Parse(json);
+
+        Assert.Equal(DateTimeKind.Utc, payload.ObservedAtUtc.Kind);
+        Assert.Equal(new DateTime(2026, 4, 12, 12, 30, 0, DateTimeKind.Utc), payload.ObservedAtUtc);
+        Assert.Equal("2026-04-12T12:30:00Z", document.RootElement.GetProperty("observed_at").GetString());
+    }
+
+    [Fact]
+    public void Mark_timeout_moves_request_to_transient_failure() {
+        var nowUtc = new DateTime(2026, 4, 12, 13, 0, 0, DateTimeKind.Utc);
+        var queue = new ContentIdResolveQueue();
+
+        Assert.True(queue.Enqueue(3003UL, nowUtc));
+        Assert.True(queue.TryStartNext(nowUtc, out var requestLease));
+
+        Assert.True(queue.MarkTimeout(3003UL, requestLease.AttemptVersion, nowUtc.AddSeconds(5)));
+
+        var request = Assert.Single(queue.Requests);
+        Assert.Equal(ResolveState.FailedTransient, request.State);
+        Assert.Equal(nowUtc.AddSeconds(15), request.NextEligibleAttemptAtUtc);
+    }
+
+    [Fact]
+    public void Backoff_schedule_advances_10s_then_permanent_on_second_failure() {
+        var baseUtc = new DateTime(2026, 4, 12, 14, 0, 0, DateTimeKind.Utc);
+        var queue = new ContentIdResolveQueue();
+
+        Assert.True(queue.Enqueue(4004UL, baseUtc));
+
+        Assert.True(queue.TryStartNext(baseUtc, out var firstAttempt));
+        Assert.True(queue.MarkTimeout(4004UL, firstAttempt.AttemptVersion, baseUtc));
+        Assert.Equal(baseUtc.AddSeconds(10), queue.GetRequest(4004UL).NextEligibleAttemptAtUtc);
+
+        Assert.True(queue.TryStartNext(baseUtc.AddSeconds(10), out var secondAttempt));
+        Assert.True(queue.MarkTimeout(4004UL, secondAttempt.AttemptVersion, baseUtc.AddSeconds(10)));
+        Assert.Equal(ResolveState.FailedPermanent, queue.GetRequest(4004UL).State);
+        Assert.False(queue.TryStartNext(baseUtc.AddSeconds(100), out _));
+    }
+
+    [Fact]
+    public void Local_failures_share_same_retry_cap_as_timeouts() {
+        var baseUtc = new DateTime(2026, 4, 12, 14, 30, 0, DateTimeKind.Utc);
+        var queue = new ContentIdResolveQueue();
+
+        Assert.True(queue.Enqueue(4014UL, baseUtc));
+
+        Assert.True(queue.TryStartNext(baseUtc, out var firstAttempt));
+        Assert.True(queue.MarkLocalFailure(4014UL, firstAttempt.AttemptVersion, baseUtc));
+        Assert.Equal(ResolveState.FailedTransient, queue.GetRequest(4014UL).State);
+        Assert.Equal(baseUtc.AddSeconds(10), queue.GetRequest(4014UL).NextEligibleAttemptAtUtc);
+
+        Assert.True(queue.TryStartNext(baseUtc.AddSeconds(10), out var secondAttempt));
+        Assert.True(queue.MarkLocalFailure(4014UL, secondAttempt.AttemptVersion, baseUtc.AddSeconds(10)));
+        Assert.Equal(ResolveState.FailedPermanent, queue.GetRequest(4014UL).State);
+        Assert.False(queue.TryStartNext(baseUtc.AddSeconds(100), out _));
+    }
+
+    [Fact]
+    public void Fresh_resolved_identity_is_not_requeued_within_ttl() {
+        var resolvedAtUtc = new DateTime(2026, 4, 12, 15, 0, 0, DateTimeKind.Utc);
+        var queue = new ContentIdResolveQueue();
+        var snapshot = new CharacterIdentitySnapshot(
+            5005UL,
+            "Gamma Delta",
+            21,
+            "Ravana",
+            resolvedAtUtc
+        );
+
+        queue.MarkResolved(snapshot);
+
+        Assert.False(queue.Enqueue(5005UL, resolvedAtUtc.AddHours(1)));
+        Assert.Equal(ResolveState.Resolved, queue.GetState(5005UL));
+    }
+
+    [Fact]
+    public void Enqueue_does_not_reset_backoff_for_failed_transient_request() {
+        var nowUtc = new DateTime(2026, 4, 13, 0, 0, 0, DateTimeKind.Utc);
+        var queue = new ContentIdResolveQueue();
+
+        Assert.True(queue.Enqueue(6006UL, nowUtc));
+        Assert.True(queue.TryStartNext(nowUtc, out var attempt));
+        Assert.True(queue.MarkTimeout(6006UL, attempt.AttemptVersion, nowUtc.AddSeconds(1)));
+
+        var nextEligible = queue.GetRequest(6006UL).NextEligibleAttemptAtUtc;
+
+        Assert.False(queue.Enqueue(6006UL, nowUtc.AddSeconds(2)));
+        Assert.Equal(ResolveState.FailedTransient, queue.GetState(6006UL));
+        Assert.Equal(nextEligible, queue.GetRequest(6006UL).NextEligibleAttemptAtUtc);
+    }
+
+    [Fact]
+    public void Mark_timeout_ignores_stale_attempt_after_newer_attempt_started() {
+        var nowUtc = new DateTime(2026, 4, 13, 1, 0, 0, DateTimeKind.Utc);
+        var queue = new ContentIdResolveQueue();
+
+        Assert.True(queue.Enqueue(7007UL, nowUtc));
+        Assert.True(queue.TryStartNext(nowUtc, out var firstAttempt));
+        Assert.True(queue.MarkTimeout(7007UL, firstAttempt.AttemptVersion, nowUtc.AddSeconds(1)));
+        Assert.True(queue.TryStartNext(nowUtc.AddSeconds(11), out var secondAttempt));
+
+        Assert.False(queue.MarkTimeout(7007UL, firstAttempt.AttemptVersion, nowUtc.AddSeconds(12)));
+
+        var request = queue.GetRequest(7007UL);
+        Assert.Equal(ResolveState.InFlight, request.State);
+        Assert.Equal(secondAttempt.AttemptVersion, request.AttemptVersion);
+        Assert.Equal(nowUtc.AddSeconds(11), request.LastRequestedAtUtc);
+    }
+
+    [Fact]
+    public void Mark_timeout_ignores_stale_attempt_after_request_was_resolved() {
+        var nowUtc = new DateTime(2026, 4, 13, 2, 0, 0, DateTimeKind.Utc);
+        var queue = new ContentIdResolveQueue();
+
+        Assert.True(queue.Enqueue(8008UL, nowUtc));
+        Assert.True(queue.TryStartNext(nowUtc, out var firstAttempt));
+
+        var snapshot = new CharacterIdentitySnapshot(
+            8008UL,
+            "Late Resolve",
+            42,
+            "Kujata",
+            nowUtc.AddSeconds(2)
+        );
+        queue.MarkResolved(snapshot);
+
+        Assert.False(queue.MarkTimeout(8008UL, firstAttempt.AttemptVersion, nowUtc.AddSeconds(3)));
+
+        var request = queue.GetRequest(8008UL);
+        Assert.Equal(ResolveState.Resolved, request.State);
+        Assert.Equal(snapshot.LastResolvedAtUtc, request.LastResolvedAtUtc);
+    }
+
+    [Fact]
+    public void Enqueue_does_not_requeue_permanently_failed_request() {
+        var nowUtc = new DateTime(2026, 4, 13, 3, 0, 0, DateTimeKind.Utc);
+        var queue = new ContentIdResolveQueue();
+
+        Assert.True(queue.Enqueue(9009UL, nowUtc));
+        Assert.True(queue.TryStartNext(nowUtc, out var firstAttempt));
+        Assert.True(queue.MarkTimeout(9009UL, firstAttempt.AttemptVersion, nowUtc.AddSeconds(1)));
+        Assert.True(queue.TryStartNext(nowUtc.AddSeconds(11), out var secondAttempt));
+        Assert.True(queue.MarkTimeout(9009UL, secondAttempt.AttemptVersion, nowUtc.AddSeconds(12)));
+
+        Assert.Equal(ResolveState.FailedPermanent, queue.GetState(9009UL));
+        Assert.False(queue.Enqueue(9009UL, nowUtc.AddMinutes(5)));
+    }
+}

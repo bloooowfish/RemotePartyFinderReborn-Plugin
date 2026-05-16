@@ -1,0 +1,24 @@
+{
+  "graph": [
+    {
+      "name": "Overall",
+      "percentile": 99,
+      "rank": 1
+    },
+    {
+      "phaseName": "P1",
+      "rankPercentile": 88
+    },
+    {
+      "phase_name": "P2",
+      "bestPull": "not-a-percent"
+    },
+    {
+      "mechanic": {
+        "name": "P3",
+        "number": 3
+      },
+      "historical_percentile": "12%"
+    }
+  ]
+}

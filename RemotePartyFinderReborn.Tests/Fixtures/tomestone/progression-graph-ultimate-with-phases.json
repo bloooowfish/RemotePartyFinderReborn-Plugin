@@ -1,0 +1,41 @@
+{
+  "data": {
+    "graph": [
+      {
+        "phase": {
+          "name": "P2",
+          "number": 2
+        },
+        "bestPull": "30%"
+      },
+      {
+        "phase": {
+          "name": "P1",
+          "number": 1
+        },
+        "best_pull": "12%"
+      },
+      {
+        "phase_name": "P3",
+        "order": 3,
+        "percentage": "55.5%"
+      },
+      {
+        "phase": {
+          "name": "P2",
+          "order": 2
+        },
+        "boss_percentage": "24%"
+      },
+      {
+        "bestPull": "10%"
+      },
+      {
+        "name": "P4",
+        "order": 4,
+        "bestPullsLabel": "Best Pulls",
+        "Best Pulls": "101%"
+      }
+    ]
+  }
+}
