@@ -15,7 +15,7 @@ public sealed class FFLogsBatchProcessorTests
     {
         var apiClient = new StubFFLogsApiClient
         {
-            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _, _) =>
+            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _) =>
             {
                 var output = new Dictionary<string, FFLogsClient.CharacterFetchedData>();
                 foreach (var query in queries)
@@ -34,7 +34,6 @@ public sealed class FFLogsBatchProcessorTests
                                     ClearCount = 2,
                                 },
                             ],
-                            RecentReportCodes = ["ALPHA"],
                         },
                         "Beta" => new FFLogsClient.CharacterFetchedData
                         {
@@ -48,7 +47,6 @@ public sealed class FFLogsBatchProcessorTests
                                     ClearCount = 5,
                                 },
                             ],
-                            RecentReportCodes = ["BETA"],
                         },
                         _ => new FFLogsClient.CharacterFetchedData(),
                     };
@@ -84,11 +82,48 @@ public sealed class FFLogsBatchProcessorTests
     }
 
     [Fact]
+    public async Task Batch_processor_processes_candidate_fetch_without_recent_report_dependency()
+    {
+        var apiClient = new StubFFLogsApiClient
+        {
+            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _) =>
+            {
+                return Task.FromResult(new Dictionary<string, FFLogsClient.CharacterFetchedData>
+                {
+                    [queries[0].Key] = new FFLogsClient.CharacterFetchedData
+                    {
+                        Hidden = false,
+                        Parses =
+                        [
+                            new FFLogsClient.CharacterEncounterParse
+                            {
+                                EncounterId = 88,
+                                Percentile = 80.1,
+                                ClearCount = 2,
+                            },
+                        ],
+                    },
+                });
+            },
+        };
+        var processor = CreateProcessor(apiClient);
+        var session = new FFLogsLeaseSession(
+            new UploadUrl("https://session-owner.example/"),
+            [CreateJob(contentId: 1101, server: "Tonberry")]);
+
+        var result = await processor.ProcessLeaseSessionAsync(session, CancellationToken.None);
+
+        var parse = Assert.Single(result.ProcessedResults);
+        Assert.Equal(80.1, parse.Encounters[88], 3);
+        Assert.Equal(2, parse.ClearCounts[88]);
+    }
+
+    [Fact]
     public async Task Prefers_hidden_real_parse_over_visible_none()
     {
         var apiClient = new StubFFLogsApiClient
         {
-            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _, _) =>
+            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _) =>
             {
                 var output = new Dictionary<string, FFLogsClient.CharacterFetchedData>();
                 foreach (var query in queries)
@@ -99,7 +134,6 @@ public sealed class FFLogsBatchProcessorTests
                         {
                             Hidden = false,
                             Parses = [],
-                            RecentReportCodes = [],
                         },
                         "HiddenParsed" => new FFLogsClient.CharacterFetchedData
                         {
@@ -113,7 +147,6 @@ public sealed class FFLogsBatchProcessorTests
                                     ClearCount = 1,
                                 },
                             ],
-                            RecentReportCodes = ["HIDDEN-REPORT"],
                         },
                         _ => new FFLogsClient.CharacterFetchedData(),
                     };
@@ -146,10 +179,9 @@ public sealed class FFLogsBatchProcessorTests
     [Fact]
     public async Task Batch_processor_preserves_hidden_parse_results_without_progress_enrichment()
     {
-        var progressCalls = 0;
         var apiClient = new StubFFLogsApiClient
         {
-            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _, _) =>
+            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _) =>
             {
                 return Task.FromResult(new Dictionary<string, FFLogsClient.CharacterFetchedData>
                 {
@@ -165,14 +197,8 @@ public sealed class FFLogsBatchProcessorTests
                                 ClearCount = 9,
                             },
                         ],
-                        RecentReportCodes = ["HIDDEN"],
                     },
                 });
-            },
-            OnFetchBestBossPercentByReportAsync = (_, _, _, _) =>
-            {
-                progressCalls++;
-                return Task.FromResult(new Dictionary<string, double>());
             },
         };
         var processor = CreateProcessor(apiClient);
@@ -187,66 +213,6 @@ public sealed class FFLogsBatchProcessorTests
         Assert.Empty(parse.Encounters);
         Assert.Empty(parse.ClearCounts);
         Assert.Empty(parse.BossPercentages);
-        Assert.Equal(0, progressCalls);
-    }
-
-    [Fact]
-    public async Task Batch_processor_merges_recent_report_progress_for_needed_encounters()
-    {
-        var progressEncounterIds = new List<int>();
-        var apiClient = new StubFFLogsApiClient
-        {
-            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _, _) =>
-            {
-                return Task.FromResult(new Dictionary<string, FFLogsClient.CharacterFetchedData>
-                {
-                    [queries[0].Key] = new FFLogsClient.CharacterFetchedData
-                    {
-                        Hidden = false,
-                        Parses =
-                        [
-                            new FFLogsClient.CharacterEncounterParse
-                            {
-                                EncounterId = 88,
-                                Percentile = 91.2,
-                                ClearCount = 4,
-                            },
-                        ],
-                        RecentReportCodes = ["REP1", "REP2", "REP3"],
-                    },
-                });
-            },
-            OnFetchBestBossPercentByReportAsync = (_, encounterId, _, _) =>
-            {
-                progressEncounterIds.Add(encounterId);
-                return Task.FromResult(encounterId switch
-                {
-                    88 => new Dictionary<string, double>
-                    {
-                        ["REP1"] = 17.5,
-                        ["REP2"] = 9.8,
-                    },
-                    99 => new Dictionary<string, double>
-                    {
-                        ["REP2"] = 43.2,
-                        ["REP3"] = 12.4,
-                    },
-                    _ => new Dictionary<string, double>(),
-                });
-            },
-        };
-        var processor = CreateProcessor(apiClient);
-        var session = new FFLogsLeaseSession(
-            new UploadUrl("https://session-owner.example/"),
-            [CreateJob(contentId: 3001, server: "Visible", secondaryEncounterId: 99)]);
-
-        var result = await processor.ProcessLeaseSessionAsync(session, CancellationToken.None);
-
-        var parse = Assert.Single(result.ProcessedResults);
-        Assert.Equal([88, 99], progressEncounterIds.OrderBy(static value => value));
-        Assert.Equal(9.8, parse.BossPercentages[88], 3);
-        Assert.Equal(12.4, parse.BossPercentages[99], 3);
-        Assert.Equal(91.2, parse.Encounters[88], 3);
     }
 
     [Fact]
@@ -254,7 +220,7 @@ public sealed class FFLogsBatchProcessorTests
     {
         var apiClient = new StubFFLogsApiClient
         {
-            OnFetchCharacterCandidateDataBatchOutcomeAsync = static (_, _, _, _, _) =>
+            OnFetchCharacterCandidateDataBatchOutcomeAsync = static (_, _, _, _) =>
                 Task.FromResult(OperationOutcome<Dictionary<string, FFLogsClient.CharacterFetchedData>>.Failure(
                     transientFailure: true,
                     "candidate fetch failed")),
@@ -273,46 +239,36 @@ public sealed class FFLogsBatchProcessorTests
     }
 
     [Fact]
-    public async Task Batch_processor_reports_transient_failure_when_best_boss_percent_fetch_fails()
+    public async Task Batch_processor_submits_tomestone_progress_when_fflogs_candidate_fetch_fails()
     {
         var apiClient = new StubFFLogsApiClient
         {
-            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _, _) =>
-            {
-                return Task.FromResult(new Dictionary<string, FFLogsClient.CharacterFetchedData>
-                {
-                    [queries[0].Key] = new FFLogsClient.CharacterFetchedData
-                    {
-                        Hidden = false,
-                        Parses =
-                        [
-                            new FFLogsClient.CharacterEncounterParse
-                            {
-                                EncounterId = 88,
-                                Percentile = 91.2,
-                                ClearCount = 4,
-                            },
-                        ],
-                        RecentReportCodes = ["REP1"],
-                    },
-                });
-            },
-            OnFetchBestBossPercentByReportOutcomeAsync = static (_, _, _, _) =>
-                Task.FromResult(OperationOutcome<Dictionary<string, double>>.Failure(
+            OnFetchCharacterCandidateDataBatchOutcomeAsync = static (_, _, _, _) =>
+                Task.FromResult(OperationOutcome<Dictionary<string, FFLogsClient.CharacterFetchedData>>.Failure(
                     transientFailure: true,
-                    "best boss fetch failed")),
+                    "candidate fetch failed")),
         };
-        var processor = CreateProcessor(apiClient);
+        var tomestoneClient = new StubTomestoneApiClient
+        {
+            OnFetchProgressionDataAsync = static (_, _, _, _, _) =>
+                Task.FromResult(new TomestoneProgressData([], 34.5)),
+        };
+        var processor = CreateProcessor(apiClient, tomestoneClient);
         var session = new FFLogsLeaseSession(
             new UploadUrl("https://session-owner.example/"),
-            [CreateJob(contentId: 3601, server: "Tonberry")]);
+            [CreateJob(contentId: 3502, server: "Tonberry", zoneId: 73, encounterId: 102)]);
 
         var result = await processor.ProcessLeaseSessionAsync(session, CancellationToken.None);
 
         var parse = Assert.Single(result.ProcessedResults);
+        Assert.Equal(3502UL, parse.ContentId);
+        Assert.Equal("tomestone_api", parse.SourceKind);
+        Assert.Equal(34.5, parse.BossPercentages[102], 3);
+        Assert.Empty(parse.Encounters);
+        Assert.Empty(parse.ClearCounts);
         Assert.True(result.HadTransientFailure);
-        Assert.Empty(parse.BossPercentages);
-        Assert.Equal(91.2, parse.Encounters[88], 3);
+        Assert.False(result.HitRateLimitCooldown);
+        Assert.False(result.ShouldAbandonRemainingLeases);
     }
 
     [Fact]
@@ -320,7 +276,7 @@ public sealed class FFLogsBatchProcessorTests
     {
         var apiClient = new StubFFLogsApiClient
         {
-            OnFetchCharacterCandidateDataBatchOutcomeAsync = static (_, _, _, _, _) =>
+            OnFetchCharacterCandidateDataBatchOutcomeAsync = static (_, _, _, _) =>
                 Task.FromResult(OperationOutcome<Dictionary<string, FFLogsClient.CharacterFetchedData>>.Failure(
                     transientFailure: false,
                     "Cannot query field staleField")),
@@ -344,7 +300,7 @@ public sealed class FFLogsBatchProcessorTests
         var cooldownChecks = 0;
         var apiClient = new StubFFLogsApiClient
         {
-            OnFetchCharacterCandidateDataBatchOutcomeAsync = static (_, _, _, _, _) =>
+            OnFetchCharacterCandidateDataBatchOutcomeAsync = static (_, _, _, _) =>
                 Task.FromResult(OperationOutcome<Dictionary<string, FFLogsClient.CharacterFetchedData>>.Failure(
                     transientFailure: true,
                     "rate limited")),
@@ -600,13 +556,13 @@ public sealed class FFLogsBatchProcessorTests
         Assert.Equal(5003UL, parse.ContentId);
         Assert.Empty(parse.PhaseProgress);
         Assert.Single(tomestoneClient.Requests);
-        Assert.True(result.HadTransientFailure);
+        Assert.False(result.HadTransientFailure);
         Assert.False(result.HitRateLimitCooldown);
         Assert.False(result.ShouldAbandonRemainingLeases);
     }
 
     [Fact]
-    public async Task Batch_processor_reports_transient_failure_when_tomestone_progress_fetch_fails()
+    public async Task Batch_processor_does_not_report_transient_failure_when_tomestone_progress_fetch_fails()
     {
         var apiClient = CreateVisibleApiClient(encounterId: 1079);
         var tomestoneClient = new StubTomestoneApiClient
@@ -626,7 +582,7 @@ public sealed class FFLogsBatchProcessorTests
         var parse = Assert.Single(result.ProcessedResults);
         Assert.Equal(5003UL, parse.ContentId);
         Assert.Empty(parse.PhaseProgress);
-        Assert.True(result.HadTransientFailure);
+        Assert.False(result.HadTransientFailure);
         Assert.False(result.HitRateLimitCooldown);
         Assert.False(result.ShouldAbandonRemainingLeases);
     }
@@ -687,7 +643,7 @@ public sealed class FFLogsBatchProcessorTests
     {
         var apiClient = new StubFFLogsApiClient
         {
-            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _, _) =>
+            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _) =>
             {
                 var output = new Dictionary<string, FFLogsClient.CharacterFetchedData>();
                 foreach (var query in queries)
@@ -703,7 +659,6 @@ public sealed class FFLogsBatchProcessorTests
                                 Percentile = query.Server == "Beta" ? 95.0 : 10.0,
                             },
                         ],
-                        RecentReportCodes = [],
                     };
                 }
 
@@ -733,6 +688,50 @@ public sealed class FFLogsBatchProcessorTests
         Assert.Equal("Beta", parse.MatchedServer);
         var request = Assert.Single(tomestoneClient.Requests);
         Assert.Equal("Beta", request.Server);
+    }
+
+    [Fact]
+    public async Task Batch_processor_requests_tomestone_progress_without_fflogs_boss_percent_enrichment()
+    {
+        var events = new List<string>();
+        var apiClient = new StubFFLogsApiClient
+        {
+            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _) =>
+            {
+                return Task.FromResult(new Dictionary<string, FFLogsClient.CharacterFetchedData>
+                {
+                    [queries[0].Key] = new FFLogsClient.CharacterFetchedData
+                    {
+                        Hidden = false,
+                        Parses =
+                        [
+                            new FFLogsClient.CharacterEncounterParse
+                            {
+                                EncounterId = 1079,
+                                Percentile = 88.8,
+                                ClearCount = 3,
+                            },
+                        ],
+                    },
+                });
+            },
+        };
+        var tomestoneClient = new StubTomestoneApiClient
+        {
+            OnFetchProgressionDataAsync = (_, _, _, _, _) =>
+            {
+                events.Add("tomestone-progress");
+                return Task.FromResult(TomestoneProgressData.Empty);
+            },
+        };
+        var processor = CreateProcessor(apiClient, tomestoneClient);
+        var session = new FFLogsLeaseSession(
+            new UploadUrl("https://session-owner.example/"),
+            [CreateJob(contentId: 5007, server: "Tonberry", zoneId: 65, encounterId: 1079)]);
+
+        await processor.ProcessLeaseSessionAsync(session, CancellationToken.None);
+
+        Assert.Equal(["tomestone-progress"], events);
     }
 
     [Fact]
@@ -776,7 +775,7 @@ public sealed class FFLogsBatchProcessorTests
                     ? (true, TimeSpan.FromSeconds(42))
                     : (false, TimeSpan.Zero);
             },
-            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _, _) =>
+            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _) =>
             {
                 return Task.FromResult(new Dictionary<string, FFLogsClient.CharacterFetchedData>
                 {
@@ -861,6 +860,46 @@ public sealed class FFLogsBatchProcessorTests
     }
 
     [Fact]
+    public async Task Tomestone_progress_enricher_does_not_write_cleared_progress()
+    {
+        var tomestoneClient = new StubTomestoneApiClient
+        {
+            OnFetchProgressionDataAsync = static (_, _, _, _, _) =>
+                Task.FromResult(TomestoneProgressData.ClearedProgress),
+        };
+        var seams = FFLogsCollector.CreateSeams(
+            new StubFFLogsIngestHttpSender(),
+            new StubFFLogsApiClient(),
+            new ManualFFLogsTimeProvider(),
+            tomestoneClient,
+            new Configuration(),
+            static (_, _) => Task.CompletedTask);
+        var enricher = new TomestoneProgressEnricher(seams);
+        var job = CreateJob(contentId: 8002, server: "Tonberry", zoneId: 73, encounterId: 102);
+        var parseResult = new ParseResult
+        {
+            ContentId = job.ContentId,
+            MatchedServer = "Tonberry",
+        };
+        var resultsByContentId = new Dictionary<ulong, ParseResult>
+        {
+            [job.ContentId] = parseResult,
+        };
+
+        var hadTransientFailure = await enricher.EnrichProgressAsync(
+            [job],
+            resultsByContentId,
+            zoneId: 73,
+            CancellationToken.None);
+
+        Assert.False(hadTransientFailure);
+        Assert.Empty(parseResult.BossPercentages);
+        Assert.Empty(parseResult.PhaseProgress);
+        var request = Assert.Single(tomestoneClient.Requests);
+        Assert.Equal(("Player-8002", "Tonberry", 73u, 102u), request);
+    }
+
+    [Fact]
     public async Task Tomestone_progress_enricher_uses_configured_max_concurrency()
     {
         var activeRequests = 0;
@@ -935,69 +974,6 @@ public sealed class FFLogsBatchProcessorTests
         });
     }
 
-    [Fact]
-    public async Task FFLogs_boss_percent_enricher_merges_lowest_recent_report_percent_per_encounter()
-    {
-        var requests = new List<(List<string> ReportCodes, int EncounterId, int? DifficultyId)>();
-        var apiClient = new StubFFLogsApiClient
-        {
-            OnFetchBestBossPercentByReportAsync = (reportCodes, encounterId, difficultyId, _) =>
-            {
-                requests.Add((reportCodes, encounterId, difficultyId));
-                return Task.FromResult(encounterId switch
-                {
-                    88 => new Dictionary<string, double>
-                    {
-                        ["REP1"] = 17.5,
-                        ["REP2"] = 9.8,
-                    },
-                    99 => new Dictionary<string, double>
-                    {
-                        ["REP2"] = 43.2,
-                        ["REP5"] = 12.4,
-                    },
-                    _ => new Dictionary<string, double>(),
-                });
-            },
-        };
-        var seams = FFLogsCollector.CreateSeams(
-            new StubFFLogsIngestHttpSender(),
-            apiClient,
-            new ManualFFLogsTimeProvider());
-        var enricher = new FFLogsBossPercentEnricher(seams);
-        var job = CreateJob(contentId: 8101, server: "Tonberry", encounterId: 88, secondaryEncounterId: 99);
-        var parseResult = new ParseResult { ContentId = job.ContentId };
-        var resultsByContentId = new Dictionary<ulong, ParseResult>
-        {
-            [job.ContentId] = parseResult,
-        };
-        var chosenDataByContentId = new Dictionary<ulong, FFLogsClient.CharacterFetchedData>
-        {
-            [job.ContentId] = new()
-            {
-                RecentReportCodes = ["REP1", "REP2", "REP3", "REP4", "REP5", "REP6"],
-            },
-        };
-
-        var result = await enricher.EnrichBossPercentagesAsync(
-            [job],
-            resultsByContentId,
-            chosenDataByContentId,
-            difficultyId: 5,
-            CancellationToken.None);
-
-        Assert.False(result.HadTransientFailure);
-        Assert.False(result.HitRateLimitCooldown);
-        Assert.Equal(9.8, parseResult.BossPercentages[88], 3);
-        Assert.Equal(12.4, parseResult.BossPercentages[99], 3);
-        Assert.Equal([88, 99], requests.Select(static request => request.EncounterId).OrderBy(static value => value));
-        Assert.All(requests, request =>
-        {
-            Assert.Equal(["REP1", "REP2", "REP3", "REP4", "REP5"], request.ReportCodes);
-            Assert.Equal(5, request.DifficultyId);
-        });
-    }
-
     private static FFLogsBatchProcessor CreateProcessor(
         StubFFLogsApiClient apiClient,
         ITomestoneApiClient? tomestoneApiClient = null,
@@ -1035,7 +1011,7 @@ public sealed class FFLogsBatchProcessorTests
     {
         return new StubFFLogsApiClient
         {
-            OnFetchCharacterCandidateDataBatchAsync = (queries, _, _, _, _) =>
+            OnFetchCharacterCandidateDataBatchAsync = (queries, _, _, _) =>
             {
                 return Task.FromResult(new Dictionary<string, FFLogsClient.CharacterFetchedData>
                 {
@@ -1051,7 +1027,6 @@ public sealed class FFLogsBatchProcessorTests
                                 ClearCount = 3,
                             },
                         ],
-                        RecentReportCodes = [],
                     },
                 });
             },

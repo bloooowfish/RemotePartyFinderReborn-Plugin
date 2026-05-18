@@ -64,6 +64,58 @@ public static class TomestoneProgressParser
             ParseBestBossPercentage(root));
     }
 
+    public static TomestoneProgressData ParseProgress(string json, TomestoneEncounterParams target)
+    {
+        if (target is null)
+        {
+            return ParseProgress(json);
+        }
+
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return TomestoneProgressData.Empty;
+        }
+
+        JToken root;
+        try
+        {
+            root = JToken.Parse(json);
+        }
+        catch (JsonException)
+        {
+            return TomestoneProgressData.Empty;
+        }
+
+        var targetCanonicalNames = BuildTargetCanonicalNames(target);
+        if (targetCanonicalNames.Count == 0)
+        {
+            return TomestoneProgressData.Empty;
+        }
+
+        var activityFallbackCanonicalNames = BuildTargetActivityFallbackCanonicalNames(target, targetCanonicalNames);
+        var targetNodes = FindTargetEncounterNodes(root, targetCanonicalNames);
+        if (targetNodes.Any(HasCompletedActivity))
+        {
+            return TomestoneProgressData.ClearedProgress;
+        }
+
+        IReadOnlyList<PhaseProgress> phases = [];
+        if (target.ProgressKind == TomestoneProgressKind.PhaseProgress)
+        {
+            phases = ParseTargetPhaseProgress(targetNodes);
+            if (phases.Count == 0)
+            {
+                phases = ParsePhaseProgress(root);
+            }
+        }
+
+        var bossPercentage = target.ProgressKind == TomestoneProgressKind.BossPercentage
+            ? ParseTargetBossPercentage(root, targetNodes, activityFallbackCanonicalNames)
+            : null;
+
+        return new TomestoneProgressData(phases, bossPercentage);
+    }
+
     private static IReadOnlyList<PhaseProgress> ParsePhaseProgress(JToken root)
     {
         var graph = FindGraphArray(root);
@@ -93,6 +145,277 @@ public static class TomestoneProgressParser
         return values.Count == 0
             ? null
             : values.Min();
+    }
+
+    private static IReadOnlyList<string> BuildTargetCanonicalNames(TomestoneEncounterParams target)
+    {
+        var canonicalNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (target.TargetCanonicalNames is not null)
+        {
+            foreach (var canonicalName in target.TargetCanonicalNames)
+            {
+                if (!string.IsNullOrWhiteSpace(canonicalName))
+                {
+                    canonicalNames.Add(canonicalName.Trim());
+                }
+            }
+        }
+
+        if (canonicalNames.Count == 0 && !string.IsNullOrWhiteSpace(target.Encounter))
+        {
+            canonicalNames.Add(target.Encounter.Trim());
+        }
+
+        return canonicalNames.ToList();
+    }
+
+    private static IReadOnlyList<string> BuildTargetActivityFallbackCanonicalNames(
+        TomestoneEncounterParams target,
+        IReadOnlyList<string> targetCanonicalNames)
+    {
+        if (target.TargetCanonicalNames is null)
+        {
+            return targetCanonicalNames;
+        }
+
+        var explicitCanonicalNames = target.TargetCanonicalNames
+            .Where(static canonicalName => !string.IsNullOrWhiteSpace(canonicalName))
+            .Select(static canonicalName => canonicalName.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return explicitCanonicalNames.Count > 0
+            ? explicitCanonicalNames
+            : targetCanonicalNames;
+    }
+
+    private static IReadOnlyList<JObject> FindTargetEncounterNodes(
+        JToken root,
+        IReadOnlyCollection<string> targetCanonicalNames)
+    {
+        var targetNodes = new List<JObject>();
+        foreach (var property in EnumerateDescendantsAndSelf(root).OfType<JProperty>())
+        {
+            if (!string.Equals(property.Name, "encounters", StringComparison.OrdinalIgnoreCase)
+                || property.Value is not JArray encounters)
+            {
+                continue;
+            }
+
+            foreach (var encounterNode in EnumerateDescendantsAndSelf(encounters).OfType<JObject>())
+            {
+                if (ObjectMatchesTargetCanonical(encounterNode, targetCanonicalNames))
+                {
+                    targetNodes.Add(encounterNode);
+                }
+            }
+        }
+
+        return targetNodes;
+    }
+
+    private static bool HasCompletedActivity(JObject targetNode)
+    {
+        if (TryReadNonNullCompletedAt(targetNode))
+        {
+            return true;
+        }
+
+        return TryReadObjectProperty(targetNode, "activity", out var activityObject)
+               && TryReadNonNullCompletedAt(activityObject);
+    }
+
+    private static bool TryReadNonNullCompletedAt(JObject value)
+    {
+        return TryReadPropertyValue(value, "completedAt", out var completedAt)
+               && completedAt.Type is not JTokenType.Null and not JTokenType.Undefined;
+    }
+
+    private static IReadOnlyList<PhaseProgress> ParseTargetPhaseProgress(
+        IReadOnlyList<JObject> targetNodes)
+    {
+        var phasesByKey = new Dictionary<string, ParsedPhase>(StringComparer.Ordinal);
+        var graphIndex = 0;
+        foreach (var targetNode in targetNodes)
+        {
+            if (TryReadTargetRawPercent(targetNode, out var bossPercentage)
+                && TryReadMechanicNumber(targetNode, out var mechanicNumber))
+            {
+                bossPercentage = Math.Clamp(bossPercentage, 0, 100);
+                var phaseName = $"P{mechanicNumber.ToString(CultureInfo.InvariantCulture)}";
+                UpsertParsedPhase(
+                    phasesByKey,
+                    phaseName,
+                    mechanicNumber,
+                    graphIndex,
+                    bossPercentage);
+            }
+
+            graphIndex++;
+        }
+
+        return BuildPhaseProgress(phasesByKey);
+    }
+
+    private static double? ParseTargetBossPercentage(
+        JToken root,
+        IReadOnlyList<JObject> targetNodes,
+        IReadOnlyCollection<string> targetCanonicalNames)
+    {
+        var rawPercentValues = new List<double>();
+        foreach (var targetNode in targetNodes)
+        {
+            if (TryReadTargetRawPercent(targetNode, out var bossPercentage))
+            {
+                rawPercentValues.Add(Math.Clamp(bossPercentage, 0, 100));
+            }
+        }
+
+        if (rawPercentValues.Count > 0)
+        {
+            return rawPercentValues.Min();
+        }
+
+        var activityValues = new List<double>();
+        CollectTargetActivityBossPercentages(root, targetCanonicalNames, activityValues);
+
+        return activityValues.Count == 0
+            ? null
+            : activityValues.Min();
+    }
+
+    private static void CollectTargetActivityBossPercentages(
+        JToken root,
+        IReadOnlyCollection<string> targetCanonicalNames,
+        List<double> values)
+    {
+        var rows = FindActivityRows(root);
+        if (rows is null)
+        {
+            return;
+        }
+
+        foreach (var row in rows)
+        {
+            if (row is not JObject rowObject
+                || IsKillRow(rowObject)
+                || !ObjectContainsTargetCanonical(rowObject, targetCanonicalNames))
+            {
+                continue;
+            }
+
+            foreach (var source in EnumerateActivityProgressSources(rowObject))
+            {
+                if (IsKillSource(source)
+                    || !ObjectMatchesTargetCanonical(source, targetCanonicalNames)
+                    || !TryReadBestPercentValue(source, out var bossPercentage))
+                {
+                    continue;
+                }
+
+                values.Add(Math.Clamp(bossPercentage, 0, 100));
+            }
+        }
+    }
+
+    private static bool TryReadTargetRawPercent(JObject targetNode, out double bossPercentage)
+    {
+        bossPercentage = 0;
+        if (!TryReadObjectProperty(targetNode, "progression", out var progressionObject)
+            || !TryReadPropertyValue(progressionObject, "rawPercent", out var rawPercent))
+        {
+            return false;
+        }
+
+        return TryParseNumericPercent(rawPercent, out bossPercentage);
+    }
+
+    private static bool TryReadMechanicNumber(JObject targetNode, out int mechanicNumber)
+    {
+        mechanicNumber = 0;
+        if (TryReadObjectProperty(targetNode, "mechanic", out var mechanicObject)
+            || TryReadObjectProperty(targetNode, "progression", out var progressionObject)
+            && TryReadObjectProperty(progressionObject, "mechanic", out mechanicObject))
+        {
+            var number = ReadIntProperty(mechanicObject, "number");
+            if (number is > 0)
+            {
+                mechanicNumber = number.Value;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool ObjectContainsTargetCanonical(
+        JObject source,
+        IReadOnlyCollection<string> targetCanonicalNames)
+    {
+        return EnumerateDescendantsAndSelf(source)
+            .OfType<JObject>()
+            .Any(candidate => ObjectMatchesTargetCanonical(candidate, targetCanonicalNames));
+    }
+
+    private static bool ObjectMatchesTargetCanonical(
+        JObject source,
+        IReadOnlyCollection<string> targetCanonicalNames)
+    {
+        foreach (var canonicalName in EnumerateCanonicalNames(source))
+        {
+            if (targetCanonicalNames.Any(targetCanonicalName => string.Equals(
+                    targetCanonicalName,
+                    canonicalName,
+                    StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static IEnumerable<string> EnumerateCanonicalNames(JObject source)
+    {
+        if (ReadStringProperty(source, "canonicalName") is { Length: > 0 } canonicalName)
+        {
+            yield return canonicalName;
+        }
+
+        if (ReadStringProperty(source, "canonical_name") is { Length: > 0 } snakeCanonicalName)
+        {
+            yield return snakeCanonicalName;
+        }
+
+        if (TryReadObjectProperty(source, "encounter", out var encounterObject))
+        {
+            foreach (var encounterCanonicalName in EnumerateDirectCanonicalNames(encounterObject))
+            {
+                yield return encounterCanonicalName;
+            }
+        }
+
+        if (TryReadObjectProperty(source, "progression", out var progressionObject)
+            && TryReadObjectProperty(progressionObject, "encounter", out encounterObject))
+        {
+            foreach (var progressionCanonicalName in EnumerateDirectCanonicalNames(encounterObject))
+            {
+                yield return progressionCanonicalName;
+            }
+        }
+    }
+
+    private static IEnumerable<string> EnumerateDirectCanonicalNames(JObject source)
+    {
+        if (ReadStringProperty(source, "canonicalName") is { Length: > 0 } canonicalName)
+        {
+            yield return canonicalName;
+        }
+
+        if (ReadStringProperty(source, "canonical_name") is { Length: > 0 } snakeCanonicalName)
+        {
+            yield return snakeCanonicalName;
+        }
     }
 
     private static void CollectGraphBossPercentages(JArray graph, List<double> values)
@@ -355,6 +678,11 @@ public static class TomestoneProgressParser
                && ReadIntProperty(activityObject, "killsCount") is > 0;
     }
 
+    private static bool IsKillSource(JObject source)
+    {
+        return ReadIntProperty(source, "killsCount") is > 0;
+    }
+
     private static bool TryReadPhaseLabel(
         JObject graphItem,
         out string phaseName,
@@ -536,6 +864,35 @@ public static class TomestoneProgressParser
         return value is not null;
     }
 
+    private static IEnumerable<JToken> EnumerateDescendantsAndSelf(JToken root)
+    {
+        yield return root;
+
+        foreach (var child in root.Children())
+        {
+            foreach (var descendant in EnumerateDescendantsAndSelf(child))
+            {
+                yield return descendant;
+            }
+        }
+    }
+
+    private static bool TryReadObjectProperty(
+        JObject source,
+        string propertyName,
+        out JObject value)
+    {
+        if (TryReadPropertyValue(source, propertyName, out var token)
+            && token is JObject objectValue)
+        {
+            value = objectValue;
+            return true;
+        }
+
+        value = null;
+        return false;
+    }
+
     private static string ReadStringProperty(JObject source, string propertyName)
     {
         return TryReadPropertyValue(source, propertyName, out var value)
@@ -569,6 +926,20 @@ public static class TomestoneProgressParser
                 return IsFinite(percent);
             case JTokenType.String:
                 return TryParsePercentString(value.Value<string>(), out percent);
+            default:
+                percent = 0;
+                return false;
+        }
+    }
+
+    private static bool TryParseNumericPercent(JToken value, out double percent)
+    {
+        switch (value.Type)
+        {
+            case JTokenType.Integer:
+            case JTokenType.Float:
+                percent = value.Value<double>();
+                return IsFinite(percent);
             default:
                 percent = 0;
                 return false;

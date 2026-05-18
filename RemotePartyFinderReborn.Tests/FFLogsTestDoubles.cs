@@ -35,16 +35,10 @@ internal sealed class StubFFLogsApiClient : IFFLogsApiClient {
     public Func<(bool HasCooldown, TimeSpan Remaining)> OnTryGetRateLimitRemaining { get; set; }
         = static () => (false, TimeSpan.Zero);
 
-    public Func<List<FFLogsClient.CandidateCharacterQuery>, int, int?, int, CancellationToken, Task<Dictionary<string, FFLogsClient.CharacterFetchedData>>> OnFetchCharacterCandidateDataBatchAsync { get; set; }
-        = static (_, _, _, _, _) => Task.FromResult(new Dictionary<string, FFLogsClient.CharacterFetchedData>());
+    public Func<List<FFLogsClient.CandidateCharacterQuery>, int, int?, CancellationToken, Task<Dictionary<string, FFLogsClient.CharacterFetchedData>>> OnFetchCharacterCandidateDataBatchAsync { get; set; }
+        = static (_, _, _, _) => Task.FromResult(new Dictionary<string, FFLogsClient.CharacterFetchedData>());
 
-    public Func<List<FFLogsClient.CandidateCharacterQuery>, int, int?, int, CancellationToken, Task<OperationOutcome<Dictionary<string, FFLogsClient.CharacterFetchedData>>>>? OnFetchCharacterCandidateDataBatchOutcomeAsync { get; set; }
-        = null;
-
-    public Func<List<string>, int, int?, CancellationToken, Task<Dictionary<string, double>>> OnFetchBestBossPercentByReportAsync { get; set; }
-        = static (_, _, _, _) => Task.FromResult(new Dictionary<string, double>());
-
-    public Func<List<string>, int, int?, CancellationToken, Task<OperationOutcome<Dictionary<string, double>>>>? OnFetchBestBossPercentByReportOutcomeAsync { get; set; }
+    public Func<List<FFLogsClient.CandidateCharacterQuery>, int, int?, CancellationToken, Task<OperationOutcome<Dictionary<string, FFLogsClient.CharacterFetchedData>>>>? OnFetchCharacterCandidateDataBatchOutcomeAsync { get; set; }
         = null;
 
     public DateTime RateLimitCooldownUntilUtc { get; set; }
@@ -63,14 +57,12 @@ internal sealed class StubFFLogsApiClient : IFFLogsApiClient {
         List<FFLogsClient.CandidateCharacterQuery> queries,
         int zoneId,
         int? difficultyId,
-        int recentReportsLimit,
         CancellationToken cancellationToken) {
         if (OnFetchCharacterCandidateDataBatchOutcomeAsync != null) {
             return await OnFetchCharacterCandidateDataBatchOutcomeAsync(
                 queries,
                 zoneId,
                 difficultyId,
-                recentReportsLimit,
                 cancellationToken);
         }
 
@@ -79,38 +71,11 @@ internal sealed class StubFFLogsApiClient : IFFLogsApiClient {
                 queries,
                 zoneId,
                 difficultyId,
-                recentReportsLimit,
                 cancellationToken);
             return OperationOutcome<Dictionary<string, FFLogsClient.CharacterFetchedData>>.Success(result);
         }
         catch (Exception ex) {
             return OperationOutcome<Dictionary<string, FFLogsClient.CharacterFetchedData>>.Failure(true, ex.Message);
-        }
-    }
-
-    public async Task<OperationOutcome<Dictionary<string, double>>> FetchBestBossPercentByReportAsync(
-        List<string> reportCodes,
-        int encounterId,
-        int? difficultyId,
-        CancellationToken cancellationToken) {
-        if (OnFetchBestBossPercentByReportOutcomeAsync != null) {
-            return await OnFetchBestBossPercentByReportOutcomeAsync(
-                reportCodes,
-                encounterId,
-                difficultyId,
-                cancellationToken);
-        }
-
-        try {
-            var result = await OnFetchBestBossPercentByReportAsync(
-                reportCodes,
-                encounterId,
-                difficultyId,
-                cancellationToken);
-            return OperationOutcome<Dictionary<string, double>>.Success(result);
-        }
-        catch (Exception ex) {
-            return OperationOutcome<Dictionary<string, double>>.Failure(true, ex.Message);
         }
     }
 }

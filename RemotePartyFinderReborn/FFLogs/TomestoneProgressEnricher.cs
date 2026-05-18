@@ -18,7 +18,7 @@ internal sealed class TomestoneProgressEnricher
 
     public async Task<bool> EnrichProgressAsync(
         IReadOnlyList<ParseJob> jobs,
-        IReadOnlyDictionary<ulong, ParseResult> resultsByContentId,
+        IDictionary<ulong, ParseResult> resultsByContentId,
         uint zoneId,
         CancellationToken cancellationToken)
     {
@@ -58,21 +58,79 @@ internal sealed class TomestoneProgressEnricher
             foreach (var fetchResult in fetchResults)
             {
                 hadTransientFailure |= fetchResult.HadTransientFailure;
-                ApplyTomestoneProgress(fetchResult);
+                ApplyTomestoneProgress(fetchResult, resultsByContentId);
             }
         }
 
         return hadTransientFailure;
     }
 
-    private static void ApplyTomestoneProgress(TomestoneFetchResult fetchResult)
+    private static void ApplyTomestoneProgress(
+        TomestoneFetchResult fetchResult,
+        IDictionary<ulong, ParseResult> resultsByContentId)
+    {
+        var parseResult = GetExistingMergeTarget(fetchResult.Request, resultsByContentId);
+        if (parseResult == null)
+        {
+            if (!HasUsefulProgress(fetchResult))
+            {
+                return;
+            }
+
+            parseResult = CreateTomestoneProgressOnlyResult(fetchResult.Request);
+            resultsByContentId[fetchResult.Request.Job.ContentId] = parseResult;
+        }
+
+        ApplyTomestoneProgress(fetchResult, parseResult);
+    }
+
+    private static ParseResult GetExistingMergeTarget(
+        TomestoneRequest request,
+        IDictionary<ulong, ParseResult> resultsByContentId)
+    {
+        if (!resultsByContentId.TryGetValue(request.Job.ContentId, out var current))
+        {
+            return null;
+        }
+
+        if (!current.IsHidden || string.Equals(current.SourceKind, "tomestone_api", StringComparison.Ordinal))
+        {
+            return current;
+        }
+
+        return null;
+    }
+
+    private static ParseResult CreateTomestoneProgressOnlyResult(TomestoneRequest request)
+        => new()
+        {
+            ContentId = request.Job.ContentId,
+            ZoneId = request.Job.ZoneId,
+            DifficultyId = request.Job.DifficultyId,
+            IsEstimated = request.Job.CandidateServers?.Count > 0,
+            MatchedServer = request.LookupServer,
+            SourceKind = "tomestone_api",
+            LeaseToken = request.Job.LeaseToken,
+        };
+
+    private static bool HasUsefulProgress(TomestoneFetchResult fetchResult)
+        => fetchResult.Request.ProgressKind switch
+        {
+            TomestoneProgressKind.PhaseProgress => fetchResult.Progress.Phases.Count > 0,
+            TomestoneProgressKind.BossPercentage => TryGetBossPercentage(fetchResult.Progress, out _),
+            _ => false,
+        };
+
+    private static void ApplyTomestoneProgress(
+        TomestoneFetchResult fetchResult,
+        ParseResult parseResult)
     {
         switch (fetchResult.Request.ProgressKind)
         {
             case TomestoneProgressKind.PhaseProgress:
                 if (fetchResult.Progress.Phases.Count > 0)
                 {
-                    fetchResult.Request.ParseResult.PhaseProgress[(int)fetchResult.Request.EncounterId] =
+                    parseResult.PhaseProgress[(int)fetchResult.Request.EncounterId] =
                         fetchResult.Progress.Phases.ToList();
                 }
 
@@ -80,7 +138,7 @@ internal sealed class TomestoneProgressEnricher
             case TomestoneProgressKind.BossPercentage:
                 if (TryGetBossPercentage(fetchResult.Progress, out var bossPercentage))
                 {
-                    fetchResult.Request.ParseResult.BossPercentages[(int)fetchResult.Request.EncounterId] =
+                    parseResult.BossPercentages[(int)fetchResult.Request.EncounterId] =
                         bossPercentage;
                 }
 
@@ -128,12 +186,14 @@ internal sealed class TomestoneProgressEnricher
 
     private static IEnumerable<TomestoneRequest> BuildRequests(
         IReadOnlyList<ParseJob> jobs,
-        IReadOnlyDictionary<ulong, ParseResult> resultsByContentId,
+        IDictionary<ulong, ParseResult> resultsByContentId,
         uint zoneId)
     {
         foreach (var job in jobs)
         {
-            if (!resultsByContentId.TryGetValue(job.ContentId, out var parseResult) || parseResult.IsHidden)
+            resultsByContentId.TryGetValue(job.ContentId, out var parseResult);
+            var lookupServer = ResolveLookupServer(job, parseResult);
+            if (string.IsNullOrWhiteSpace(lookupServer))
             {
                 continue;
             }
@@ -142,12 +202,22 @@ internal sealed class TomestoneProgressEnricher
             {
                 yield return new TomestoneRequest(
                     job,
-                    parseResult,
+                    lookupServer,
                     target.ZoneId,
                     target.EncounterId,
                     target.ProgressKind);
             }
         }
+    }
+
+    private static string ResolveLookupServer(ParseJob job, ParseResult parseResult)
+    {
+        if (!string.IsNullOrWhiteSpace(parseResult?.MatchedServer))
+        {
+            return parseResult.MatchedServer.Trim();
+        }
+
+        return job.Server?.Trim() ?? string.Empty;
     }
 
     private static async Task<TomestoneFetchResult> FetchProgressAsync(
@@ -159,7 +229,7 @@ internal sealed class TomestoneProgressEnricher
         {
             var outcome = await tomestoneClient.FetchProgressionDataAsync(
                 request.Job.Name,
-                request.ParseResult.MatchedServer,
+                request.LookupServer,
                 request.ZoneId,
                 request.EncounterId,
                 cancellationToken);
@@ -222,7 +292,7 @@ internal sealed class TomestoneProgressEnricher
 
     private sealed record TomestoneRequest(
         ParseJob Job,
-        ParseResult ParseResult,
+        string LookupServer,
         uint ZoneId,
         uint EncounterId,
         TomestoneProgressKind ProgressKind);

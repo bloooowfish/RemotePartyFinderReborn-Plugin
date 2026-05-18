@@ -1,0 +1,37 @@
+{
+  "data": {
+    "encounters": [
+      {
+        "canonicalName": "red-hot-deep-blue",
+        "activity": {
+          "completedAt": "2025-01-01T00:00:00Z"
+        },
+        "progression": {
+          "rawPercent": 12.34,
+          "encounter": {
+            "canonical_name": "red-hot-deep-blue"
+          }
+        }
+      }
+    ]
+  },
+  "activity": {
+    "activities": {
+      "activities": {
+        "paginator": {
+          "data": [
+            {
+              "activity": {
+                "bestPercent": "8.90%",
+                "killsCount": 0,
+                "encounter": {
+                  "canonical_name": "red-hot-deep-blue"
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

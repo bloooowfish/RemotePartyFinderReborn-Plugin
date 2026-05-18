@@ -47,7 +47,6 @@ public sealed class FFLogsCandidateMatcherTests
         Assert.True(parse.IsEstimated);
         Assert.Equal(74.5, parse.Encounters[88], 3);
         Assert.Equal(3, parse.ClearCounts[88]);
-        Assert.True(result.ChosenDataByContentId.ContainsKey(101));
     }
 
     [Fact]
@@ -156,7 +155,6 @@ public sealed class FFLogsCandidateMatcherTests
         var result = matcher.MatchFetchedCandidates(new Dictionary<string, FFLogsClient.CharacterFetchedData>());
 
         Assert.Empty(result.ResultsByContentId);
-        Assert.Empty(result.ChosenDataByContentId);
     }
 
     [Fact]

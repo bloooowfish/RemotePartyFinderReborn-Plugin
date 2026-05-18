@@ -1,0 +1,34 @@
+{
+  "data": {
+    "encounters": [
+      {
+        "canonicalName": "red-hot-deep-blue",
+        "progression": {
+          "rawPercent": 29.69,
+          "encounter": {
+            "canonical_name": "red-hot-deep-blue"
+          }
+        }
+      }
+    ]
+  },
+  "activity": {
+    "activities": {
+      "activities": {
+        "paginator": {
+          "data": [
+            {
+              "activity": {
+                "bestPercent": "26.81%",
+                "killsCount": 0,
+                "encounter": {
+                  "canonical_name": "enuo"
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

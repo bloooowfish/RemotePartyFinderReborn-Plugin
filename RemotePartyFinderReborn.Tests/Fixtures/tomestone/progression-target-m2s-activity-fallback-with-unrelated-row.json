@@ -1,0 +1,43 @@
+{
+  "data": {
+    "encounters": [
+      {
+        "canonicalName": "red-hot-deep-blue",
+        "progression": {
+          "displayPercent": "46.35%",
+          "encounter": {
+            "canonical_name": "red-hot-deep-blue"
+          }
+        }
+      }
+    ]
+  },
+  "activity": {
+    "activities": {
+      "activities": {
+        "paginator": {
+          "data": [
+            {
+              "activity": {
+                "bestPercent": "46.35%",
+                "killsCount": 0,
+                "encounter": {
+                  "canonical_name": "red-hot-deep-blue"
+                }
+              }
+            },
+            {
+              "activity": {
+                "bestPercent": "14.13%",
+                "killsCount": 0,
+                "encounter": {
+                  "canonical_name": "vamp-fatale"
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

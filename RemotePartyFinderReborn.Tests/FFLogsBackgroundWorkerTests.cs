@@ -136,85 +136,9 @@ public sealed class FFLogsBackgroundWorkerTests
         };
         var apiClient = new StubFFLogsApiClient
         {
-            OnFetchCharacterCandidateDataBatchAsync = static (_, _, _, _, _) =>
+            OnFetchCharacterCandidateDataBatchAsync = static (_, _, _, _) =>
                 Task.FromException<Dictionary<string, FFLogsClient.CharacterFetchedData>>(
                     new HttpRequestException("transient candidate lookup")),
-        };
-        var seams = FFLogsCollector.CreateSeams(
-            new StubFFLogsIngestHttpSender(),
-            apiClient,
-            new ManualFFLogsTimeProvider());
-        var delays = new List<int>();
-        var errors = new List<string>();
-        var workerPolicy = new FFLogsWorkerPolicy(
-            configuration,
-            _ => { },
-            seams.TimeProvider,
-            (delayMs, _) =>
-            {
-                delays.Add(delayMs);
-                throw new TaskCanceledException();
-            });
-        var worker = new FFLogsBackgroundWorker(
-            configuration,
-            seams.ApiClient,
-            workerPolicy,
-            new FixedAttemptJobLeaseClient(
-                seams,
-                new FFLogsJobLeaseAttempt(
-                    new FFLogsLeaseSession(configuration.UploadUrls[0], [CreateJob()]),
-                    false)),
-            new FFLogsBatchProcessor(seams),
-            new FFLogsResultSubmitter(seams, new FFLogsSubmitBuffer()),
-            new FFLogsLeaseAbandoner(seams),
-            static _ => { },
-            static _ => { },
-            errors.Add,
-            static _ => { });
-
-        await worker.RunAsync(CancellationToken.None);
-
-        Assert.Equal([5000], delays);
-        Assert.Equal(5000, workerPolicy.LastBackoffDelayMs);
-        Assert.Empty(errors);
-    }
-
-    [Fact]
-    public async Task Backoff_on_transient_progress_lookup_without_top_level_error()
-    {
-        var configuration = new Configuration
-        {
-            EnableFFLogsWorker = true,
-            FFLogsClientId = "client-id",
-            FFLogsClientSecret = "client-secret",
-            IngestClientId = Guid.NewGuid().ToString("N"),
-            FFLogsWorkerBaseDelayMs = 5000,
-            FFLogsWorkerMaxBackoffDelayMs = 12000,
-            FFLogsWorkerJitterMs = 0,
-            UploadUrls = ImmutableList.Create(new UploadUrl("http://127.0.0.1:8000")),
-        };
-        var apiClient = new StubFFLogsApiClient
-        {
-            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _, _) =>
-                Task.FromResult(new Dictionary<string, FFLogsClient.CharacterFetchedData>
-                {
-                    [queries[0].Key] = new FFLogsClient.CharacterFetchedData
-                    {
-                        Hidden = false,
-                        Parses =
-                        [
-                            new FFLogsClient.CharacterEncounterParse
-                            {
-                                EncounterId = 9001,
-                                Percentile = 88.8,
-                            },
-                        ],
-                        RecentReportCodes = ["REP1", "REP2"],
-                    },
-                }),
-            OnFetchBestBossPercentByReportAsync = static (_, _, _, _) =>
-                Task.FromException<Dictionary<string, double>>(
-                    new TimeoutException("transient progress lookup")),
         };
         var seams = FFLogsCollector.CreateSeams(
             new StubFFLogsIngestHttpSender(),

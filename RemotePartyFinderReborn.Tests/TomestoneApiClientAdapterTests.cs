@@ -185,6 +185,70 @@ public sealed class TomestoneApiClientAdapterTests
         {
             OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
             {
+                Content = new StringContent("""
+                {"data":{"encounters":[
+                  {"canonicalName":"futures-rewritten-ultimate","mechanic":{"number":1},"progression":{"rawPercent":12}},
+                  {"canonicalName":"futures-rewritten-ultimate","mechanic":{"number":2},"progression":{"rawPercent":24}},
+                  {"canonicalName":"futures-rewritten-ultimate","mechanic":{"number":3},"progression":{"rawPercent":55.5}},
+                  {"canonicalName":"futures-rewritten-ultimate","mechanic":{"number":4},"progression":{"rawPercent":100}}
+                ]}}
+                """),
+            }),
+        };
+        using var client = new TomestoneApiClient(
+            new Configuration
+            {
+                EnableTomestoneProgressEnrichment = true,
+                TomestoneApiKey = "secret-token",
+            },
+            handler);
+        var adapter = CreateAdapter(
+            client,
+            new Configuration
+            {
+                EnableTomestoneProgressEnrichment = true,
+                TomestoneApiKey = "secret-token",
+            });
+
+        var result = await adapter.FetchProgressionDataAsync(
+            "Alpha",
+            "Tonberry",
+            65,
+            1079,
+            CancellationToken.None);
+
+        Assert.True(result.Succeeded);
+        Assert.Collection(
+            result.Value!.Phases,
+            phase =>
+            {
+                Assert.Equal("p1", phase.PhaseKey);
+                Assert.Equal(12, phase.BossPercentage);
+            },
+            phase =>
+            {
+                Assert.Equal("p2", phase.PhaseKey);
+                Assert.Equal(24, phase.BossPercentage);
+            },
+            phase =>
+            {
+                Assert.Equal("p3", phase.PhaseKey);
+                Assert.Equal(55.5, phase.BossPercentage);
+            },
+            phase =>
+            {
+                Assert.Equal("p4", phase.PhaseKey);
+                Assert.Equal(100, phase.BossPercentage);
+            });
+    }
+
+    [Fact]
+    public async Task Uses_legacy_phase_progress_fallback_when_target_nodes_are_absent()
+    {
+        var handler = new RecordingTomestoneHttpMessageHandler
+        {
+            OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
                 Content = new StringContent(ReadFixture("progression-graph-ultimate-with-phases.json")),
             }),
         };
@@ -243,7 +307,10 @@ public sealed class TomestoneApiClientAdapterTests
             OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
             {
                 Content = new StringContent("""
-                {"data":{"graph":[{"name":"Overall","bestPull":"22.1%"},{"name":"Overall","best_pull":"9.8%"}]}}
+                {"data":{"encounters":[
+                  {"canonicalName":"vamp-fatale","progression":{"rawPercent":22.1}},
+                  {"canonicalName":"vamp-fatale","progression":{"rawPercent":9.8}}
+                ]}}
                 """),
             }),
         };
@@ -272,6 +339,83 @@ public sealed class TomestoneApiClientAdapterTests
         Assert.True(result.Succeeded);
         Assert.Empty(result.Value!.Phases);
         Assert.Equal(9.8, result.Value!.BossPercentage!.Value, 3);
+    }
+
+    [Fact]
+    public async Task Uses_target_aware_parser_for_completed_current_savage_progress()
+    {
+        var handler = new RecordingTomestoneHttpMessageHandler
+        {
+            OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(ReadFixture("progression-target-m2s-completed-with-wipe-activity.json")),
+            }),
+        };
+        using var client = new TomestoneApiClient(
+            new Configuration
+            {
+                EnableTomestoneProgressEnrichment = true,
+                TomestoneApiKey = "secret-token",
+            },
+            handler);
+        var adapter = CreateAdapter(
+            client,
+            new Configuration
+            {
+                EnableTomestoneProgressEnrichment = true,
+                TomestoneApiKey = "secret-token",
+            });
+
+        var result = await adapter.FetchProgressionDataAsync(
+            "Alpha",
+            "Tonberry",
+            73,
+            102,
+            CancellationToken.None);
+
+        Assert.True(result.Succeeded);
+        Assert.False(result.TransientFailure);
+        Assert.True(result.Value!.Cleared);
+        Assert.Empty(result.Value!.Phases);
+        Assert.Null(result.Value!.BossPercentage);
+    }
+
+    [Fact]
+    public async Task Uses_target_aware_parser_for_current_savage_raw_percent()
+    {
+        var handler = new RecordingTomestoneHttpMessageHandler
+        {
+            OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(ReadFixture("progression-target-m2s-raw-percent-with-unrelated-activity.json")),
+            }),
+        };
+        using var client = new TomestoneApiClient(
+            new Configuration
+            {
+                EnableTomestoneProgressEnrichment = true,
+                TomestoneApiKey = "secret-token",
+            },
+            handler);
+        var adapter = CreateAdapter(
+            client,
+            new Configuration
+            {
+                EnableTomestoneProgressEnrichment = true,
+                TomestoneApiKey = "secret-token",
+            });
+
+        var result = await adapter.FetchProgressionDataAsync(
+            "Alpha",
+            "Tonberry",
+            73,
+            102,
+            CancellationToken.None);
+
+        Assert.True(result.Succeeded);
+        Assert.False(result.TransientFailure);
+        Assert.Empty(result.Value!.Phases);
+        Assert.Equal(29.69, result.Value!.BossPercentage!.Value, 3);
     }
 
     [Fact]

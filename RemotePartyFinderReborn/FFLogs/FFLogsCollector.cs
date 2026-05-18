@@ -20,12 +20,6 @@ internal interface IFFLogsApiClient
         List<FFLogsClient.CandidateCharacterQuery> queries,
         int zoneId,
         int? difficultyId,
-        int recentReportsLimit,
-        CancellationToken cancellationToken);
-    Task<OperationOutcome<Dictionary<string, double>>> FetchBestBossPercentByReportAsync(
-        List<string> reportCodes,
-        int encounterId,
-        int? difficultyId,
         CancellationToken cancellationToken);
 }
 
@@ -79,23 +73,10 @@ public class FFLogsCollector : IDisposable
             List<FFLogsClient.CandidateCharacterQuery> queries,
             int zoneId,
             int? difficultyId,
-            int recentReportsLimit,
             CancellationToken cancellationToken)
             => client.FetchCharacterCandidateDataBatchOutcomeAsync(
                 queries,
                 zoneId,
-                difficultyId,
-                recentReportsLimit,
-                cancellationToken);
-
-        public Task<OperationOutcome<Dictionary<string, double>>> FetchBestBossPercentByReportAsync(
-            List<string> reportCodes,
-            int encounterId,
-            int? difficultyId,
-            CancellationToken cancellationToken)
-            => client.FetchBestBossPercentByReportOutcomeAsync(
-                reportCodes,
-                encounterId,
                 difficultyId,
                 cancellationToken);
     }
@@ -205,7 +186,7 @@ public class FFLogsCollector : IDisposable
             try
             {
                 JToken.Parse(response.Body);
-                var progress = TomestoneProgressParser.ParseProgress(response.Body);
+                var progress = TomestoneProgressParser.ParseProgress(response.Body, encounterParams);
                 debugLog(
                     $"Tomestone progress parsed {progress.Phases.Count} phase(s), boss={progress.BossPercentage?.ToString("0.##", CultureInfo.InvariantCulture) ?? "none"} for {targetDescription}.");
                 return OperationOutcome<TomestoneProgressData>.Success(progress);

@@ -283,7 +283,7 @@ public sealed class FFLogsJobLeaseClientTests
         };
         var apiClient = new StubFFLogsApiClient
         {
-            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _, _) =>
+            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _) =>
             {
                 return Task.FromResult(new Dictionary<string, FFLogsClient.CharacterFetchedData>
                 {

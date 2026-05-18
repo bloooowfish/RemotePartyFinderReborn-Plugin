@@ -45,6 +45,7 @@ public class ParseResult
     public bool IsHidden { get; set; }
     public bool IsEstimated { get; set; }
     public string MatchedServer { get; set; } = "";
+    public string SourceKind { get; set; } = "";
     public string LeaseToken { get; set; } = "";
 }
 

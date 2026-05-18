@@ -327,7 +327,6 @@ public class FFLogsClient : IDisposable
     {
         public bool Hidden { get; init; }
         public List<CharacterEncounterParse> Parses { get; init; } = new();
-        public List<string> RecentReportCodes { get; init; } = new();
     }
 
     public sealed class CharacterEncounterParse
@@ -349,7 +348,6 @@ public class FFLogsClient : IDisposable
         List<(ulong ContentId, string Name, string Server, string Region)> characters,
         int zoneId,
         int? difficultyId,
-        int recentReportsLimit,
         CancellationToken cancellationToken)
     {
         if (characters.Count == 0) return new();
@@ -374,12 +372,6 @@ public class FFLogsClient : IDisposable
             args.Add("timeframe: Historical");
 
             sb.Append($" zoneRankings({string.Join(", ", args)}) ");
-
-            // recent reports (for progress lookup)
-            if (recentReportsLimit > 0)
-            {
-                sb.Append($" recentReports(limit: {recentReportsLimit}) {{ data {{ code }} }} ");
-            }
 
             sb.Append(" }");
         }
@@ -430,24 +422,10 @@ public class FFLogsClient : IDisposable
                 }
             }
 
-            var reportCodes = new List<string>();
-            if (recentReportsLimit > 0 && character["recentReports"]?["data"] is JArray reports)
-            {
-                foreach (var r in reports)
-                {
-                    var code = r?["code"]?.ToString();
-                    if (!string.IsNullOrWhiteSpace(code))
-                    {
-                        reportCodes.Add(code);
-                    }
-                }
-            }
-
             output[charInfo.ContentId] = new CharacterFetchedData
             {
                 Hidden = hidden,
                 Parses = parses,
-                RecentReportCodes = reportCodes,
             };
         }
 
@@ -458,14 +436,12 @@ public class FFLogsClient : IDisposable
         List<CandidateCharacterQuery> candidates,
         int zoneId,
         int? difficultyId,
-        int recentReportsLimit,
         CancellationToken cancellationToken)
     {
         var outcome = await FetchCharacterCandidateDataBatchOutcomeAsync(
             candidates,
             zoneId,
             difficultyId,
-            recentReportsLimit,
             cancellationToken).ConfigureAwait(false);
         return outcome.Succeeded ? outcome.Value ?? [] : [];
     }
@@ -474,7 +450,6 @@ public class FFLogsClient : IDisposable
         List<CandidateCharacterQuery> candidates,
         int zoneId,
         int? difficultyId,
-        int recentReportsLimit,
         CancellationToken cancellationToken)
     {
         var output = new Dictionary<string, CharacterFetchedData>(StringComparer.OrdinalIgnoreCase);
@@ -492,8 +467,7 @@ public class FFLogsClient : IDisposable
             var query = FFLogsQueryBuilder.BuildCharacterCandidateDataBatchQuery(
                 chunk,
                 zoneId,
-                difficultyId,
-                recentReportsLimit);
+                difficultyId);
             var result = await QueryOutcomeAsync(query, cancellationToken);
             if (!result.Succeeded)
             {
@@ -539,111 +513,15 @@ public class FFLogsClient : IDisposable
                     }
                 }
 
-                var reportCodes = new List<string>();
-                if (recentReportsLimit > 0 && character["recentReports"]?["data"] is JArray reports)
-                {
-                    foreach (var r in reports)
-                    {
-                        var code = r?["code"]?.ToString();
-                        if (!string.IsNullOrWhiteSpace(code))
-                        {
-                            reportCodes.Add(code);
-                        }
-                    }
-                }
-
                 output[chunk[i].Key] = new CharacterFetchedData
                 {
                     Hidden = hidden,
                     Parses = parses,
-                    RecentReportCodes = reportCodes,
                 };
             }
         }
 
         return OperationOutcome<Dictionary<string, CharacterFetchedData>>.Success(output);
-    }
-
-    public async Task<Dictionary<string, double>> FetchBestBossPercentByReportAsync(
-        List<string> reportCodes,
-        int encounterId,
-        int? difficultyId,
-        CancellationToken cancellationToken)
-    {
-        var outcome = await FetchBestBossPercentByReportOutcomeAsync(
-            reportCodes,
-            encounterId,
-            difficultyId,
-            cancellationToken).ConfigureAwait(false);
-        return outcome.Succeeded ? outcome.Value ?? [] : [];
-    }
-
-    internal async Task<OperationOutcome<Dictionary<string, double>>> FetchBestBossPercentByReportOutcomeAsync(
-        List<string> reportCodes,
-        int encounterId,
-        int? difficultyId,
-        CancellationToken cancellationToken)
-    {
-        var output = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
-        if (reportCodes.Count == 0)
-        {
-            return OperationOutcome<Dictionary<string, double>>.Success(output);
-        }
-
-        const int chunkSize = 25;
-
-        for (var offset = 0; offset < reportCodes.Count; offset += chunkSize)
-        {
-            var chunk = reportCodes.Skip(offset).Take(chunkSize).ToList();
-
-            var query = FFLogsQueryBuilder.BuildBestBossPercentByReportQuery(
-                chunk,
-                encounterId,
-                difficultyId);
-            var result = await QueryOutcomeAsync(query, cancellationToken);
-            if (!result.Succeeded)
-            {
-                return OperationOutcome<Dictionary<string, double>>.Failure(
-                    result.TransientFailure,
-                    result.ErrorMessage);
-            }
-
-            if (result.Value?["data"]?["reportData"] is not JObject reportData)
-            {
-                continue;
-            }
-
-            for (var i = 0; i < chunk.Count; i++)
-            {
-                var code = chunk[i];
-                var alias = $"r{i}";
-                if (reportData[alias] is not JObject report)
-                {
-                    continue;
-                }
-
-                if (report["fights"] is not JArray fights)
-                {
-                    continue;
-                }
-
-                double? best = null;
-                foreach (var f in fights)
-                {
-                    if (f is not JObject fight) continue;
-                    var bp = fight["bossPercentage"]?.ToObject<double?>();
-                    if (!bp.HasValue) continue;
-                    best = best.HasValue ? Math.Min(best.Value, bp.Value) : bp.Value;
-                }
-
-                if (best.HasValue)
-                {
-                    output[code] = best.Value;
-                }
-            }
-        }
-
-        return OperationOutcome<Dictionary<string, double>>.Success(output);
     }
 
     private static bool IsTransientStatusCode(HttpStatusCode statusCode)

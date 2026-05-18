@@ -59,6 +59,16 @@ public sealed class TomestoneEncounterMappingTests
         Assert.Equal("raids", encounterParams.Category);
         Assert.Equal(encounter, encounterParams.Encounter);
         Assert.Equal(TomestoneProgressKind.BossPercentage, encounterParams.ProgressKind);
+        Assert.NotEmpty(encounterParams.TargetCanonicalNames);
+    }
+
+    [Fact]
+    public void TryGetProgressionTarget_returns_target_canonical_names_for_multi_boss_encounter()
+    {
+        var found = TomestoneEncounterMapping.TryGetProgressionTarget(73, 105, out var encounterParams);
+
+        Assert.True(found);
+        Assert.Equal(["lindwurm-ii"], encounterParams.TargetCanonicalNames);
     }
 
     [Fact]

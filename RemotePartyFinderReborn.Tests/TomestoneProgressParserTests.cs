@@ -6,6 +6,20 @@ namespace RemotePartyFinderReborn.Tests;
 
 public sealed class TomestoneProgressParserTests
 {
+    private static readonly TomestoneEncounterParams M2SProgressTarget = new(
+        "dawntrail",
+        "raids",
+        "aac-heavyweight-m2-savage",
+        TomestoneProgressKind.BossPercentage,
+        ["red-hot-deep-blue"]);
+
+    private static readonly TomestoneEncounterParams PhaseProgressTarget = new(
+        "dawntrail",
+        "ultimates",
+        "target-ultimate",
+        TomestoneProgressKind.PhaseProgress,
+        ["target-phase"]);
+
     [Fact]
     public void ParsePhaseProgress_extracts_phase_progress_in_display_order()
     {
@@ -297,6 +311,254 @@ public sealed class TomestoneProgressParserTests
 
         Assert.Empty(progress.Phases);
         Assert.Null(progress.BossPercentage);
+    }
+
+    [Fact]
+    public void ParseProgress_for_target_prefers_target_raw_percent_over_unrelated_activity()
+    {
+        var json = ReadFixture("progression-target-m2s-raw-percent-with-unrelated-activity.json");
+
+        var progress = TomestoneProgressParser.ParseProgress(json, M2SProgressTarget);
+
+        Assert.False(progress.Cleared);
+        Assert.Empty(progress.Phases);
+        Assert.Equal(29.69, progress.BossPercentage!.Value, 3);
+    }
+
+    [Fact]
+    public void ParseProgress_for_target_completed_activity_returns_cleared_without_progress()
+    {
+        var json = ReadFixture("progression-target-m2s-completed-with-wipe-activity.json");
+
+        var progress = TomestoneProgressParser.ParseProgress(json, M2SProgressTarget);
+
+        Assert.True(progress.Cleared);
+        Assert.Empty(progress.Phases);
+        Assert.Null(progress.BossPercentage);
+    }
+
+    [Fact]
+    public void ParseProgress_for_target_direct_completed_at_returns_cleared_without_progress()
+    {
+        const string json = """
+        {
+          "data": {
+            "encounters": [
+              {
+                "canonicalName": "red-hot-deep-blue",
+                "completedAt": "2026-05-18T00:00:00Z",
+                "progression": {
+                  "rawPercent": 12.34
+                }
+              }
+            ]
+          }
+        }
+        """;
+
+        var progress = TomestoneProgressParser.ParseProgress(json, M2SProgressTarget);
+
+        Assert.True(progress.Cleared);
+        Assert.Empty(progress.Phases);
+        Assert.Null(progress.BossPercentage);
+    }
+
+    [Fact]
+    public void ParseProgress_for_target_fallback_uses_only_matching_activity_rows()
+    {
+        var json = ReadFixture("progression-target-m2s-activity-fallback-with-unrelated-row.json");
+
+        var progress = TomestoneProgressParser.ParseProgress(json, M2SProgressTarget);
+
+        Assert.False(progress.Cleared);
+        Assert.Empty(progress.Phases);
+        Assert.Equal(46.35, progress.BossPercentage!.Value, 3);
+    }
+
+    [Fact]
+    public void ParseProgress_for_boss_target_activity_fallback_ignores_endpoint_slug_when_explicit_target_exists()
+    {
+        const string json = """
+        {
+          "activity": {
+            "activities": {
+              "activities": {
+                "paginator": {
+                  "data": [
+                    {
+                      "activity": {
+                        "bestPercent": "7.00%",
+                        "killsCount": 0,
+                        "encounter": {
+                          "canonical_name": "aac-heavyweight-m2-savage"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+        """;
+
+        var progress = TomestoneProgressParser.ParseProgress(json, M2SProgressTarget);
+
+        Assert.False(progress.Cleared);
+        Assert.Empty(progress.Phases);
+        Assert.Null(progress.BossPercentage);
+    }
+
+    [Fact]
+    public void ParseProgress_for_target_fallback_uses_only_matching_sources_within_target_row()
+    {
+        const string json = """
+        {
+          "activity": {
+            "activities": {
+              "activities": {
+                "paginator": {
+                  "data": [
+                    {
+                      "activity": {
+                        "bestPercent": "50.00%",
+                        "killsCount": 0,
+                        "encounter": {
+                          "canonical_name": "red-hot-deep-blue"
+                        }
+                      },
+                      "perspectives": {
+                        "otherEncounter": {
+                          "bestPercent": "5.00%",
+                          "killsCount": 0,
+                          "encounter": {
+                            "canonical_name": "vamp-fatale"
+                          }
+                        },
+                        "targetKill": {
+                          "bestPercent": "0.00%",
+                          "killsCount": 1,
+                          "encounter": {
+                            "canonical_name": "red-hot-deep-blue"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+        """;
+
+        var progress = TomestoneProgressParser.ParseProgress(json, M2SProgressTarget);
+
+        Assert.False(progress.Cleared);
+        Assert.Empty(progress.Phases);
+        Assert.Equal(50.00, progress.BossPercentage!.Value, 3);
+    }
+
+    [Fact]
+    public void ParseProgress_for_m4s_p1_only_lindwurm_does_not_store_final_boss_percentage()
+    {
+        const string json = """
+        {
+          "data": {
+            "encounters": [
+              {
+                "canonicalName": "lindwurm",
+                "progression": {
+                  "rawPercent": 19.25
+                }
+              }
+            ]
+          }
+        }
+        """;
+
+        Assert.True(TomestoneEncounterMapping.TryGetProgressionTarget(73, 105, out var target));
+
+        var progress = TomestoneProgressParser.ParseProgress(json, target);
+
+        Assert.False(progress.Cleared);
+        Assert.Empty(progress.Phases);
+        Assert.Null(progress.BossPercentage);
+    }
+
+    [Fact]
+    public void ParseProgress_for_m4s_both_lindwurm_nodes_stores_lindwurm_ii_boss_percentage()
+    {
+        const string json = """
+        {
+          "data": {
+            "encounters": [
+              {
+                "canonicalName": "lindwurm",
+                "progression": {
+                  "rawPercent": 19.25
+                }
+              },
+              {
+                "canonicalName": "lindwurm-ii",
+                "progression": {
+                  "rawPercent": 41.75
+                }
+              }
+            ]
+          }
+        }
+        """;
+
+        Assert.True(TomestoneEncounterMapping.TryGetProgressionTarget(73, 105, out var target));
+
+        var progress = TomestoneProgressParser.ParseProgress(json, target);
+
+        Assert.False(progress.Cleared);
+        Assert.Empty(progress.Phases);
+        Assert.Equal(41.75, progress.BossPercentage!.Value, 3);
+    }
+
+    [Fact]
+    public void ParseProgress_for_phase_target_uses_target_canonical_names()
+    {
+        const string json = """
+        {
+          "data": {
+            "encounters": [
+              {
+                "canonicalName": "unrelated-phase",
+                "progression": {
+                  "rawPercent": 3.25
+                },
+                "mechanic": {
+                  "number": 1
+                }
+              },
+              {
+                "canonicalName": "target-phase",
+                "progression": {
+                  "rawPercent": 42.5
+                },
+                "mechanic": {
+                  "number": 2
+                }
+              }
+            ]
+          }
+        }
+        """;
+
+        var progress = TomestoneProgressParser.ParseProgress(json, PhaseProgressTarget);
+
+        Assert.False(progress.Cleared);
+        Assert.Null(progress.BossPercentage);
+        var phase = Assert.Single(progress.Phases);
+        Assert.Equal("p2", phase.PhaseKey);
+        Assert.Equal("P2", phase.PhaseName);
+        Assert.Equal(2, phase.Order);
+        Assert.Equal(42.5, phase.BossPercentage);
+        Assert.Equal("P2 42.5%", phase.DisplayText);
     }
 
     private static string ReadFixture(

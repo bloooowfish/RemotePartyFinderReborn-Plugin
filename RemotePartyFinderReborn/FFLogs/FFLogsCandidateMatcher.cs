@@ -67,8 +67,6 @@ internal sealed class FFLogsCandidateMatcher
         ArgumentNullException.ThrowIfNull(fetchedByKey);
 
         var resultsByContentId = new Dictionary<ulong, ParseResult>();
-        var chosenDataByContentId = new Dictionary<ulong, FFLogsClient.CharacterFetchedData>();
-
         foreach (var job in _jobs)
         {
             if (!_candidatesByContentId.TryGetValue(job.ContentId, out var candidates) || candidates.Count == 0)
@@ -127,10 +125,9 @@ internal sealed class FFLogsCandidateMatcher
             }
 
             resultsByContentId[job.ContentId] = parseResult;
-            chosenDataByContentId[job.ContentId] = bestData;
         }
 
-        return new FFLogsCandidateMatchResult(resultsByContentId, chosenDataByContentId);
+        return new FFLogsCandidateMatchResult(resultsByContentId);
     }
 
     private static long ScoreCandidate(
@@ -170,7 +167,6 @@ internal sealed class FFLogsCandidateMatcher
         ScoreEncounter(encounterId);
         ScoreEncounter(secondaryEncounterId);
 
-        score += Math.Min(data.RecentReportCodes.Count, 10);
         return score;
     }
 
@@ -219,15 +215,10 @@ internal sealed class FFLogsCandidateMatcher
 
 internal sealed class FFLogsCandidateMatchResult
 {
-    public FFLogsCandidateMatchResult(
-        Dictionary<ulong, ParseResult> resultsByContentId,
-        Dictionary<ulong, FFLogsClient.CharacterFetchedData> chosenDataByContentId)
+    public FFLogsCandidateMatchResult(Dictionary<ulong, ParseResult> resultsByContentId)
     {
         ResultsByContentId = resultsByContentId ?? throw new ArgumentNullException(nameof(resultsByContentId));
-        ChosenDataByContentId = chosenDataByContentId ?? throw new ArgumentNullException(nameof(chosenDataByContentId));
     }
 
     public Dictionary<ulong, ParseResult> ResultsByContentId { get; }
-
-    public Dictionary<ulong, FFLogsClient.CharacterFetchedData> ChosenDataByContentId { get; }
 }

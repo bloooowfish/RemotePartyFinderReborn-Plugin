@@ -8,12 +8,12 @@ public static class TomestoneEncounterMapping
     private static readonly IReadOnlyDictionary<(uint ZoneId, uint EncounterId), TomestoneEncounterParams> UltimateMappings =
         new Dictionary<(uint ZoneId, uint EncounterId), TomestoneEncounterParams>
         {
-            [(59, 1073)] = new("stormblood", "ultimates", "the-unending-coil-of-bahamut-ultimate"),
-            [(59, 1074)] = new("stormblood", "ultimates", "the-weapons-refrain-ultimate"),
-            [(59, 1075)] = new("shadowbringers", "ultimates", "the-epic-of-alexander-ultimate"),
-            [(59, 1076)] = new("endwalker", "ultimates", "dragonsongs-reprise-ultimate"),
-            [(59, 1077)] = new("endwalker", "ultimates", "the-omega-protocol-ultimate"),
-            [(65, 1079)] = new("dawntrail", "ultimates", "futures-rewritten-ultimate"),
+            [(59, 1073)] = new("stormblood", "ultimates", "the-unending-coil-of-bahamut-ultimate", TargetCanonicalNames: ["the-unending-coil-of-bahamut-ultimate"]),
+            [(59, 1074)] = new("stormblood", "ultimates", "the-weapons-refrain-ultimate", TargetCanonicalNames: ["the-weapons-refrain-ultimate"]),
+            [(59, 1075)] = new("shadowbringers", "ultimates", "the-epic-of-alexander-ultimate", TargetCanonicalNames: ["the-epic-of-alexander-ultimate"]),
+            [(59, 1076)] = new("endwalker", "ultimates", "dragonsongs-reprise-ultimate", TargetCanonicalNames: ["dragonsongs-reprise-ultimate"]),
+            [(59, 1077)] = new("endwalker", "ultimates", "the-omega-protocol-ultimate", TargetCanonicalNames: ["the-omega-protocol-ultimate"]),
+            [(65, 1079)] = new("dawntrail", "ultimates", "futures-rewritten-ultimate", TargetCanonicalNames: ["futures-rewritten-ultimate"]),
         };
 
     private static readonly IReadOnlyDictionary<(uint ZoneId, uint EncounterId), TomestoneEncounterParams> ProgressionMappings =
@@ -24,22 +24,26 @@ public static class TomestoneEncounterMapping
                     "dawntrail",
                     "raids",
                     "aac-heavyweight-m1-savage",
-                    TomestoneProgressKind.BossPercentage),
+                    TomestoneProgressKind.BossPercentage,
+                    ["vamp-fatale"]),
                 [(73, 102)] = new(
                     "dawntrail",
                     "raids",
                     "aac-heavyweight-m2-savage",
-                    TomestoneProgressKind.BossPercentage),
+                    TomestoneProgressKind.BossPercentage,
+                    ["red-hot-deep-blue"]),
                 [(73, 103)] = new(
                     "dawntrail",
                     "raids",
                     "aac-heavyweight-m3-savage",
-                    TomestoneProgressKind.BossPercentage),
+                    TomestoneProgressKind.BossPercentage,
+                    ["the-tyrant"]),
                 [(73, 105)] = new(
                     "dawntrail",
                     "raids",
                     "aac-heavyweight-m4-savage",
-                    TomestoneProgressKind.BossPercentage),
+                    TomestoneProgressKind.BossPercentage,
+                    ["lindwurm-ii"]),
             })
             .ToDictionary(static mapping => mapping.Key, static mapping => mapping.Value);
 
