@@ -253,6 +253,58 @@ public sealed class FFLogsResultSubmitterTests
     }
 
     [Fact]
+    public async Task Result_submitter_logs_tomestone_progress_upload_summary()
+    {
+        var configuration = CreateConfiguration();
+        var submitBuffer = new FFLogsSubmitBuffer();
+        var infoLogs = new List<string>();
+        var sender = new StubFFLogsIngestHttpSender
+        {
+            OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{\"status\":\"ok\",\"submitted\":3,\"accepted\":3,\"updated\":3,\"rejected\":0}", Encoding.UTF8, "application/json"),
+            }),
+        };
+        var seams = FFLogsCollector.CreateSeams(sender, new StubFFLogsApiClient(), new ManualFFLogsTimeProvider());
+        var submitter = new FFLogsResultSubmitter(seams, submitBuffer);
+        var session = new FFLogsLeaseSession(new UploadUrl("https://session-owner.example/"), []);
+        var tomestoneOnly = CreateResult(contentId: 4701);
+        tomestoneOnly.SourceKind = "tomestone_api";
+        tomestoneOnly.PhaseProgress[1079] =
+        [
+            new PhaseProgress
+            {
+                PhaseKey = "p2",
+                PhaseName = "Diamond Dust",
+                Order = 2,
+                BossPercentage = 52.4,
+                DisplayText = "P2 52.4%",
+                Source = "tomestone_api",
+            },
+        ];
+        var tomestoneEnriched = CreateResult(contentId: 4702);
+        tomestoneEnriched.BossPercentages[105] = 5.76;
+
+        await submitter.TrySubmitResultsAsync(
+            configuration,
+            session,
+            [CreateResult(contentId: 4700), tomestoneOnly, tomestoneEnriched],
+            CancellationToken.None,
+            infoLogs.Add,
+            static _ => { },
+            static _ => { });
+
+        var message = Assert.Single(infoLogs);
+        Assert.Contains("submitted=3", message, StringComparison.Ordinal);
+        Assert.Contains("tomestone_only=1", message, StringComparison.Ordinal);
+        Assert.Contains("tomestone_progress_results=2", message, StringComparison.Ordinal);
+        Assert.Contains("phase_progress_results=1", message, StringComparison.Ordinal);
+        Assert.Contains("phase_progress_entries=1", message, StringComparison.Ordinal);
+        Assert.Contains("boss_percentage_results=1", message, StringComparison.Ordinal);
+        Assert.Contains("boss_percentage_entries=1", message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Parse_result_serializes_phase_progress_with_snake_case_nested_fields()
     {
         var result = CreateResult(contentId: 4601);

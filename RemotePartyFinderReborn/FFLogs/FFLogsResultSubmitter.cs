@@ -49,6 +49,7 @@ internal sealed class FFLogsResultSubmitter
             return new FFLogsResultSubmitAttempt(false, false);
         }
 
+        var submitSummary = SummarizeSubmitBatch(submitBatch);
         var jsonContent = JsonConvert.SerializeObject(submitBatch);
         var result = await _protectedExecutor.ExecuteAsync(
             configuration,
@@ -71,11 +72,11 @@ internal sealed class FFLogsResultSubmitter
             if (TryParseResultsSubmitResponse(result.Body, out var parsed))
             {
                 infoLog(
-                    $"Uploaded parse results: updated={parsed.Updated}, accepted={parsed.Accepted}/{parsed.Submitted}, rejected={parsed.Rejected}, status={parsed.Status}.");
+                    $"Uploaded parse results: updated={parsed.Updated}, accepted={parsed.Accepted}/{parsed.Submitted}, submitted={parsed.Submitted}, rejected={parsed.Rejected}, status={parsed.Status}, {submitSummary.ToLogFragment()}.");
             }
             else
             {
-                infoLog($"Uploaded {submitBatch.Count} parse results.");
+                infoLog($"Uploaded {submitBatch.Count} parse results: {submitSummary.ToLogFragment()}.");
             }
 
             return new FFLogsResultSubmitAttempt(false, false);
@@ -89,11 +90,11 @@ internal sealed class FFLogsResultSubmitter
 
         if (!result.StatusCode.HasValue)
         {
-            errorLog($"Failed to upload results (exception): {result.FailureBody} (requeued {submitBatch.Count})");
+            errorLog($"Failed to upload results (exception): {result.FailureBody} (requeued {submitBatch.Count}, {submitSummary.ToLogFragment()})");
             return new FFLogsResultSubmitAttempt(true, false);
         }
 
-        errorLog($"Failed to upload results: {result.StatusCode} (requeued {submitBatch.Count}) body={result.Body}");
+        errorLog($"Failed to upload results: {result.StatusCode} (requeued {submitBatch.Count}, {submitSummary.ToLogFragment()}) body={result.Body}");
         return new FFLogsResultSubmitAttempt(!result.AuthFailure, false);
     }
 
@@ -103,4 +104,67 @@ internal sealed class FFLogsResultSubmitter
         return IngestJson.TryDeserializeObject(content, out parsed);
     }
 
+    private static FFLogsSubmitBatchSummary SummarizeSubmitBatch(IReadOnlyCollection<ParseResult> submitBatch)
+    {
+        var tomestoneOnlyResults = 0;
+        var tomestoneProgressResults = 0;
+        var phaseProgressResults = 0;
+        var phaseProgressEntries = 0;
+        var bossPercentageResults = 0;
+        var bossPercentageEntries = 0;
+
+        foreach (var result in submitBatch)
+        {
+            if (string.Equals(result.SourceKind, "tomestone_api", StringComparison.Ordinal))
+            {
+                tomestoneOnlyResults++;
+            }
+
+            var resultPhaseEntries = result.PhaseProgress?
+                .Sum(static entry => entry.Value?.Count ?? 0) ?? 0;
+            var resultBossEntries = result.BossPercentages?.Count ?? 0;
+
+            if (resultPhaseEntries > 0)
+            {
+                phaseProgressResults++;
+                phaseProgressEntries += resultPhaseEntries;
+            }
+
+            if (resultBossEntries > 0)
+            {
+                bossPercentageResults++;
+                bossPercentageEntries += resultBossEntries;
+            }
+
+            if (resultPhaseEntries > 0 || resultBossEntries > 0)
+            {
+                tomestoneProgressResults++;
+            }
+        }
+
+        return new FFLogsSubmitBatchSummary(
+            tomestoneOnlyResults,
+            tomestoneProgressResults,
+            phaseProgressResults,
+            phaseProgressEntries,
+            bossPercentageResults,
+            bossPercentageEntries);
+    }
+
+    private sealed record FFLogsSubmitBatchSummary(
+        int TomestoneOnlyResults,
+        int TomestoneProgressResults,
+        int PhaseProgressResults,
+        int PhaseProgressEntries,
+        int BossPercentageResults,
+        int BossPercentageEntries)
+    {
+        public string ToLogFragment()
+            => $"tomestone_only={TomestoneOnlyResults}, "
+               + $"tomestone_progress_results={TomestoneProgressResults}, "
+               + $"phase_progress_results={PhaseProgressResults}, "
+               + $"phase_progress_entries={PhaseProgressEntries}, "
+               + $"boss_percentage_results={BossPercentageResults}, "
+               + $"boss_percentage_entries={BossPercentageEntries}";
+    }
 }
