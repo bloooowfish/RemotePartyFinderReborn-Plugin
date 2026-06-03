@@ -107,6 +107,37 @@ public sealed class TomestoneApiClientAdapterTests
     }
 
     [Fact]
+    public async Task FetchProgressionDataAsync_builds_dancing_mad_progression_graph_endpoint()
+    {
+        var handler = new RecordingTomestoneHttpMessageHandler();
+        using var client = new TomestoneApiClient(
+            new Configuration
+            {
+                EnableTomestoneProgressEnrichment = true,
+                TomestoneApiKey = "secret-token",
+            },
+            handler);
+        var adapter = CreateAdapter(
+            client,
+            new Configuration
+            {
+                EnableTomestoneProgressEnrichment = true,
+                TomestoneApiKey = "secret-token",
+            });
+
+        await adapter.FetchProgressionDataAsync(
+            "Alpha",
+            "Tonberry",
+            76,
+            1085,
+            CancellationToken.None);
+
+        var request = Assert.Single(handler.Requests);
+        Assert.Equal("/api/character/progression-graph/Tonberry/Alpha", request.RequestUri?.AbsolutePath);
+        Assert.Equal("?expansion=dawntrail&zone=ultimates&encounter=dancing-mad-ultimate", request.RequestUri?.Query);
+    }
+
+    [Fact]
     public async Task FetchProgressionDataAsync_builds_current_savage_progression_graph_endpoint()
     {
         var handler = new RecordingTomestoneHttpMessageHandler();

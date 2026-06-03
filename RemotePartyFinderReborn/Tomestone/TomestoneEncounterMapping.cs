@@ -14,6 +14,7 @@ public static class TomestoneEncounterMapping
             [(59, 1076)] = new("endwalker", "ultimates", "dragonsongs-reprise-ultimate", TargetCanonicalNames: ["dragonsongs-reprise-ultimate"]),
             [(59, 1077)] = new("endwalker", "ultimates", "the-omega-protocol-ultimate", TargetCanonicalNames: ["the-omega-protocol-ultimate"]),
             [(65, 1079)] = new("dawntrail", "ultimates", "futures-rewritten-ultimate", TargetCanonicalNames: ["futures-rewritten-ultimate"]),
+            [(76, 1085)] = new("dawntrail", "ultimates", "dancing-mad-ultimate", TargetCanonicalNames: ["dancing-mad-ultimate"]),
         };
 
     private static readonly IReadOnlyDictionary<(uint ZoneId, uint EncounterId), TomestoneEncounterParams> ProgressionMappings =

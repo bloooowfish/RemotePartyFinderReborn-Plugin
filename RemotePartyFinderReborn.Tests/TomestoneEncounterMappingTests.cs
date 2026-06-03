@@ -12,6 +12,7 @@ public sealed class TomestoneEncounterMappingTests
     [InlineData(59u, 1076u, "endwalker", "ultimates", "dragonsongs-reprise-ultimate")]
     [InlineData(59u, 1077u, "endwalker", "ultimates", "the-omega-protocol-ultimate")]
     [InlineData(65u, 1079u, "dawntrail", "ultimates", "futures-rewritten-ultimate")]
+    [InlineData(76u, 1085u, "dawntrail", "ultimates", "dancing-mad-ultimate")]
     public void TryGetUltimateParams_returns_expected_params_for_known_ultimate(
         uint zoneId,
         uint encounterId,
