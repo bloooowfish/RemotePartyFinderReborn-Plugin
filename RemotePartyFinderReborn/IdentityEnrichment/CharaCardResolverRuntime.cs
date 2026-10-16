@@ -10,6 +10,8 @@ using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.Game.Network;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
+using FFXIVClientStructs.FFXIV.Client.UI.Misc;
+using FFXIVClientStructs.FFXIV.Component.GUI;
 
 #nullable enable
 
@@ -157,32 +159,27 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
     private const int CharaCardPacketNameOffset = 0x1A9;
     private const int CharaCardPacketNameLength = 32;
 
-    // These helpers are not exposed as generated interop yet, so resolve them by signature.
-    private const string HandleCurrentCharaCardDataPacketSignature =
-        "40 53 48 83 EC ?? 8B 05 ?? ?? ?? ?? 48 8B DA";
+    // CharaCard packet handling is exposed by the generated FFXIVClientStructs interop.
     private const string CharaCardUpdateResponseDispatcherSignature =
-        "48 89 5C 24 08 57 48 83 EC 20 41 8B F8 8B DA 85 D2 0F 85 84 01 00 00 38 51 68 0F 84 3B 02 00 00 44 0F B6 81 E0 01 00 00 45 33 D2 41 F6 C0 04";
-    private const string AgentOpenCharaCardForPacketSignature =
-        "40 55 53 57 41 57 48 8D AC 24 ?? ?? ?? ?? 48 81 EC B8 04 00 00";
+        "48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 EC 20 41 8B F1 41 8B F8 8B DA";
+    // SelectOk state transition has no generated member-function address. Keep the
+    // ABI-verified 7.57 signature because the agent vtable is not guaranteed to be
+    // instantiated when plugin initialization runs.
     private const string SelectOkStateTransitionSignature =
-        "40 55 53 56 57 48 8D 6C 24 88 48 81 EC 78 01 00 00 48 8B 05 50 C2 A7 01 48 33 C4 48 89 45 60 8B 85 C0 00 00 00 49 8B F8 48 8B F2 48 8B D9 83 F8 01 75 17";
-    private const string GameUiMessageSignature =
-        "48 89 5C 24 10 48 89 74 24 18 48 89 7C 24 20 55 48 8D AC 24 80 FE FF FF 48 81 EC 80 02 00 00 48 8B 05 22 F9 E4 01 48 33 C4 48 89 85 70 01 00 00";
-    private const string ParameterizedGameUiMessageSignature =
-        "48 89 5C 24 10 48 89 74 24 18 55 57 41 56 48 8D AC 24 20 FE FF FF 48 81 EC E0 02 00 00 48 8B 05 C4 F6 E4 01 48 33 C4 48 89 85 D0 01 00 00 45 33 F6";
+        "40 55 53 56 57 48 8D 6C 24 ?? 48 81 EC 78 01 00 00";
     private const string CreateSelectOkDialogSignature =
-        "40 53 55 56 57 41 56 48 81 EC 90 00 00 00 48 8B 05 23 86 A7 01 48 33 C4 48 89 84 24 80 00 00 00 BF 04 00 00 00 41 8B E8 44 8B CF 48 8D 44 24 40";
+        "40 53 55 56 57 41 56 48 81 EC 90 00 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 ?? ?? ?? ?? BF 04 00 00 00";
 
     private readonly IGameInteropProvider _interopProvider;
     private readonly delegate*<CharaCard*> _instanceResolver;
     private readonly Action<string>? _warningSink;
     private readonly Action<string>? _debugSink;
-    private Hook<HandleCurrentCharaCardDataPacketDelegate>? _packetHook;
+    private Hook<CharaCard.Delegates.HandleCurrentCharaCardDataPacket>? _packetHook;
     private Hook<CharaCardUpdateResponseDispatcherDelegate>? _responseStatusDispatcherHook;
     private Hook<AgentOpenCharaCardForPacketDelegate>? _agentPacketHook;
     private Hook<SelectOkStateTransitionDelegate>? _selectOkStateTransitionHook;
-    private Hook<GameUiMessageDelegate>? _gameUiMessageHook;
-    private Hook<ParameterizedGameUiMessageDelegate>? _parameterizedGameUiMessageHook;
+    private Hook<RaptureLogModule.Delegates.ShowLogMessage>? _gameUiMessageHook;
+    private Hook<RaptureLogModule.Delegates.ShowLogMessageUInt>? _parameterizedGameUiMessageHook;
     private Hook<CreateSelectOkDialogDelegate>? _createSelectOkDialogHook;
     private InteropHookBundle? _hookBundle;
     private bool _loggedPacketDetourHit;
@@ -199,13 +196,10 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
     private Func<GameUiMessageModel, bool>? _parameterizedGameUiMessageHandler;
     private Func<SelectOkDialogRequestModel, bool>? _selectOkDialogHandler;
 
-    private delegate void HandleCurrentCharaCardDataPacketDelegate(CharaCard* thisPtr, CharaCardPacket* packet);
-    private delegate void CharaCardUpdateResponseDispatcherDelegate(nint thisPtr, int responseCode, uint responseDetail);
+    private delegate void CharaCardUpdateResponseDispatcherDelegate(CharaCard* thisPtr, int responseCode, uint responseDetail, int timestamp);
     private delegate void AgentOpenCharaCardForPacketDelegate(AgentCharaCard* thisPtr, CharaCardPacket* packet, bool a3);
-    private delegate nint SelectOkStateTransitionDelegate(nint thisPtr, nint statePtr, nint eventPtr, nint arg4, int action);
-    private delegate void GameUiMessageDelegate(nint thisPtr, uint messageId);
-    private delegate void ParameterizedGameUiMessageDelegate(nint thisPtr, uint messageId, uint param);
-    private delegate uint CreateSelectOkDialogDelegate(nint thisPtr, uint messageId, nuint variant);
+    private delegate AtkValue* SelectOkStateTransitionDelegate(AgentCharaCard* thisPtr, AtkValue* returnValue, AtkValue* values, uint valueCount, ulong eventKind);
+    private delegate uint CreateSelectOkDialogDelegate(AgentCharaCard* thisPtr, uint messageId, uint variant);
 
     internal static DalamudCharaCardResolverRuntime Create(
         IGameInteropProvider interopProvider,
@@ -260,11 +254,11 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
         _selectOkDialogHandler = selectOkDialogHandler;
         var hooks = new InteropHookBundle();
         try {
-            _packetHook = CreateRequiredHook<HandleCurrentCharaCardDataPacketDelegate>(
-                "HandleCurrentCharaCardDataPacket",
-                HandleCurrentCharaCardDataPacketSignature,
+            _packetHook = _interopProvider.HookFromAddress<CharaCard.Delegates.HandleCurrentCharaCardDataPacket>(
+                (nint)CharaCard.Addresses.HandleCurrentCharaCardDataPacket.Value,
                 HandleCurrentCharaCardDataPacketDetour
             );
+            _debugSink?.Invoke("CharaCardResolver: initialized required HandleCurrentCharaCardDataPacket hook from FFXIVClientStructs address.");
             hooks.Add(_packetHook);
             _responseStatusDispatcherHook = TryCreateOptionalHook<CharaCardUpdateResponseDispatcherDelegate>(
                 "CharaCardUpdateResponseDispatcher",
@@ -272,9 +266,9 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
                 CharaCardUpdateResponseDispatcherDetour
             );
             AddOptionalHook(hooks, _responseStatusDispatcherHook);
-            _agentPacketHook = TryCreateOptionalHook<AgentOpenCharaCardForPacketDelegate>(
+            _agentPacketHook = TryCreateOptionalAddressHook<AgentOpenCharaCardForPacketDelegate>(
                 "AgentOpenCharaCardForPacket",
-                AgentOpenCharaCardForPacketSignature,
+                (nint)AgentCharaCard.Addresses.OpenCharaCardForPacket.Value,
                 AgentOpenCharaCardForPacketDetour
             );
             AddOptionalHook(hooks, _agentPacketHook);
@@ -359,34 +353,39 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
     }
 
     private void TryInitializeOptionalGameUiMessageHooks() {
-        _gameUiMessageHook = TryCreateOptionalHook<GameUiMessageDelegate>(
-            "GameUiMessage",
-            GameUiMessageSignature,
+        _gameUiMessageHook = TryCreateOptionalAddressHook<RaptureLogModule.Delegates.ShowLogMessage>(
+            "ShowLogMessage",
+            (nint)RaptureLogModule.Addresses.ShowLogMessage.Value,
             GameUiMessageDetour
         );
 
-        _parameterizedGameUiMessageHook = TryCreateOptionalHook<ParameterizedGameUiMessageDelegate>(
-            "ParameterizedGameUiMessage",
-            ParameterizedGameUiMessageSignature,
+        _parameterizedGameUiMessageHook = TryCreateOptionalAddressHook<RaptureLogModule.Delegates.ShowLogMessageUInt>(
+            "ShowLogMessageUInt",
+            (nint)RaptureLogModule.Addresses.ShowLogMessageUInt.Value,
             ParameterizedGameUiMessageDetour
         );
-    }
-
-    private Hook<T> CreateRequiredHook<T>(string name, string signature, T detour) where T : Delegate {
-        try {
-            var hook = _interopProvider.HookFromSignature(signature, detour);
-            _debugSink?.Invoke($"CharaCardResolver: initialized required {name} hook.");
-            return hook;
-        } catch (Exception exception) {
-            _warningSink?.Invoke($"CharaCardResolver: failed to initialize required {name} hook. {exception.Message}");
-            throw;
-        }
     }
 
     private Hook<T>? TryCreateOptionalHook<T>(string name, string signature, T detour) where T : Delegate {
         try {
             var hook = _interopProvider.HookFromSignature(signature, detour);
             _debugSink?.Invoke($"CharaCardResolver: initialized optional {name} hook.");
+            return hook;
+        } catch (Exception exception) {
+            _debugSink?.Invoke($"CharaCardResolver: optional {name} hook unavailable. {exception.Message}");
+            return null;
+        }
+    }
+
+    private Hook<T>? TryCreateOptionalAddressHook<T>(string name, nint address, T detour) where T : Delegate {
+        if (address == 0) {
+            _debugSink?.Invoke($"CharaCardResolver: optional {name} interop address unavailable.");
+            return null;
+        }
+
+        try {
+            var hook = _interopProvider.HookFromAddress(address, detour);
+            _debugSink?.Invoke($"CharaCardResolver: initialized optional {name} hook from FFXIVClientStructs address.");
             return hook;
         } catch (Exception exception) {
             _debugSink?.Invoke($"CharaCardResolver: optional {name} hook unavailable. {exception.Message}");
@@ -413,7 +412,7 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
         }
     }
 
-    private void CharaCardUpdateResponseDispatcherDetour(nint thisPtr, int responseCode, uint responseDetail) {
+    private void CharaCardUpdateResponseDispatcherDetour(CharaCard* thisPtr, int responseCode, uint responseDetail, int timestamp) {
         try {
             if (!_loggedResponseStatusDetourHit) {
                 _loggedResponseStatusDetourHit = true;
@@ -428,7 +427,7 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
             _warningSink?.Invoke($"CharaCardResolver: failed to process CharaCard update response dispatcher. {exception.Message}");
         }
 
-        _responseStatusDispatcherHook?.Original(thisPtr, responseCode, responseDetail);
+        _responseStatusDispatcherHook?.Original(thisPtr, responseCode, responseDetail, timestamp);
     }
 
     private void AgentOpenCharaCardForPacketDetour(AgentCharaCard* thisPtr, CharaCardPacket* packet, bool a3) {
@@ -446,7 +445,7 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
         }
     }
 
-    private void GameUiMessageDetour(nint thisPtr, uint messageId) {
+    private void GameUiMessageDetour(RaptureLogModule* thisPtr, uint messageId) {
         try {
             if (CharaCardResolver.PlateFailureMessageIds.Contains(messageId) && !_loggedSimpleGameUiMessageDetourHit) {
                 _loggedSimpleGameUiMessageDetourHit = true;
@@ -462,7 +461,7 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
         _gameUiMessageHook?.Original(thisPtr, messageId);
     }
 
-    private void ParameterizedGameUiMessageDetour(nint thisPtr, uint messageId, uint param) {
+    private void ParameterizedGameUiMessageDetour(RaptureLogModule* thisPtr, uint messageId, uint param) {
         try {
             if (CharaCardResolver.PlateFailureMessageIds.Contains(messageId) && !_loggedParameterizedGameUiMessageDetourHit) {
                 _loggedParameterizedGameUiMessageDetourHit = true;
@@ -480,52 +479,53 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
         _parameterizedGameUiMessageHook?.Original(thisPtr, messageId, param);
     }
 
-    private nint SelectOkStateTransitionDetour(nint thisPtr, nint statePtr, nint eventPtr, nint arg4, int action) {
+    private AtkValue* SelectOkStateTransitionDetour(AgentCharaCard* thisPtr, AtkValue* returnValue, AtkValue* values, uint valueCount, ulong eventKind) {
         try {
-            var storage = GetCharaCardStorage(thisPtr);
+            var storage = thisPtr == null ? null : thisPtr->Data;
             if (storage != null && !_loggedSelectOkStateTransitionDetourHit) {
                 _loggedSelectOkStateTransitionDetourHit = true;
                 _debugSink?.Invoke(
-                    $"CharaCardResolver: hit SelectOk state transition detour action={action} contentId={storage->ContentId}."
+                    $"CharaCardResolver: hit SelectOk state transition detour eventKind={eventKind} contentId={storage->ContentId}."
                 );
             }
             if (storage != null
                 && _selectOkStateTransitionHandler?.Invoke(new SelectOkStateTransitionModel(
                     storage->ContentId,
-                    action,
+                    unchecked((int)eventKind),
                     storage->CanEdit,
                     storage->IsNotCreated,
                     storage->WasResetDueToFantasia
                 )) == false) {
                 storage->SelectOkAddonId = 0;
-                if (statePtr != 0) {
-                    *(int*)statePtr = 2;
-                    *((byte*)statePtr + 8) = 0;
+                if (returnValue != null) {
+                    returnValue->SetBool(false);
                 }
 
-                return statePtr;
+                return returnValue;
             }
         } catch (Exception exception) {
             _warningSink?.Invoke($"CharaCardResolver: failed to process SelectOk state transition. {exception.Message}");
         }
 
-        return _selectOkStateTransitionHook?.Original(thisPtr, statePtr, eventPtr, arg4, action) ?? statePtr;
+        return _selectOkStateTransitionHook is { } hook
+            ? hook.Original(thisPtr, returnValue, values, valueCount, eventKind)
+            : returnValue;
     }
 
-    private uint CreateSelectOkDialogDetour(nint thisPtr, uint messageId, nuint variant) {
+    private uint CreateSelectOkDialogDetour(AgentCharaCard* thisPtr, uint messageId, uint variant) {
         try {
-            var storage = GetCharaCardStorage(thisPtr);
+            var storage = thisPtr == null ? null : thisPtr->Data;
             if (storage != null && !_loggedFinalSelectOkDialogDetourHit) {
                 _loggedFinalSelectOkDialogDetourHit = true;
                 _debugSink?.Invoke(
-                    $"CharaCardResolver: hit final SelectOk dialog detour messageId=0x{messageId:X} variant={(int)variant} contentId={storage->ContentId}."
+                    $"CharaCardResolver: hit final SelectOk dialog detour messageId=0x{messageId:X} variant={variant} contentId={storage->ContentId}."
                 );
             }
             if (storage != null
                 && _selectOkDialogHandler?.Invoke(new SelectOkDialogRequestModel(
                     storage->ContentId,
                     messageId,
-                    (int)variant,
+                    unchecked((int)variant),
                     storage->IsNotCreated,
                     storage->WasResetDueToFantasia
                 )) == false) {
@@ -536,10 +536,6 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
         }
 
         return _createSelectOkDialogHook?.Original(thisPtr, messageId, variant) ?? 0;
-    }
-
-    private static AgentCharaCard.Storage* GetCharaCardStorage(nint thisPtr) {
-        return thisPtr == 0 ? null : ((AgentCharaCard*)thisPtr)->Data;
     }
 
     private static CharaCardPacketModel CreatePacketModel(CharaCardPacket* packet) {

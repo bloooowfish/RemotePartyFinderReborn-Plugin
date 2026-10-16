@@ -21,15 +21,22 @@ public sealed class PartyFinderSlotFlagFormatterTests {
     }
 
     [Fact]
-    public void FormatAcceptingJobs_ignores_non_job_bits_without_hiding_known_jobs() {
+    public void FormatAcceptingJobs_formats_high_bit_beastmaster_with_existing_jobs() {
         Assert.Equal(
-            "Tank: PLD",
+            "Tank: PLD; DPS: BST",
             PartyFinderSlotFlagFormatter.FormatAcceptingJobs("0x0000000100000101"));
     }
 
     [Fact]
     public void FormatAcceptingJobs_returns_none_when_mask_has_only_non_job_bits() {
-        Assert.Equal("None", PartyFinderSlotFlagFormatter.FormatAcceptingJobs("0x0000000100000001"));
+        Assert.Equal("None", PartyFinderSlotFlagFormatter.FormatAcceptingJobs("0x0000000000000001"));
+    }
+
+    [Fact]
+    public void FormatAcceptingJobs_keeps_beastmaster_with_legacy_dps_flags() {
+        Assert.Equal(
+            "DPS: BLU/BST",
+            PartyFinderSlotFlagFormatter.FormatAcceptingJobs("0x0000000102000000"));
     }
 
     [Fact]

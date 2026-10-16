@@ -25,7 +25,7 @@ internal static class PartyFinderSlotFlagFormatter {
 
         var groups = new List<string>(4);
         var acceptedJobs = OrderedJobFlags
-            .Where(job => (raw & (uint)job) != 0)
+            .Where(job => (raw & (ulong)job) != 0)
             .ToArray();
 
         foreach (var role in RoleOrder) {
@@ -98,7 +98,8 @@ internal static class PartyFinderSlotFlagFormatter {
                 or JobFlags.Dancer
                 or JobFlags.Reaper
                 or JobFlags.Viper
-                or JobFlags.Pictomancer => JobRoleGroup.Dps,
+                or JobFlags.Pictomancer
+                or JobFlags.Beastmaster => JobRoleGroup.Dps,
             _ => JobRoleGroup.Other,
         };
     }
@@ -145,6 +146,7 @@ internal static class PartyFinderSlotFlagFormatter {
             JobFlags.Sage => "SGE",
             JobFlags.Viper => "VPR",
             JobFlags.Pictomancer => "PCT",
+            JobFlags.Beastmaster => "BST",
             _ => job.ToString(),
         };
     }

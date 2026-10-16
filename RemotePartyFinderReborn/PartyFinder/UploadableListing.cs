@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using Dalamud.Game.Gui.PartyFinder.Types;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
@@ -114,14 +115,50 @@ internal sealed class UploadableListing {
 [Serializable]
 [JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
 internal sealed class UploadableSlot {
-    public uint Accepting { get; }
+    private static readonly FieldInfo RawAcceptingField = typeof(PartyFinderSlot).GetField(
+        "accepting",
+        BindingFlags.Instance | BindingFlags.NonPublic
+    ) ?? throw new MissingFieldException(typeof(PartyFinderSlot).FullName, "accepting");
+
+    [JsonConverter(typeof(AcceptingFlagsJsonConverter))]
+    public ulong Accepting { get; }
 
     internal UploadableSlot(PartyFinderSlot source) {
-        var mask = 0u;
-        foreach (var acceptingFlag in source.Accepting) {
-            mask |= (uint)acceptingFlag;
+        ArgumentNullException.ThrowIfNull(source);
+        // Dalamud's Accepting collection currently uses an indexer that casts JobFlags to uint.
+        // That makes every flag above bit 31 (including Beastmaster) appear unset, so preserve
+        // the raw mask stored by PartyFinderSlot instead of rebuilding it from that collection.
+        Accepting = (ulong)(RawAcceptingField.GetValue(source)
+            ?? throw new InvalidOperationException("PartyFinderSlot accepting flags were unavailable."));
+    }
+}
+
+/// <summary>
+/// Keeps the existing JSON number representation for masks understood by older servers while
+/// encoding values that exceed UInt32 as fixed-width hexadecimal strings to avoid precision loss.
+/// </summary>
+internal sealed class AcceptingFlagsJsonConverter : JsonConverter {
+    public override bool CanConvert(Type objectType) => objectType == typeof(ulong);
+
+    public override void WriteJson(JsonWriter writer, object value, JsonSerializer serializer) {
+        var flags = value is ulong raw
+            ? raw
+            : throw new JsonSerializationException("Expected a UInt64 accepting-job mask.");
+
+        if (flags <= uint.MaxValue) {
+            writer.WriteValue((uint)flags);
+            return;
         }
 
-        Accepting = mask;
+        writer.WriteValue($"0x{flags:X16}");
     }
+
+    public override object ReadJson(
+        JsonReader reader,
+        Type objectType,
+        object existingValue,
+        JsonSerializer serializer
+    ) => throw new NotSupportedException("Accepting flags are only serialized for uploads.");
+
+    public override bool CanRead => false;
 }
