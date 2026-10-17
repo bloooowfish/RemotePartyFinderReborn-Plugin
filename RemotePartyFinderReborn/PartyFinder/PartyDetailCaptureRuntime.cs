@@ -248,10 +248,14 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     }
 
     internal void OnFrameworkUpdate() {
-        ObserveFrameworkTick(
-            PartyDetailSnapshotBuilder.TryBuildFromAgent(out var snapshot, out var debugSnapshot) ? snapshot : null,
-            debugSnapshot
-        );
+        OnFrameworkUpdate(BuildAgentSnapshot);
+    }
+
+    internal void TestFrameworkUpdate(
+        Func<(UploadablePartyDetail? Snapshot, PartyDetailDebugSnapshot? DebugSnapshot)> snapshotFactory
+    ) {
+        ArgumentNullException.ThrowIfNull(snapshotFactory);
+        OnFrameworkUpdate(snapshotFactory);
     }
 
     internal void TestObservePopulationEvent() {
@@ -361,12 +365,73 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         TryRecordAgentSnapshot(snapshot, debugSnapshot, enforceFreshness: true);
     }
 
+    private static (UploadablePartyDetail? Snapshot, PartyDetailDebugSnapshot? DebugSnapshot) BuildAgentSnapshot() {
+        return PartyDetailSnapshotBuilder.TryBuildFromAgent(out var snapshot, out var debugSnapshot)
+            ? (snapshot, debugSnapshot)
+            : (null, debugSnapshot);
+    }
+
+    private void OnFrameworkUpdate(
+        Func<(UploadablePartyDetail? Snapshot, PartyDetailDebugSnapshot? DebugSnapshot)> snapshotFactory
+    ) {
+        // Snapshot construction reads native agent state and allocates several
+        // per-member collections. Skip it unless this request is currently
+        // eligible to accept a post-population snapshot.
+        if (!_state.TryGetCurrentRequestCycle(out var cycle)) {
+#if DEBUG
+            DebugPerformanceDiagnostics.Count(DebugPerformancePath.PartySnapshotSkippedNoRequest);
+#endif
+            return;
+        }
+
+        if (!HasObservedPostRequestPopulation(cycle.RequestSerial)) {
+#if DEBUG
+            DebugPerformanceDiagnostics.Count(DebugPerformancePath.PartySnapshotSkippedAwaitPopulation);
+#endif
+            return;
+        }
+
+        (UploadablePartyDetail? Snapshot, PartyDetailDebugSnapshot? DebugSnapshot) snapshotResult;
+#if DEBUG
+        var snapshotStartedAt = DebugPerformanceDiagnostics.Begin();
+        var snapshotAllocatedBefore = DebugPerformanceDiagnostics.AllocatedBytes();
+        try {
+            snapshotResult = snapshotFactory();
+        } finally {
+            DebugPerformanceDiagnostics.Record(DebugPerformancePath.PartySnapshotBuild, snapshotStartedAt, snapshotAllocatedBefore);
+        }
+#else
+        snapshotResult = snapshotFactory();
+#endif
+        var (snapshot, debugSnapshot) = snapshotResult;
+        if (snapshot is null) {
+#if DEBUG
+            DebugPerformanceDiagnostics.Count(DebugPerformancePath.PartySnapshotEmpty);
+#endif
+            return;
+        }
+
+        // The request may have changed while the native snapshot was being
+        // read. Validate the original serial and freshness again before record.
+        var recorded = TryRecordAgentSnapshot(snapshot, debugSnapshot, enforceFreshness: true, expectedRequestSerial: cycle.RequestSerial);
+#if DEBUG
+        DebugPerformanceDiagnostics.Count(recorded
+            ? DebugPerformancePath.PartySnapshotAccepted
+            : DebugPerformancePath.PartySnapshotRejected);
+#endif
+    }
+
     private bool TryRecordAgentSnapshot(
         UploadablePartyDetail snapshot,
         PartyDetailDebugSnapshot? debugSnapshot,
-        bool enforceFreshness
+        bool enforceFreshness,
+        long? expectedRequestSerial = null
     ) {
         if (!_state.TryGetCurrentRequestCycle(out var cycle)) {
+            return false;
+        }
+
+        if (expectedRequestSerial is { } expectedSerial && cycle.RequestSerial != expectedSerial) {
             return false;
         }
 

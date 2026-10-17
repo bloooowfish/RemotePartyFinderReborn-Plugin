@@ -105,7 +105,7 @@ public static class TomestoneProgressParser
             phases = ParseTargetPhaseProgress(targetNodes);
             if (phases.Count == 0)
             {
-                phases = ParsePhaseProgress(root);
+                phases = ParseEncounterActivityProgress(root, target, allowUnlabelled: false).Phases;
             }
         }
 
@@ -114,6 +114,139 @@ public static class TomestoneProgressParser
             : null;
 
         return new TomestoneProgressData(phases, bossPercentage);
+    }
+
+    // The activity endpoint is already scoped to one encounter. Profile activity is
+    // different: unlabelled rows there cannot safely be attributed to the target.
+    public static TomestoneProgressData ParseEncounterActivityProgress(string json, TomestoneEncounterParams target)
+    {
+        if (string.IsNullOrWhiteSpace(json) || target is null)
+        {
+            return TomestoneProgressData.Empty;
+        }
+
+        try
+        {
+            return ParseEncounterActivityProgress(JToken.Parse(json), target, allowUnlabelled: true);
+        }
+        catch (JsonException)
+        {
+            return TomestoneProgressData.Empty;
+        }
+    }
+
+    private static TomestoneProgressData ParseEncounterActivityProgress(
+        JToken root, TomestoneEncounterParams target, bool allowUnlabelled)
+    {
+        var rows = FindActivityRows(root);
+        if (rows is null)
+        {
+            return TomestoneProgressData.Empty;
+        }
+
+        var names = BuildTargetCanonicalNames(target);
+        var phases = new Dictionary<string, ParsedPhase>(StringComparer.Ordinal);
+        var percentages = new List<double>();
+        var rowIndex = 0;
+        foreach (var row in rows.OfType<JObject>())
+        {
+            var rowMatches = ObjectContainsTargetCanonical(row, names);
+            if (IsKillRow(row) || !ActivitySourceMatchesTarget(row, names, allowUnlabelled || rowMatches))
+            {
+                rowIndex++;
+                continue;
+            }
+
+            foreach (var source in EnumerateActivityProgressSources(row))
+            {
+                if (IsKillSource(source)
+                    || !ActivitySourceMatchesTarget(source, names, allowUnlabelled || rowMatches))
+                {
+                    continue;
+                }
+
+                if (target.ProgressKind == TomestoneProgressKind.PhaseProgress)
+                {
+                    if (TryReadProgressPhase(source, out var phaseName, out var order, out var percentage))
+                    {
+                        UpsertParsedPhase(phases, phaseName, order ?? rowIndex + 1, rowIndex, Math.Clamp(percentage, 0, 100));
+                    }
+                }
+                else if (TryReadBestPercentValue(source, out var percentage))
+                {
+                    percentages.Add(Math.Clamp(percentage, 0, 100));
+                }
+            }
+
+            rowIndex++;
+        }
+
+        return new TomestoneProgressData(BuildBestPhaseProgress(phases), percentages.Count > 0 ? percentages.Min() : null);
+    }
+
+    private static bool ActivitySourceMatchesTarget(
+        JObject source, IReadOnlyCollection<string> names, bool allowUnlabelled)
+    {
+        // Do not interpret a player's name or a mechanic name as an encounter label.
+        var labels = new List<string>();
+        foreach (var key in new[] { "canonicalName", "canonical_name", "zoneName" })
+        {
+            if (ReadStringProperty(source, key) is { Length: > 0 } label)
+            {
+                labels.Add(key == "zoneName" ? Slugify(label) : label);
+            }
+        }
+
+        if (TryReadObjectProperty(source, "encounter", out var encounter))
+        {
+            labels.AddRange(EnumerateCanonicalNames(encounter));
+        }
+
+        return labels.Count == 0 ? allowUnlabelled : labels.Any(label => names.Contains(label, StringComparer.OrdinalIgnoreCase));
+    }
+
+    public static string DescribeResponseShape(string json, TomestoneEncounterParams target)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return "empty";
+        }
+
+        JToken root;
+        try
+        {
+            root = JToken.Parse(json);
+        }
+        catch (JsonException)
+        {
+            return "invalid-json";
+        }
+
+        var topLevelKeys = root is JObject rootObject
+            ? string.Join(",", rootObject.Properties().Select(static property => property.Name).OrderBy(static name => name, StringComparer.Ordinal))
+            : root.Type.ToString();
+        var encounterSections = EnumerateDescendantsAndSelf(root)
+            .OfType<JProperty>()
+            .Where(static property => string.Equals(property.Name, "encounters", StringComparison.OrdinalIgnoreCase))
+            .Select(static property => property.Value)
+            .ToArray();
+        var encounterCount = encounterSections.SelectMany(EnumerateDescendantsAndSelf).OfType<JObject>().Distinct().Count();
+        var targetNodes = target is null
+            ? []
+            : FindTargetEncounterNodes(root, BuildTargetCanonicalNames(target));
+        var progressionFields = targetNodes
+            .Select(node => TryReadObjectProperty(node, "progression", out var progression) ? progression : null)
+            .OfType<JObject>()
+            .SelectMany(static progression => progression.Properties())
+            .Select(static property => property.Name)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(static name => name, StringComparer.Ordinal);
+        var graph = FindGraphArray(root);
+        var activityRows = FindActivityRows(root);
+
+        return $"rootKeys=[{topLevelKeys}] encounterSections={encounterSections.Length} encounterNodes={encounterCount} "
+            + $"targetNodes={targetNodes.Count} targetProgressionFields=[{string.Join(",", progressionFields)}] "
+            + $"graphItems={graph?.Count ?? 0} activityRows={activityRows?.Count ?? 0}";
     }
 
     private static IReadOnlyList<PhaseProgress> ParsePhaseProgress(JToken root)
@@ -197,16 +330,19 @@ public static class TomestoneProgressParser
         foreach (var property in EnumerateDescendantsAndSelf(root).OfType<JProperty>())
         {
             if (!string.Equals(property.Name, "encounters", StringComparison.OrdinalIgnoreCase)
-                || property.Value is not JArray encounters)
+                || property.Value is not (JArray or JObject))
             {
                 continue;
             }
 
-            foreach (var encounterNode in EnumerateDescendantsAndSelf(encounters).OfType<JObject>())
+            foreach (var encounterNode in EnumerateDescendantsAndSelf(property.Value).OfType<JObject>())
             {
                 if (ObjectMatchesTargetCanonical(encounterNode, targetCanonicalNames))
                 {
-                    targetNodes.Add(encounterNode);
+                    if (!targetNodes.Contains(encounterNode))
+                    {
+                        targetNodes.Add(encounterNode);
+                    }
                 }
             }
         }
@@ -221,8 +357,32 @@ public static class TomestoneProgressParser
             return true;
         }
 
-        return TryReadObjectProperty(targetNode, "activity", out var activityObject)
-               && TryReadNonNullCompletedAt(activityObject);
+        foreach (var field in new[] { "activity", "achievement" })
+        {
+            if (TryReadObjectProperty(targetNode, field, out var clear)
+                && (TryReadNonNullCompletedAt(clear) || TryReadCompletionWeek(clear)))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool TryReadCompletionWeek(JObject clear)
+    {
+        if (!TryReadPropertyValue(clear, "completionWeek", out var week))
+        {
+            return false;
+        }
+
+        return week.Type switch
+        {
+            JTokenType.Integer or JTokenType.Float => week.Value<double>() > 0,
+            JTokenType.String => !string.IsNullOrWhiteSpace(week.Value<string>())
+                                 && week.Value<string>().Trim() != "0",
+            _ => false,
+        };
     }
 
     private static bool TryReadNonNullCompletedAt(JObject value)
@@ -238,15 +398,14 @@ public static class TomestoneProgressParser
         var graphIndex = 0;
         foreach (var targetNode in targetNodes)
         {
-            if (TryReadTargetRawPercent(targetNode, out var bossPercentage)
-                && TryReadMechanicNumber(targetNode, out var mechanicNumber))
+            if (TryReadObjectProperty(targetNode, "progression", out var progression)
+                && TryReadProgressPhase(progression, out var phaseName, out var phaseOrder, out var bossPercentage))
             {
                 bossPercentage = Math.Clamp(bossPercentage, 0, 100);
-                var phaseName = $"P{mechanicNumber.ToString(CultureInfo.InvariantCulture)}";
                 UpsertParsedPhase(
                     phasesByKey,
                     phaseName,
-                    mechanicNumber,
+                    phaseOrder ?? graphIndex + 1,
                     graphIndex,
                     bossPercentage);
             }
@@ -254,7 +413,36 @@ public static class TomestoneProgressParser
             graphIndex++;
         }
 
-        return BuildPhaseProgress(phasesByKey);
+        if (phasesByKey.Count > 0)
+        {
+            return BuildPhaseProgress(phasesByKey);
+        }
+
+        // A mechanic number counts recurrences, not fight phases. Keep the
+        // profile's authoritative mechanic label without inventing a P-number.
+        foreach (var targetNode in targetNodes)
+        {
+            if (TryReadObjectProperty(targetNode, "progression", out var progression)
+                && TryReadObjectProperty(progression, "mechanic", out var mechanic)
+                && ReadStringProperty(mechanic, "name") is { Length: > 0 } mechanicName
+                && TryReadTargetRawPercent(targetNode, out var percentage))
+            {
+                var occurrence = ReadIntProperty(mechanic, "number");
+                var label = occurrence is > 1 ? $"{mechanicName} #{occurrence.Value}" : mechanicName;
+                percentage = Math.Clamp(percentage, 0, 100);
+                return [new PhaseProgress
+                {
+                    PhaseKey = "mechanic-" + NormalizePhaseKey(label),
+                    PhaseName = label,
+                    Order = 0,
+                    BossPercentage = percentage,
+                    DisplayText = $"{label} {FormatPercent(percentage)}%",
+                    Source = "tomestone_api",
+                }];
+            }
+        }
+
+        return [];
     }
 
     private static double? ParseTargetBossPercentage(
@@ -321,30 +509,49 @@ public static class TomestoneProgressParser
     private static bool TryReadTargetRawPercent(JObject targetNode, out double bossPercentage)
     {
         bossPercentage = 0;
-        if (!TryReadObjectProperty(targetNode, "progression", out var progressionObject)
-            || !TryReadPropertyValue(progressionObject, "rawPercent", out var rawPercent))
+        if (!TryReadObjectProperty(targetNode, "progression", out var progressionObject))
         {
             return false;
         }
 
-        return TryParseNumericPercent(rawPercent, out bossPercentage);
-    }
-
-    private static bool TryReadMechanicNumber(JObject targetNode, out int mechanicNumber)
-    {
-        mechanicNumber = 0;
-        if (TryReadObjectProperty(targetNode, "mechanic", out var mechanicObject)
-            || TryReadObjectProperty(targetNode, "progression", out var progressionObject)
-            && TryReadObjectProperty(progressionObject, "mechanic", out mechanicObject))
+        foreach (var propertyName in new[] { "rawPercent", "displayPercent", "percent" })
         {
-            var number = ReadIntProperty(mechanicObject, "number");
-            if (number is > 0)
+            if (TryReadPropertyValue(progressionObject, propertyName, out var value)
+                && TryParseNumericPercent(value, out bossPercentage))
             {
-                mechanicNumber = number.Value;
                 return true;
             }
         }
 
+        return false;
+    }
+
+    private static bool TryReadProgressPhase(JObject source, out string phaseName, out int? phaseOrder, out double percentage)
+    {
+        foreach (var key in new[] { "displayPercent", "bestPercent", "best_percent" })
+        {
+            if (ReadStringProperty(source, key) is { Length: > 0 } label
+                && TryReadPercentPhaseLabel(label, out phaseName, out phaseOrder, out percentage))
+            {
+                return true;
+            }
+        }
+
+        percentage = 0;
+        if (TryReadPhaseLabel(source, out phaseName, out phaseOrder)
+            && (source["phase"] is not null || source["phaseName"] is not null || source["phase_name"] is not null))
+        {
+            foreach (var key in new[] { "rawPercent", "displayPercent", "percent", "bestPercent", "best_percent" })
+            {
+                if (TryReadPropertyValue(source, key, out var value) && TryParseNumericPercent(value, out percentage))
+                {
+                    return true;
+                }
+            }
+        }
+
+        phaseName = null;
+        phaseOrder = null;
         return false;
     }
 
@@ -385,6 +592,18 @@ public static class TomestoneProgressParser
         if (ReadStringProperty(source, "canonical_name") is { Length: > 0 } snakeCanonicalName)
         {
             yield return snakeCanonicalName;
+        }
+
+        foreach (var propertyName in new[] { "zoneName", "name" })
+        {
+            if (ReadStringProperty(source, propertyName) is { Length: > 0 } displayName)
+            {
+                var slug = Slugify(displayName);
+                if (slug.Length > 0)
+                {
+                    yield return slug;
+                }
+            }
         }
 
         if (TryReadObjectProperty(source, "encounter", out var encounterObject))
@@ -619,6 +838,11 @@ public static class TomestoneProgressParser
 
     private static JArray FindActivityRows(JToken root)
     {
+        if (root is JArray rootRows)
+        {
+            return rootRows;
+        }
+
         if (root is not JObject rootObject)
         {
             return null;
@@ -631,6 +855,9 @@ public static class TomestoneProgressParser
             "activities.activities.paginator.data",
             "data.activities.activities.paginator.data",
             "paginator.data",
+            "results",
+            "data",
+            "data.paginator.data",
         ];
 
         foreach (var path in paths)
@@ -695,9 +922,20 @@ public static class TomestoneProgressParser
         {
             phaseName = ReadStringProperty(phaseObject, "name");
             explicitOrder = ReadIntProperty(phaseObject, "order")
-                ?? ReadIntProperty(phaseObject, "number");
+                ?? ReadIntProperty(phaseObject, "number")
+                ?? (phaseName is null ? null : TryReadPhaseOrder(phaseName));
             if (!string.IsNullOrWhiteSpace(phaseName))
             {
+                return true;
+            }
+        }
+
+        if (graphItem["phase"]?.Type == JTokenType.String)
+        {
+            phaseName = graphItem["phase"].Value<string>();
+            if (!string.IsNullOrWhiteSpace(phaseName))
+            {
+                explicitOrder = TryReadPhaseOrder(phaseName);
                 return true;
             }
         }
@@ -705,18 +943,11 @@ public static class TomestoneProgressParser
         phaseName = ReadStringProperty(graphItem, "phaseName")
             ?? ReadStringProperty(graphItem, "phase_name");
         explicitOrder = ReadIntProperty(graphItem, "order")
-            ?? ReadIntProperty(graphItem, "number");
+            ?? ReadIntProperty(graphItem, "number")
+            ?? (phaseName is null ? null : TryReadPhaseOrder(phaseName));
         if (!string.IsNullOrWhiteSpace(phaseName))
         {
             return true;
-        }
-
-        if (graphItem["mechanic"] is JObject mechanicObject)
-        {
-            phaseName = ReadStringProperty(mechanicObject, "name");
-            explicitOrder = ReadIntProperty(mechanicObject, "order")
-                ?? ReadIntProperty(mechanicObject, "number");
-            return !string.IsNullOrWhiteSpace(phaseName);
         }
 
         phaseName = ReadStringProperty(graphItem, "name");
@@ -767,6 +998,15 @@ public static class TomestoneProgressParser
             return false;
         }
 
+        return TryReadPercentPhaseLabel(label, out phaseName, out explicitOrder, out bossPercentage);
+    }
+
+    private static bool TryReadPercentPhaseLabel(
+        string label, out string phaseName, out int? explicitOrder, out double bossPercentage)
+    {
+        phaseName = null;
+        explicitOrder = null;
+        bossPercentage = 0;
         var percentIndex = label.IndexOf('%');
         if (percentIndex <= 0 || percentIndex >= label.Length - 1)
         {
@@ -803,8 +1043,18 @@ public static class TomestoneProgressParser
     {
         bossPercentage = 0;
 
-        var label = ReadStringProperty(source, "bestPercent")
-            ?? ReadStringProperty(source, "best_percent");
+        if (!(TryReadPropertyValue(source, "bestPercent", out var value)
+              || TryReadPropertyValue(source, "best_percent", out value)))
+        {
+            return false;
+        }
+
+        if (TryParseNumericPercent(value, out bossPercentage))
+        {
+            return true;
+        }
+
+        var label = value.Type == JTokenType.String ? value.Value<string>() : null;
         if (string.IsNullOrWhiteSpace(label))
         {
             return false;
@@ -940,10 +1190,37 @@ public static class TomestoneProgressParser
             case JTokenType.Float:
                 percent = value.Value<double>();
                 return IsFinite(percent);
+            case JTokenType.String:
+                return TryParsePercentString(value.Value<string>(), out percent);
             default:
                 percent = 0;
                 return false;
         }
+    }
+
+    private static string Slugify(string value)
+    {
+        var builder = new StringBuilder(value.Length);
+        var pendingSeparator = false;
+        foreach (var character in value.Trim().ToLowerInvariant())
+        {
+            if (char.IsLetterOrDigit(character))
+            {
+                if (pendingSeparator && builder.Length > 0)
+                {
+                    builder.Append('-');
+                }
+
+                builder.Append(character);
+                pendingSeparator = false;
+            }
+            else if (char.IsWhiteSpace(character) || character == '-')
+            {
+                pendingSeparator = true;
+            }
+        }
+
+        return builder.ToString();
     }
 
     private static bool TryParsePercentString(string value, out double percent)

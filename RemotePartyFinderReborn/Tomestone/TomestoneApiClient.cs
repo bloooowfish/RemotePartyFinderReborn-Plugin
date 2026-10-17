@@ -18,16 +18,25 @@ public sealed class TomestoneApiClient : IDisposable
     private readonly Action<string> _infoLog;
     private readonly Action<string> _warningLog;
     private readonly Action<string> _debugLog;
+    private readonly Action<ApiCredentialValidationState, string> _credentialStatusChanged;
     private readonly RateLimitCooldownState _rateLimitCooldown = new();
 
     public TomestoneApiClient(Configuration configuration)
+        : this(configuration, null)
+    {
+    }
+
+    internal TomestoneApiClient(
+        Configuration configuration,
+        Action<ApiCredentialValidationState, string> credentialStatusChanged)
         : this(
             configuration,
             new HttpClient(),
             static () => DateTime.UtcNow,
             message => Plugin.Log.Info(message),
             message => Plugin.Log.Warning(message),
-            message => Plugin.Log.Debug(message))
+            message => Plugin.Log.Debug(message),
+            credentialStatusChanged)
     {
     }
 
@@ -37,14 +46,16 @@ public sealed class TomestoneApiClient : IDisposable
         Func<DateTime> utcNow = null,
         Action<string> infoLog = null,
         Action<string> warningLog = null,
-        Action<string> debugLog = null)
+        Action<string> debugLog = null,
+        Action<ApiCredentialValidationState, string> credentialStatusChanged = null)
         : this(
             configuration,
             new HttpClient(messageHandler),
             utcNow ?? (static () => DateTime.UtcNow),
             infoLog ?? (static _ => { }),
             warningLog ?? (static _ => { }),
-            debugLog ?? (static _ => { }))
+            debugLog ?? (static _ => { }),
+            credentialStatusChanged)
     {
     }
 
@@ -54,7 +65,8 @@ public sealed class TomestoneApiClient : IDisposable
         Func<DateTime> utcNow,
         Action<string> infoLog,
         Action<string> warningLog,
-        Action<string> debugLog)
+        Action<string> debugLog,
+        Action<ApiCredentialValidationState, string> credentialStatusChanged)
     {
         _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
@@ -62,6 +74,7 @@ public sealed class TomestoneApiClient : IDisposable
         _infoLog = infoLog ?? throw new ArgumentNullException(nameof(infoLog));
         _warningLog = warningLog ?? throw new ArgumentNullException(nameof(warningLog));
         _debugLog = debugLog ?? throw new ArgumentNullException(nameof(debugLog));
+        _credentialStatusChanged = credentialStatusChanged;
     }
 
     public DateTime RateLimitCooldownUntilUtc
@@ -106,6 +119,9 @@ public sealed class TomestoneApiClient : IDisposable
 
             if (response.StatusCode == HttpStatusCode.TooManyRequests)
             {
+                ReportCredentialStatus(
+                    ApiCredentialValidationState.RequestFailed,
+                    "Tomestone rate-limited the request; API key validity was not confirmed.");
                 ActivateRateLimitCooldown($"GET {requestUri}");
                 return OperationOutcome<TomestoneRawResponse>.Failure(
                     transientFailure: true,
@@ -114,18 +130,51 @@ public sealed class TomestoneApiClient : IDisposable
 
             if (!response.IsSuccessStatusCode)
             {
-                _warningLog(
-                    $"Tomestone API GET {requestUri} failed with {(int)response.StatusCode} ({response.StatusCode}); body length {body.Length} byte(s).");
+                var statusCode = (int)response.StatusCode;
+                var activityHidden = response.StatusCode == HttpStatusCode.Forbidden
+                    && body.Contains("hidden", StringComparison.OrdinalIgnoreCase);
+                var credentialState = activityHidden
+                    ? ApiCredentialValidationState.Accepted
+                    : response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
+                        ? ApiCredentialValidationState.Rejected
+                        : response.StatusCode == HttpStatusCode.NotFound
+                            ? ApiCredentialValidationState.NotChecked
+                            : ApiCredentialValidationState.RequestFailed;
+                var credentialMessage = activityHidden
+                    ? "Tomestone accepted the API key, but this character's activity is hidden."
+                    : credentialState == ApiCredentialValidationState.Rejected
+                        ? $"Tomestone rejected the API key (HTTP {statusCode})."
+                        : response.StatusCode == HttpStatusCode.NotFound
+                            ? "Tomestone returned no matching record (HTTP 404); API key validity was not confirmed."
+                            : $"Tomestone request failed (HTTP {statusCode}); API key validity was not confirmed.";
+                ReportCredentialStatus(credentialState, credentialMessage);
+                if (!activityHidden)
+                {
+                    _warningLog(
+                        $"Tomestone API GET {requestUri} failed with {(int)response.StatusCode} ({response.StatusCode}); body length {body.Length} byte(s).");
+                }
+            }
+            else
+            {
+                var configuredApiKey = !string.IsNullOrWhiteSpace(_configuration.TomestoneApiKey);
+                ReportCredentialStatus(
+                    configuredApiKey ? ApiCredentialValidationState.Accepted : ApiCredentialValidationState.NotChecked,
+                    configuredApiKey
+                        ? $"Tomestone accepted the request (HTTP {(int)response.StatusCode})."
+                        : "Tomestone request succeeded without an API key; key validity was not checked.");
             }
 
             return OperationOutcome<TomestoneRawResponse>.Success(new TomestoneRawResponse
             {
                 StatusCode = response.StatusCode,
                 Body = body,
+                ActivityHidden = response.StatusCode == HttpStatusCode.Forbidden
+                    && body.Contains("hidden", StringComparison.OrdinalIgnoreCase),
             });
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
+            ReportCredentialStatus(ApiCredentialValidationState.RequestFailed, "Could not reach Tomestone to check the API key.");
             _warningLog($"Tomestone API GET {requestUri} failed: {ex.GetType().Name}: {ex.Message}");
             return OperationOutcome<TomestoneRawResponse>.Failure(
                 transientFailure: true,
@@ -146,6 +195,9 @@ public sealed class TomestoneApiClient : IDisposable
             $"Tomestone API rate limited at {source}. Pausing Tomestone requests until {RateLimitCooldownUntilUtc:O} (1 hour lockout).");
     }
 
+    private void ReportCredentialStatus(ApiCredentialValidationState state, string message)
+        => _credentialStatusChanged?.Invoke(state, message);
+
     private void LogCooldownSkipIfNeeded(TimeSpan remaining)
     {
         if (!_rateLimitCooldown.ShouldLogSkip(_utcNow(), TimeSpan.FromMinutes(1)))
@@ -160,6 +212,7 @@ public sealed class TomestoneApiClient : IDisposable
     private HttpRequestMessage CreateAuthenticatedGet(Uri requestUri)
     {
         var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
+        request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         var apiKey = _configuration.TomestoneApiKey?.Trim();
         if (!string.IsNullOrEmpty(apiKey))
         {

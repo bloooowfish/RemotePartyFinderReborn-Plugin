@@ -3,7 +3,12 @@ using System.Collections.Generic;
 
 namespace RemotePartyFinderReborn;
 
-internal readonly record struct DebugPfListingCandidate(ulong ListingId, ulong ContentId, DateTime SeenAtUtc, int BatchNumber);
+internal readonly record struct DebugPfListingCandidate(
+    ulong ListingId,
+    ulong ContentId,
+    DateTime SeenAtUtc,
+    int BatchNumber,
+    DateTime? LastSeenAtUtc = null);
 
 internal readonly record struct DebugPfDetailSnapshot(ulong ListingId, ulong LeaderContentId, int NonZeroMembers, int TotalSlots);
 
@@ -79,6 +84,12 @@ internal sealed class DebugPfScanStateMachine {
 
     internal void UpsertVisibleCandidate(DebugPfListingCandidate candidate) {
         _queue.UpsertVisible(candidate);
+    }
+
+    internal void RefreshCurrentTarget() {
+        if (_hasTarget) {
+            _target = _queue.RefreshCandidate(_target);
+        }
     }
 
     internal void StartSyncQueue() {

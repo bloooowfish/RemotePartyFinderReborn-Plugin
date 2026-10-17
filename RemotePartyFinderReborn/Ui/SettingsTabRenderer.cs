@@ -48,6 +48,7 @@ internal sealed class SettingsTabRenderer
         {
             _configuration.FFLogsClientId = clientId;
             _configuration.Save();
+            _plugin.ApiCredentialStatus.ResetFFLogs();
         }
 
         var clientSecret = _configuration.FFLogsClientSecret;
@@ -55,6 +56,7 @@ internal sealed class SettingsTabRenderer
         {
             _configuration.FFLogsClientSecret = clientSecret;
             _configuration.Save();
+            _plugin.ApiCredentialStatus.ResetFFLogs();
         }
 
         var enableWorker = _configuration.EnableFFLogsWorker;
@@ -63,6 +65,14 @@ internal sealed class SettingsTabRenderer
             _configuration.EnableFFLogsWorker = enableWorker;
             _configuration.Save();
         }
+
+        DrawCredentialStatus(
+            "FFLogs",
+            _plugin.ApiCredentialStatus.FFLogs,
+            _configuration.EnableFFLogsWorker,
+            !string.IsNullOrWhiteSpace(_configuration.FFLogsClientId)
+                && !string.IsNullOrWhiteSpace(_configuration.FFLogsClientSecret),
+            "FFLogs background processing requires both a Client ID and a Client Secret.");
 
         if (ImGui.CollapsingHeader("How to get a client ID and a client secret:"))
         {
@@ -121,6 +131,7 @@ internal sealed class SettingsTabRenderer
         {
             _configuration.TomestoneApiKey = apiKey;
             _configuration.Save();
+            _plugin.ApiCredentialStatus.ResetTomestone();
         }
         if (ImGui.IsItemHovered())
         {
@@ -133,6 +144,12 @@ internal sealed class SettingsTabRenderer
             _configuration.EnableTomestoneProgressEnrichment = enableProgressEnrichment;
             _configuration.Save();
         }
+        DrawCredentialStatus(
+            "Tomestone",
+            _plugin.ApiCredentialStatus.Tomestone,
+            _configuration.EnableTomestoneProgressEnrichment,
+            !string.IsNullOrWhiteSpace(_configuration.TomestoneApiKey),
+            "Tomestone progress enrichment requires an API Key. Requests without one will not authenticate.");
         if (ImGui.IsItemHovered())
         {
             ImGui.SetTooltip("Enables official Tomestone API progression lookups. Tomestone failures do not block FFLogs uploads.");
@@ -529,6 +546,33 @@ internal sealed class SettingsTabRenderer
     private void SetUploadUrlError(string message)
     {
         _uploadUrlError.Set(message, DateTime.UtcNow, TimeSpan.FromSeconds(5));
+    }
+
+    private static void DrawCredentialStatus(
+        string provider,
+        ApiCredentialStatusSnapshot status,
+        bool featureEnabled,
+        bool isConfigured,
+        string missingCredentialsMessage)
+    {
+        if (featureEnabled && !isConfigured)
+        {
+            ImGui.TextColored(new Vector4(1.0f, 0.65f, 0.2f, 1.0f), $"{provider}: {missingCredentialsMessage}");
+            return;
+        }
+
+        var color = status.State switch
+        {
+            ApiCredentialValidationState.Accepted => new Vector4(0.0f, 1.0f, 0.0f, 1.0f),
+            ApiCredentialValidationState.Rejected => new Vector4(1.0f, 0.2f, 0.2f, 1.0f),
+            ApiCredentialValidationState.RequestFailed => new Vector4(1.0f, 0.65f, 0.2f, 1.0f),
+            _ => new Vector4(0.8f, 0.8f, 0.8f, 1.0f),
+        };
+
+        var checkedAt = status.UpdatedAtUtc == DateTime.MinValue
+            ? string.Empty
+            : $" (updated {FormatLocalClock(status.UpdatedAtUtc)} Local)";
+        ImGui.TextColored(color, $"{provider} credential status: {status.Message}{checkedAt}");
     }
 
     private static string FormatLocalClock(DateTime utcTime)

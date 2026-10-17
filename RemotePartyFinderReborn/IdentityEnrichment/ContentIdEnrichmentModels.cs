@@ -105,6 +105,26 @@ internal sealed class ContentIdResolveQueue {
     public IReadOnlyCollection<ResolveRequestStatus> Requests =>
         new ReadOnlyCollection<ResolveRequestStatus>(_requests.Values.OrderBy(static request => request.ContentId).ToArray());
 
+    public List<ResolveRequestStatus> FindExpiredInFlightRequests(
+        DateTime nowUtc,
+        TimeSpan timeout,
+        Func<ulong, bool>? hasPendingProjection = null
+    ) {
+        List<ResolveRequestStatus>? expired = null;
+        foreach (var request in _requests.Values) {
+            if (request.State != ResolveState.InFlight
+                || request.LastRequestedAtUtc == DateTime.MinValue
+                || nowUtc - request.LastRequestedAtUtc < timeout
+                || hasPendingProjection?.Invoke(request.ContentId) == true) {
+                continue;
+            }
+
+            (expired ??= new List<ResolveRequestStatus>()).Add(request);
+        }
+
+        return expired ?? [];
+    }
+
     public bool Enqueue(ulong contentId, DateTime nowUtc) {
         if (contentId == 0) {
             return false;

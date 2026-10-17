@@ -243,14 +243,30 @@ internal sealed class CharaCardResolver : IDisposable {
             return;
         }
 
+        var uniqueContentIds = contentIds.Where(static contentId => contentId != 0).Distinct().ToArray();
+        if (uniqueContentIds.Length == 0) {
+            return;
+        }
+
+        // Keep DB I/O outside the resolver lock and fetch known identities in one batch.
+#if DEBUG
+        var probeStartedAt = DebugPerformanceDiagnostics.Begin();
+        var probeAllocatedBefore = DebugPerformanceDiagnostics.AllocatedBytes();
+        Dictionary<ulong, CharacterIdentitySnapshot> knownIdentities;
+        try {
+            knownIdentities = _database.GetIdentities(uniqueContentIds);
+        } finally {
+            DebugPerformanceDiagnostics.Record(DebugPerformancePath.CharaCardIdentityDbProbe, probeStartedAt, probeAllocatedBefore);
+        }
+#else
+        var knownIdentities = _database.GetIdentities(uniqueContentIds);
+#endif
         var nowUtc = _utcNow();
         lock (_sync) {
-            foreach (var contentId in contentIds) {
-                if (contentId == 0 || _database.TryGetIdentity(contentId, out _)) {
-                    continue;
+            foreach (var contentId in uniqueContentIds) {
+                if (!knownIdentities.ContainsKey(contentId)) {
+                    _queue.Enqueue(contentId, nowUtc);
                 }
-
-                _queue.Enqueue(contentId, nowUtc);
             }
         }
     }
@@ -260,6 +276,11 @@ internal sealed class CharaCardResolver : IDisposable {
     }
 
     internal void Pump() {
+#if DEBUG
+        var pumpStartedAt = DebugPerformanceDiagnostics.Begin();
+        var pumpAllocatedBefore = DebugPerformanceDiagnostics.AllocatedBytes();
+        try {
+#endif
         if (_disposed) {
             return;
         }
@@ -306,6 +327,12 @@ internal sealed class CharaCardResolver : IDisposable {
         } catch (Exception exception) {
             DisableEnrichment($"request dispatch failed: {exception.Message}");
         }
+#if DEBUG
+        } finally {
+            DebugPerformanceDiagnostics.Record(DebugPerformancePath.CharaCardPump, pumpStartedAt, pumpAllocatedBefore);
+            DebugPerformanceDiagnostics.TryLogSummary(message => Plugin.Log?.Debug(message));
+        }
+#endif
     }
 
     internal ResolveState GetResolveState(ulong contentId) {
@@ -701,23 +728,10 @@ internal sealed class CharaCardResolver : IDisposable {
     }
 
     private void ExpireStaleInflightRequests(DateTime nowUtc) {
-        foreach (var request in _queue.Requests) {
-            if (request.State != ResolveState.InFlight) {
-                continue;
-            }
-
-            if (_pendingProjections.ContainsKey(request.ContentId)) {
-                continue;
-            }
-
-            if (request.LastRequestedAtUtc == DateTime.MinValue) {
-                continue;
-            }
-
-            if (nowUtc - request.LastRequestedAtUtc < _requestTimeout) {
-                continue;
-            }
-
+        foreach (var request in _queue.FindExpiredInFlightRequests(
+                     nowUtc,
+                     _requestTimeout,
+                     contentId => _pendingProjections.ContainsKey(contentId))) {
             if (_queue.MarkTimeout(request.ContentId, request.AttemptVersion, nowUtc)
                 && _queue.GetState(request.ContentId) == ResolveState.FailedPermanent) {
                 LogDebug($"CharaCardResolver: giving up on contentId={request.ContentId} after repeated plate request failures.");
@@ -729,9 +743,12 @@ internal sealed class CharaCardResolver : IDisposable {
         PendingProjection? candidate = null;
 
         lock (_sync) {
-            foreach (var entry in _pendingProjections.OrderBy(static entry => entry.Key)) {
-                candidate = entry.Value;
-                break;
+            ulong smallestContentId = ulong.MaxValue;
+            foreach (var entry in _pendingProjections) {
+                if (entry.Key < smallestContentId) {
+                    smallestContentId = entry.Key;
+                    candidate = entry.Value;
+                }
             }
         }
 
@@ -745,6 +762,7 @@ internal sealed class CharaCardResolver : IDisposable {
                 _pendingProjections.Remove(candidate.Snapshot.ContentId);
                 _queue.MarkResolved(candidate.Snapshot);
             }
+            _identityUploadPump?.NotifyPendingIdentityChanged();
 
             LogDebug(
                 $"CharaCardResolver: persisted resolved identity contentId={candidate.Snapshot.ContentId} " +

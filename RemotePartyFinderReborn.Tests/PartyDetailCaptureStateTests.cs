@@ -124,6 +124,78 @@ public sealed class PartyDetailCaptureStateTests {
     }
 
     [Fact]
+    public void Framework_update_does_not_build_snapshot_without_active_request() {
+        var state = new PartyDetailCaptureState();
+        using var runtime = new FakePartyDetailCaptureRuntime(state);
+        var buildCount = 0;
+
+        runtime.FrameworkUpdate(() => {
+            buildCount++;
+            return (CreateSnapshot(9001U, 44UL), null);
+        });
+
+        Assert.Equal(0, buildCount);
+        Assert.False(state.TryGetNextUnconsumedArrival(out _));
+    }
+
+    [Fact]
+    public void Framework_update_waits_for_post_request_population_before_building_snapshot() {
+        var state = new PartyDetailCaptureState();
+        using var runtime = new FakePartyDetailCaptureRuntime(state);
+        runtime.BeginManualRequestCycle(listingId: 9001U, contentId: 44UL);
+        var buildCount = 0;
+
+        runtime.FrameworkUpdate(() => {
+            buildCount++;
+            return (CreateSnapshot(9001U, 44UL), null);
+        });
+
+        Assert.Equal(0, buildCount);
+        Assert.False(state.TryGetNextUnconsumedArrival(out _));
+
+        runtime.RaisePopulationEvent();
+        runtime.FrameworkUpdate(() => {
+            buildCount++;
+            return (CreateSnapshot(9001U, 44UL), null);
+        });
+
+        Assert.Equal(1, buildCount);
+        Assert.True(state.TryGetNextUnconsumedArrival(out var arrival));
+        Assert.Equal(9001U, arrival.Payload.ListingId);
+        Assert.Equal(PartyDetailRequestOwner.Manual, arrival.Cycle.Owner);
+    }
+
+    [Fact]
+    public void Framework_update_rejects_snapshot_if_request_changes_during_build() {
+        var state = new PartyDetailCaptureState();
+        using var runtime = new FakePartyDetailCaptureRuntime(state);
+        runtime.BeginManualRequestCycle(listingId: 9001U, contentId: 44UL);
+        runtime.RaisePopulationEvent();
+
+        runtime.FrameworkUpdate(() => {
+            runtime.BeginManualRequestCycle(listingId: 9002U, contentId: 45UL);
+            return (CreateSnapshot(9002U, 45UL), null);
+        });
+
+        Assert.Equal(9002U, state.CurrentListingId);
+        Assert.False(state.TryGetNextUnconsumedArrival(out _));
+    }
+
+    [Fact]
+    public void Framework_update_keeps_debug_snapshot_for_accepted_capture() {
+        var state = new PartyDetailCaptureState();
+        using var runtime = new FakePartyDetailCaptureRuntime(state);
+        runtime.BeginManualRequestCycle(listingId: 9001U, contentId: 44UL);
+        runtime.RaisePopulationEvent();
+        var debugSnapshot = new PartyDetailDebugSnapshot { UploadListingId = 9001U };
+
+        runtime.FrameworkUpdate(() => (CreateSnapshot(9001U, 44UL), debugSnapshot));
+
+        Assert.True(state.TryGetLatestDebugSnapshot(out var latest));
+        Assert.Equal(9001U, latest.Snapshot.UploadListingId);
+    }
+
+    [Fact]
     public void Hook_initialization_failure_degrades_to_passive_mode() {
         var state = new PartyDetailCaptureState();
         var warnings = new List<string>();
@@ -491,6 +563,16 @@ public sealed class PartyDetailCaptureStateTests {
 
         internal void FrameworkTick(UploadablePartyDetail snapshot) {
             _runtime.TestFrameworkTick(snapshot);
+        }
+
+        internal void FrameworkUpdate(
+            Func<(UploadablePartyDetail? Snapshot, PartyDetailDebugSnapshot? DebugSnapshot)> snapshotFactory
+        ) {
+            _runtime.TestFrameworkUpdate(snapshotFactory);
+        }
+
+        internal void RaisePopulationEvent() {
+            _runtime.TestObservePopulationEvent();
         }
 
         public void Dispose() {

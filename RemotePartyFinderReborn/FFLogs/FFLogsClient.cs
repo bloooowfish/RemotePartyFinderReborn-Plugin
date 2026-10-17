@@ -21,7 +21,10 @@ public class FFLogsClient : IDisposable
     private readonly Action<string> _warningLog;
     private readonly Action<string> _errorLog;
     private readonly Action<Exception, string> _exceptionLog;
+    private readonly Action<ApiCredentialValidationState, string> _credentialStatusChanged;
     private string _accessToken = string.Empty;
+    private string _tokenClientId = string.Empty;
+    private string _tokenClientSecret = string.Empty;
     private DateTime _tokenExpiration;
     private readonly RateLimitCooldownState _rateLimitCooldown = new();
 
@@ -33,6 +36,13 @@ public class FFLogsClient : IDisposable
     private const string GraphQlUrl = "https://www.fflogs.com/api/v2/client";
 
     public FFLogsClient(Configuration configuration)
+        : this(configuration, null)
+    {
+    }
+
+    internal FFLogsClient(
+        Configuration configuration,
+        Action<ApiCredentialValidationState, string> credentialStatusChanged)
         : this(
             configuration,
             new HttpClient(),
@@ -40,7 +50,8 @@ public class FFLogsClient : IDisposable
             message => Plugin.Log.Info(message),
             message => Plugin.Log.Warning(message),
             message => Plugin.Log.Error(message),
-            (exception, message) => Plugin.Log.Error(exception, message))
+            (exception, message) => Plugin.Log.Error(exception, message),
+            credentialStatusChanged)
     {
     }
 
@@ -51,7 +62,8 @@ public class FFLogsClient : IDisposable
         Action<string> infoLog = null,
         Action<string> warningLog = null,
         Action<string> errorLog = null,
-        Action<Exception, string> exceptionLog = null)
+        Action<Exception, string> exceptionLog = null,
+        Action<ApiCredentialValidationState, string> credentialStatusChanged = null)
         : this(
             configuration,
             new HttpClient(messageHandler),
@@ -59,7 +71,8 @@ public class FFLogsClient : IDisposable
             infoLog ?? (static _ => { }),
             warningLog ?? (static _ => { }),
             errorLog ?? (static _ => { }),
-            exceptionLog ?? (static (_, _) => { }))
+            exceptionLog ?? (static (_, _) => { }),
+            credentialStatusChanged)
     {
     }
 
@@ -70,7 +83,8 @@ public class FFLogsClient : IDisposable
         Action<string> infoLog,
         Action<string> warningLog,
         Action<string> errorLog,
-        Action<Exception, string> exceptionLog)
+        Action<Exception, string> exceptionLog,
+        Action<ApiCredentialValidationState, string> credentialStatusChanged)
     {
         _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
         _httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
@@ -79,6 +93,7 @@ public class FFLogsClient : IDisposable
         _warningLog = warningLog ?? throw new ArgumentNullException(nameof(warningLog));
         _errorLog = errorLog ?? throw new ArgumentNullException(nameof(errorLog));
         _exceptionLog = exceptionLog ?? throw new ArgumentNullException(nameof(exceptionLog));
+        _credentialStatusChanged = credentialStatusChanged;
     }
 
     public void Dispose()
@@ -119,13 +134,27 @@ public class FFLogsClient : IDisposable
 
     private async Task<OperationOutcome<bool>> EnsureTokenAsync()
     {
+        var clientId = _configuration.FFLogsClientId?.Trim() ?? string.Empty;
+        var clientSecret = _configuration.FFLogsClientSecret?.Trim() ?? string.Empty;
+        if (!string.Equals(_tokenClientId, clientId, StringComparison.Ordinal)
+            || !string.Equals(_tokenClientSecret, clientSecret, StringComparison.Ordinal))
+        {
+            _accessToken = string.Empty;
+            _tokenExpiration = DateTime.MinValue;
+            _tokenClientId = clientId;
+            _tokenClientSecret = clientSecret;
+        }
+
         if (!string.IsNullOrEmpty(_accessToken) && _utcNow() < _tokenExpiration)
         {
             return OperationOutcome<bool>.Success(true);
         }
 
-        if (string.IsNullOrEmpty(_configuration.FFLogsClientId) || string.IsNullOrEmpty(_configuration.FFLogsClientSecret))
+        if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret))
         {
+            ReportCredentialStatus(
+                ApiCredentialValidationState.NotChecked,
+                "Client ID and Client Secret are both required.");
             return OperationOutcome<bool>.Failure(false, "FFLogs credentials are not configured.");
         }
 
@@ -135,8 +164,8 @@ public class FFLogsClient : IDisposable
             var form = new Dictionary<string, string>
             {
                 { "grant_type", "client_credentials" },
-                { "client_id", _configuration.FFLogsClientId },
-                { "client_secret", _configuration.FFLogsClientSecret }
+                { "client_id", clientId },
+                { "client_secret", clientSecret }
             };
             request.Content = new FormUrlEncodedContent(form);
 
@@ -144,6 +173,13 @@ public class FFLogsClient : IDisposable
             if (!response.IsSuccessStatusCode)
             {
                 var transientFailure = IsTransientStatusCode(response.StatusCode);
+                ReportCredentialStatus(
+                    IsOAuthCredentialsRejected(response.StatusCode)
+                        ? ApiCredentialValidationState.Rejected
+                        : ApiCredentialValidationState.RequestFailed,
+                    IsOAuthCredentialsRejected(response.StatusCode)
+                        ? $"FFLogs rejected the Client ID/Secret (HTTP {(int)response.StatusCode})."
+                        : $"FFLogs authentication request failed (HTTP {(int)response.StatusCode}).");
                 if ((int)response.StatusCode == 429)
                 {
                     ActivateRateLimitCooldown("oauth token request");
@@ -163,12 +199,18 @@ public class FFLogsClient : IDisposable
             var expiresIn = json["expires_in"]?.ToObject<int>() ?? 0;
             _tokenExpiration = _utcNow().AddSeconds(expiresIn - 60); // Buffer 60s
 
-            return !string.IsNullOrEmpty(_accessToken)
-                ? OperationOutcome<bool>.Success(true)
-                : OperationOutcome<bool>.Failure(false, "FFLogs OAuth response did not include an access token.");
+            if (!string.IsNullOrEmpty(_accessToken))
+            {
+                ReportCredentialStatus(ApiCredentialValidationState.Accepted, "FFLogs accepted the credentials.");
+                return OperationOutcome<bool>.Success(true);
+            }
+
+            ReportCredentialStatus(ApiCredentialValidationState.RequestFailed, "FFLogs response did not include an access token.");
+            return OperationOutcome<bool>.Failure(false, "FFLogs OAuth response did not include an access token.");
         }
         catch (Exception ex)
         {
+            ReportCredentialStatus(ApiCredentialValidationState.RequestFailed, "Could not reach FFLogs to check the credentials.");
             _exceptionLog(ex, "Failed to authenticate with FFLogs.");
             return OperationOutcome<bool>.Failure(true, ex.Message);
         }
@@ -211,6 +253,13 @@ public class FFLogsClient : IDisposable
             if (!response.IsSuccessStatusCode)
             {
                 var errorBody = await response.Content.ReadAsStringAsync();
+                if (IsCredentialRejected(response.StatusCode))
+                {
+                    ReportCredentialStatus(
+                        ApiCredentialValidationState.Rejected,
+                        $"FFLogs rejected API authorization (HTTP {(int)response.StatusCode}).");
+                }
+
                 var transientFailure = IsTransientStatusCode(response.StatusCode);
                 if ((int)response.StatusCode == 429)
                 {
@@ -531,6 +580,15 @@ public class FFLogsClient : IDisposable
             || code == 429
             || code >= 500;
     }
+
+    private static bool IsCredentialRejected(HttpStatusCode statusCode)
+        => statusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden;
+
+    private static bool IsOAuthCredentialsRejected(HttpStatusCode statusCode)
+        => statusCode is HttpStatusCode.BadRequest or HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden;
+
+    private void ReportCredentialStatus(ApiCredentialValidationState state, string message)
+        => _credentialStatusChanged?.Invoke(state, message);
 
     private static bool IsTransientGraphQlError(string message)
     {
