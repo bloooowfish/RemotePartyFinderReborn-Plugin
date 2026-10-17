@@ -188,7 +188,18 @@ internal sealed class PartyDetailCollector : IDisposable {
         var maxConcurrency = PartyDetailUploadPolicy.NormalizeDetailUploadConcurrency(_configuration?.DetailUploadMaxConcurrency ?? 1);
         var batchSize = PartyDetailUploadPolicy.NormalizeDetailUploadBatchSize(_configuration?.DetailUploadBatchSize ?? 1);
         while (Volatile.Read(ref _activeUploadWorkers) < maxConcurrency) {
+#if DEBUG
+            var pendingQueueUnits = _pendingDetailQueue.Count;
+            var queueStartedAt = DebugPerformanceDiagnostics.Begin();
+            var queueAllocatedBefore = DebugPerformanceDiagnostics.AllocatedBytes();
             var nextBatch = _pendingDetailQueue.SelectNextDueBatch(nowUtc, batchSize);
+#else
+            var nextBatch = _pendingDetailQueue.SelectNextDueBatch(nowUtc, batchSize);
+#endif
+#if DEBUG
+            DebugPerformanceDiagnostics.Record(DebugPerformancePath.PendingDetailQueueSelect, queueStartedAt, queueAllocatedBefore, pendingQueueUnits);
+            DebugPerformanceDiagnostics.Count(DebugPerformancePath.PendingDetailQueueSelected, nextBatch.Count);
+#endif
             if (nextBatch.Count == 0) {
                 return;
             }

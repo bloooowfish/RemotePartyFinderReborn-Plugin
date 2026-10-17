@@ -7,6 +7,7 @@ public sealed class TomestoneRawResponse
 {
     public HttpStatusCode StatusCode { get; init; }
     public string Body { get; init; } = string.Empty;
+    public bool ActivityHidden { get; init; }
 }
 
 public enum TomestoneProgressKind
@@ -18,9 +19,11 @@ public enum TomestoneProgressKind
 public sealed record TomestoneProgressData(
     IReadOnlyList<PhaseProgress> Phases,
     double? BossPercentage,
-    bool Cleared = false)
+    bool Cleared = false,
+    bool IsAuthoritative = true)
 {
     public static TomestoneProgressData Empty { get; } = new([], null);
+    public static TomestoneProgressData Skipped { get; } = new([], null, IsAuthoritative: false);
     public static TomestoneProgressData ClearedProgress { get; } = new([], null, true);
 }
 

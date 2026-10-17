@@ -117,6 +117,101 @@ public sealed class FFLogsClientTests
         Assert.Equal(2, warnings.Count);
     }
 
+    [Fact]
+    public async Task OAuth_rejection_is_reported_without_exposing_credentials()
+    {
+        var statuses = new List<(ApiCredentialValidationState State, string Message)>();
+        var handler = new RecordingHttpMessageHandler
+        {
+            OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Unauthorized)
+            {
+                Content = new StringContent("invalid client secret"),
+            }),
+        };
+        using var client = new FFLogsClient(
+            new Configuration { FFLogsClientId = "client-id", FFLogsClientSecret = "private-secret" },
+            handler,
+            credentialStatusChanged: (state, message) => statuses.Add((state, message)));
+
+        await client.QueryAsync("query { reportData { reports } }", CancellationToken.None);
+
+        var status = Assert.Single(statuses);
+        Assert.Equal(ApiCredentialValidationState.Rejected, status.State);
+        Assert.Contains("HTTP 401", status.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("private-secret", status.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("invalid client secret", status.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Successful_OAuth_exchange_marks_credentials_accepted()
+    {
+        var statuses = new List<(ApiCredentialValidationState State, string Message)>();
+        var handler = new RecordingHttpMessageHandler
+        {
+            OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{\"access_token\":\"token\",\"expires_in\":3600}"),
+            }),
+        };
+        using var client = new FFLogsClient(
+            new Configuration { FFLogsClientId = "client-id", FFLogsClientSecret = "private-secret" },
+            handler,
+            credentialStatusChanged: (state, message) => statuses.Add((state, message)));
+
+        await client.QueryAsync("query { reportData { reports } }", CancellationToken.None);
+
+        var status = Assert.Single(statuses);
+        Assert.Equal(ApiCredentialValidationState.Accepted, status.State);
+        Assert.DoesNotContain("private-secret", status.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Changing_credentials_discards_cached_token_and_revalidates()
+    {
+        var configuration = new Configuration
+        {
+            FFLogsClientId = "client-id",
+            FFLogsClientSecret = "first-secret",
+        };
+        var statuses = new List<(ApiCredentialValidationState State, string Message)>();
+        var oauthRequestCount = 0;
+        var handler = new RecordingHttpMessageHandler
+        {
+            OnSendAsync = (request, _) =>
+            {
+                if (request.RequestUri!.AbsoluteUri.Contains("/oauth/token", StringComparison.Ordinal))
+                {
+                    oauthRequestCount++;
+                    return Task.FromResult(oauthRequestCount == 1
+                        ? new HttpResponseMessage(HttpStatusCode.OK)
+                        {
+                            Content = new StringContent("{\"access_token\":\"token\",\"expires_in\":3600}"),
+                        }
+                        : new HttpResponseMessage(HttpStatusCode.Unauthorized));
+                }
+
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("{\"data\":{}}"),
+                });
+            },
+        };
+        using var client = new FFLogsClient(
+            configuration,
+            handler,
+            credentialStatusChanged: (state, message) => statuses.Add((state, message)));
+
+        await client.QueryAsync("query { reportData { reports } }", CancellationToken.None);
+        configuration.FFLogsClientSecret = "second-secret";
+        await client.QueryAsync("query { reportData { reports } }", CancellationToken.None);
+
+        Assert.Equal(2, oauthRequestCount);
+        Assert.Equal(3, handler.Requests.Count);
+        Assert.Equal(ApiCredentialValidationState.Accepted, statuses[0].State);
+        Assert.Equal(ApiCredentialValidationState.Rejected, statuses[1].State);
+        Assert.DoesNotContain("second-secret", statuses[1].Message, StringComparison.Ordinal);
+    }
+
     private sealed class RecordingHttpMessageHandler : HttpMessageHandler
     {
         public List<HttpRequestMessage> Requests { get; } = [];

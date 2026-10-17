@@ -394,8 +394,8 @@ public sealed class FFLogsBatchProcessorTests
         var apiClient = CreateVisibleApiClient(encounterId: 104);
         var tomestoneClient = new StubTomestoneApiClient
         {
-            OnFetchProgressionDataAsync = static (_, _, _, _, _) =>
-                Task.FromResult(new TomestoneProgressData([], 8.7)),
+            OnFetchProgressionDataAsync = static (_, _, _, encounterId, _) =>
+                Task.FromResult(new TomestoneProgressData([], encounterId == 104 ? 35.2 : 8.7)),
         };
         var processor = CreateProcessor(apiClient, tomestoneClient);
         var session = new FFLogsLeaseSession(
@@ -405,10 +405,12 @@ public sealed class FFLogsBatchProcessorTests
         var result = await processor.ProcessLeaseSessionAsync(session, CancellationToken.None);
 
         var parse = Assert.Single(result.ProcessedResults);
+        Assert.Equal(35.2, parse.BossPercentages[104], 3);
         Assert.Equal(8.7, parse.BossPercentages[105], 3);
         Assert.Empty(parse.PhaseProgress);
-        var request = Assert.Single(tomestoneClient.Requests);
-        Assert.Equal(("Player-5011", "Tonberry", 73u, 105u), request);
+        Assert.Equal(
+            [("Player-5011", "Tonberry", 73u, 104u), ("Player-5011", "Tonberry", 73u, 105u)],
+            tomestoneClient.Requests);
         Assert.False(result.HadTransientFailure);
         Assert.False(result.ShouldAbandonRemainingLeases);
     }

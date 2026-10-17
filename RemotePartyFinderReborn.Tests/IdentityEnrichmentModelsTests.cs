@@ -232,6 +232,30 @@ public sealed class IdentityEnrichmentModelsTests {
     }
 
     [Fact]
+    public void Expired_inflight_scan_skips_pending_projection_and_preserves_attempt_version() {
+        var nowUtc = new DateTime(2026, 4, 13, 2, 30, 0, DateTimeKind.Utc);
+        var queue = new ContentIdResolveQueue();
+        Assert.True(queue.Enqueue(8108UL, nowUtc.AddMinutes(-1)));
+        Assert.True(queue.Enqueue(8208UL, nowUtc.AddMinutes(-1)));
+        Assert.True(queue.TryStartNext(nowUtc.AddMinutes(-1), out var first));
+        Assert.True(queue.TryStartNext(nowUtc.AddMinutes(-1), out var second));
+
+        var expired = queue.FindExpiredInFlightRequests(
+            nowUtc,
+            TimeSpan.FromSeconds(5),
+            contentId => contentId == first.ContentId
+        );
+
+        var candidate = Assert.Single(expired);
+        Assert.Equal(second.ContentId, candidate.ContentId);
+        Assert.Equal(second.AttemptVersion, candidate.AttemptVersion);
+        Assert.True(queue.MarkTimeout(candidate.ContentId, candidate.AttemptVersion, nowUtc));
+        Assert.False(queue.MarkTimeout(candidate.ContentId, candidate.AttemptVersion - 1, nowUtc));
+        Assert.Equal(ResolveState.InFlight, queue.GetState(first.ContentId));
+        Assert.Equal(ResolveState.FailedTransient, queue.GetState(second.ContentId));
+    }
+
+    [Fact]
     public void Enqueue_does_not_requeue_permanently_failed_request() {
         var nowUtc = new DateTime(2026, 4, 13, 3, 0, 0, DateTimeKind.Utc);
         var queue = new ContentIdResolveQueue();

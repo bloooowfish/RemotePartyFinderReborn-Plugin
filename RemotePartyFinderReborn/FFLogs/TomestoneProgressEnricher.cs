@@ -69,10 +69,16 @@ internal sealed class TomestoneProgressEnricher
         TomestoneFetchResult fetchResult,
         IDictionary<ulong, ParseResult> resultsByContentId)
     {
+        if (!fetchResult.Succeeded)
+        {
+            return;
+        }
+
         var parseResult = GetExistingMergeTarget(fetchResult.Request, resultsByContentId);
         if (parseResult == null)
         {
-            if (!HasUsefulProgress(fetchResult))
+            if (resultsByContentId.TryGetValue(fetchResult.Request.Job.ContentId, out var current)
+                && current.IsHidden)
             {
                 return;
             }
@@ -113,18 +119,23 @@ internal sealed class TomestoneProgressEnricher
             LeaseToken = request.Job.LeaseToken,
         };
 
-    private static bool HasUsefulProgress(TomestoneFetchResult fetchResult)
-        => fetchResult.Request.ProgressKind switch
-        {
-            TomestoneProgressKind.PhaseProgress => fetchResult.Progress.Phases.Count > 0,
-            TomestoneProgressKind.BossPercentage => TryGetBossPercentage(fetchResult.Progress, out _),
-            _ => false,
-        };
-
     private static void ApplyTomestoneProgress(
         TomestoneFetchResult fetchResult,
         ParseResult parseResult)
     {
+        var encounterId = (int)fetchResult.Request.EncounterId;
+        if (!parseResult.TomestoneQueriedEncounters.Contains(encounterId))
+        {
+            parseResult.TomestoneQueriedEncounters.Add(encounterId);
+        }
+
+        parseResult.PhaseProgress.Remove(encounterId);
+        parseResult.BossPercentages.Remove(encounterId);
+        if (fetchResult.Progress.Cleared)
+        {
+            return;
+        }
+
         switch (fetchResult.Request.ProgressKind)
         {
             case TomestoneProgressKind.PhaseProgress:
@@ -192,6 +203,12 @@ internal sealed class TomestoneProgressEnricher
         foreach (var job in jobs)
         {
             resultsByContentId.TryGetValue(job.ContentId, out var parseResult);
+            if (parseResult?.IsHidden == true
+                && !string.Equals(parseResult.SourceKind, "tomestone_api", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
             var lookupServer = ResolveLookupServer(job, parseResult);
             if (string.IsNullOrWhiteSpace(lookupServer))
             {
@@ -235,10 +252,11 @@ internal sealed class TomestoneProgressEnricher
                 cancellationToken);
             if (!outcome.Succeeded)
             {
-                return new TomestoneFetchResult(request, TomestoneProgressData.Empty, outcome.TransientFailure);
+                return new TomestoneFetchResult(request, TomestoneProgressData.Empty, false, outcome.TransientFailure);
             }
 
-            return new TomestoneFetchResult(request, outcome.Value ?? TomestoneProgressData.Empty, false);
+            var progress = outcome.Value ?? TomestoneProgressData.Skipped;
+            return new TomestoneFetchResult(request, progress, progress.IsAuthoritative, false);
         }
         catch (OperationCanceledException)
         {
@@ -246,7 +264,7 @@ internal sealed class TomestoneProgressEnricher
         }
         catch (Exception)
         {
-            return new TomestoneFetchResult(request, TomestoneProgressData.Empty, true);
+            return new TomestoneFetchResult(request, TomestoneProgressData.Empty, false, true);
         }
     }
 
@@ -300,5 +318,6 @@ internal sealed class TomestoneProgressEnricher
     private sealed record TomestoneFetchResult(
         TomestoneRequest Request,
         TomestoneProgressData Progress,
+        bool Succeeded,
         bool HadTransientFailure);
 }

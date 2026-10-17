@@ -21,28 +21,43 @@ public static class TomestoneEncounterMapping
         UltimateMappings
             .Concat(new Dictionary<(uint ZoneId, uint EncounterId), TomestoneEncounterParams>
             {
+                [(62, 93)] = new("dawntrail", "aac-light-heavyweight-savage", "black-cat", TomestoneProgressKind.BossPercentage, ["black-cat"]),
+                [(62, 94)] = new("dawntrail", "aac-light-heavyweight-savage", "honey-b-lovely", TomestoneProgressKind.BossPercentage, ["honey-b-lovely"]),
+                [(62, 95)] = new("dawntrail", "aac-light-heavyweight-savage", "brute-bomber", TomestoneProgressKind.BossPercentage, ["brute-bomber"]),
+                [(62, 96)] = new("dawntrail", "aac-light-heavyweight-savage", "wicked-thunder", TomestoneProgressKind.BossPercentage, ["wicked-thunder"]),
+                [(68, 97)] = new("dawntrail", "aac-cruiserweight-savage", "dancing-green", TomestoneProgressKind.BossPercentage, ["dancing-green"]),
+                [(68, 98)] = new("dawntrail", "aac-cruiserweight-savage", "sugar-riot", TomestoneProgressKind.BossPercentage, ["sugar-riot"]),
+                [(68, 99)] = new("dawntrail", "aac-cruiserweight-savage", "brute-abombinator", TomestoneProgressKind.BossPercentage, ["brute-abombinator"]),
+                [(68, 100)] = new("dawntrail", "aac-cruiserweight-savage", "howling-blade", TomestoneProgressKind.BossPercentage, ["howling-blade"]),
+                [(72, 1084)] = new("dawntrail", "trials-extreme", "enuo", TomestoneProgressKind.BossPercentage, ["enuo"]),
                 [(73, 101)] = new(
                     "dawntrail",
-                    "raids",
-                    "aac-heavyweight-m1-savage",
+                    "aac-heavyweight-savage",
+                    "vamp-fatale",
                     TomestoneProgressKind.BossPercentage,
                     ["vamp-fatale"]),
                 [(73, 102)] = new(
                     "dawntrail",
-                    "raids",
-                    "aac-heavyweight-m2-savage",
+                    "aac-heavyweight-savage",
+                    "red-hot-deep-blue",
                     TomestoneProgressKind.BossPercentage,
                     ["red-hot-deep-blue"]),
                 [(73, 103)] = new(
                     "dawntrail",
-                    "raids",
-                    "aac-heavyweight-m3-savage",
+                    "aac-heavyweight-savage",
+                    "the-tyrant",
                     TomestoneProgressKind.BossPercentage,
                     ["the-tyrant"]),
+                [(73, 104)] = new(
+                    "dawntrail",
+                    "aac-heavyweight-savage",
+                    "lindwurm",
+                    TomestoneProgressKind.BossPercentage,
+                    ["lindwurm"]),
                 [(73, 105)] = new(
                     "dawntrail",
-                    "raids",
-                    "aac-heavyweight-m4-savage",
+                    "aac-heavyweight-savage",
+                    "lindwurm-ii",
                     TomestoneProgressKind.BossPercentage,
                     ["lindwurm-ii"]),
             })

@@ -223,6 +223,103 @@ public sealed class IdentityUploadWorkerTests {
     }
 
     [Fact]
+    public async Task Empty_identity_queue_enters_bounded_idle_and_identity_change_wakes_it() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+        var nowUtc = new DateTime(2026, 4, 13, 11, 12, 0, DateTimeKind.Utc);
+        using var disposeCts = new CancellationTokenSource();
+        var pump = new IdentityUploadPump(
+            database,
+            () => nowUtc,
+            (payloads, cancellationToken) => Task.FromResult(true),
+            disposeCts.Token,
+            idlePollInterval: TimeSpan.FromMinutes(2)
+        );
+
+        pump.PumpPendingIdentityUploads();
+        await WaitUntilAsync(() => pump.NextQueueCheckAtUtc != DateTime.MinValue);
+
+        Assert.Equal(nowUtc.AddMinutes(2), pump.NextQueueCheckAtUtc);
+        pump.PumpPendingIdentityUploads();
+        Assert.Equal(nowUtc.AddMinutes(2), pump.NextQueueCheckAtUtc);
+
+        pump.NotifyPendingIdentityChanged();
+        Assert.Equal(DateTime.MinValue, pump.NextQueueCheckAtUtc);
+    }
+
+    [Fact]
+    public async Task Initial_background_probe_discovers_pending_identity_after_restart() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+        var snapshot = new CharacterIdentitySnapshot(
+            2299UL,
+            "Restart Player",
+            21,
+            "Ravana",
+            new DateTime(2026, 4, 13, 11, 13, 0, DateTimeKind.Utc)
+        );
+        database.UpsertResolvedIdentity(snapshot);
+        IReadOnlyList<CharacterIdentityUploadPayload>? uploaded = null;
+        using var disposeCts = new CancellationTokenSource();
+        var pump = new IdentityUploadPump(
+            database,
+            () => snapshot.LastResolvedAtUtc,
+            (payloads, cancellationToken) => {
+                uploaded = payloads;
+                return Task.FromResult(true);
+            },
+            disposeCts.Token
+        );
+
+        pump.PumpPendingIdentityUploads();
+        await WaitUntilAsync(() => uploaded is not null);
+        await WaitUntilAsync(() => !pump.IsWorkerBusy);
+
+        Assert.Equal(snapshot.ContentId, Assert.Single(uploaded!).ContentId);
+        Assert.Empty(database.TakePendingIdentityUploads(10));
+    }
+
+    [Fact]
+    public async Task Cancellation_during_background_probe_releases_single_worker_gate() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+        using var disposeCts = new CancellationTokenSource();
+        var pump = new IdentityUploadPump(
+            database,
+            () => DateTime.UtcNow,
+            (payloads, cancellationToken) => Task.FromResult(true),
+            disposeCts.Token
+        );
+
+        pump.PumpPendingIdentityUploads();
+        await WaitUntilAsync(() => pump.IsWorkerBusy);
+        disposeCts.Cancel();
+        await WaitUntilAsync(() => !pump.IsWorkerBusy);
+    }
+
+    [Fact]
+    public void Bulk_identity_lookup_deduplicates_ids_and_returns_only_complete_matches() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+        var first = new CharacterIdentitySnapshot(
+            8101UL,
+            "First Identity",
+            74,
+            "Tonberry",
+            new DateTime(2026, 4, 13, 11, 14, 0, DateTimeKind.Utc)
+        );
+        var second = first with { ContentId = 8102UL, Name = "Second Identity" };
+        database.UpsertResolvedIdentity(first);
+        database.UpsertResolvedIdentity(second);
+
+        var results = database.GetIdentities([0UL, 8102UL, 8101UL, 8102UL, 9999UL]);
+
+        Assert.Equal(2, results.Count);
+        Assert.Equal(first, results[8101UL]);
+        Assert.Equal(second, results[8102UL]);
+    }
+
+    [Fact]
     public async Task Pump_runs_identity_upload_worker_single_flight_until_current_attempt_completes() {
         using var harness = new TempPlayerCacheDatabase();
         using var database = new PlayerLocalDatabase(harness.DatabasePath);

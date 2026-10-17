@@ -70,6 +70,7 @@ public class Plugin : IDalamudPlugin {
     internal PartyDetailCollector PartyDetailCollector { get; }
     private IDisposable PartyDetailGameLogSuppressionRuntime { get; }
     internal DebugPfScanner DebugPfScanner { get; }
+    internal ApiCredentialStatusStore ApiCredentialStatus { get; } = new();
     private FFLogsCollector FFLogsCollector { get; }
     internal TomestoneApiClient TomestoneApiClient { get; }
 
@@ -111,7 +112,7 @@ public class Plugin : IDalamudPlugin {
         );
         this.PartyDetailCollector = partyDetailCapture.PartyDetailCollector;
         this.DebugPfScanner = new DebugPfScanner(this, this.PartyDetailCollector, this.PartyDetailCaptureRuntime, this.Gatherer);
-        this.TomestoneApiClient = new TomestoneApiClient(this.Configuration);
+        this.TomestoneApiClient = new TomestoneApiClient(this.Configuration, this.ApiCredentialStatus.ReportTomestone);
         this.FFLogsCollector = new FFLogsCollector(this);
         ValidateGameLogMessageCatalog();
         ConfigWindow = new ConfigWindow(this);

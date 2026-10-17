@@ -42,6 +42,7 @@ public class ParseResult
     public Dictionary<int, double> BossPercentages { get; set; } = new();
     public Dictionary<int, int> ClearCounts { get; set; } = new();
     public Dictionary<int, List<PhaseProgress>> PhaseProgress { get; set; } = new();
+    public List<int> TomestoneQueriedEncounters { get; set; } = new();
     public bool IsHidden { get; set; }
     public bool IsEstimated { get; set; }
     public string MatchedServer { get; set; } = "";

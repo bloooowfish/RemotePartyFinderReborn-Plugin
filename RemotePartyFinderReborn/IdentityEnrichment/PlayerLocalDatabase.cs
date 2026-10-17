@@ -227,6 +227,57 @@ internal sealed class PlayerLocalDatabase : IDisposable {
         }
     }
 
+    public Dictionary<ulong, CharacterIdentitySnapshot> GetIdentities(IReadOnlyCollection<ulong> contentIds) {
+        ArgumentNullException.ThrowIfNull(contentIds);
+
+        var requestedIds = contentIds.Where(static id => id != 0).Distinct().ToArray();
+        var identities = new Dictionary<ulong, CharacterIdentitySnapshot>(requestedIds.Length);
+        if (requestedIds.Length == 0) {
+            return identities;
+        }
+
+        // Keep well below SQLite's historical 999-parameter limit. This is used for
+        // party member batches (normally at most 48 IDs), while remaining safe for
+        // other callers that pass larger collections.
+        const int MaxParametersPerQuery = 900;
+        lock (_sync) {
+            using var connection = OpenConnection();
+            for (var offset = 0; offset < requestedIds.Length; offset += MaxParametersPerQuery) {
+                var count = Math.Min(MaxParametersPerQuery, requestedIds.Length - offset);
+                using var command = connection.CreateCommand();
+                var parameterNames = new string[count];
+                for (var index = 0; index < count; index++) {
+                    parameterNames[index] = $"@content_id_{index}";
+                    command.Parameters.AddWithValue(parameterNames[index], (long)requestedIds[offset + index]);
+                }
+
+                command.CommandText = $"""
+                    SELECT content_id, name, home_world, world_name, last_resolved_utc
+                    FROM player_identities
+                    WHERE content_id IN ({string.Join(", ", parameterNames)})
+                      AND name IS NOT NULL
+                      AND home_world IS NOT NULL
+                      AND world_name IS NOT NULL
+                      AND last_resolved_utc IS NOT NULL;
+                    """;
+
+                using var reader = command.ExecuteReader();
+                while (reader.Read()) {
+                    var contentId = (ulong)reader.GetInt64(0);
+                    identities[contentId] = new CharacterIdentitySnapshot(
+                        contentId,
+                        reader.GetString(1),
+                        Convert.ToUInt16(reader.GetInt64(2)),
+                        reader.GetString(3),
+                        ParseTimestamp(reader.GetString(4))
+                    );
+                }
+            }
+        }
+
+        return identities;
+    }
+
     public bool TryGetPartialIdentity(ulong contentId, [NotNullWhen(true)] out PartialCharacterIdentitySnapshot? snapshot) {
         lock (_sync) {
             using var connection = OpenConnection();

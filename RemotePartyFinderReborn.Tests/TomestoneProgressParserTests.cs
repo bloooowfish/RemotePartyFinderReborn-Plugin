@@ -65,6 +65,74 @@ public sealed class TomestoneProgressParserTests
     }
 
     [Fact]
+    public void ParseProgress_reads_uncleared_ultimate_progress_from_profile_encounters()
+    {
+        const string json = """
+        {
+          "encounters": {
+            "ultimate": [{
+                "zoneName": "Futures Rewritten (Ultimate)",
+                "progression": {
+                  "mechanic": { "name": "Caloric Theory", "number": 7 },
+                  "displayPercent": "41.13%"
+                }
+              }]
+          }
+        }
+        """;
+
+        var progress = TomestoneProgressParser.ParseProgress(
+            json,
+            new TomestoneEncounterParams(
+                "dawntrail",
+                "ultimates",
+                "futures-rewritten-ultimate",
+                TomestoneProgressKind.PhaseProgress,
+                ["futures-rewritten-ultimate"]));
+
+        var phase = Assert.Single(progress.Phases);
+        Assert.Equal("mechanic-caloric-theory-7", phase.PhaseKey);
+        Assert.Equal("Caloric Theory #7", phase.PhaseName);
+        Assert.Equal(0, phase.Order);
+        Assert.Equal(41.13, phase.BossPercentage);
+        Assert.Equal("Caloric Theory #7 41.13%", phase.DisplayText);
+    }
+
+    [Fact]
+    public void DescribeResponseShape_reports_only_schema_metadata()
+    {
+        const string json = """
+        {
+          "characterName": "Sensitive Player Name",
+          "encounters": {
+            "ultimates": [{
+              "encounters": [{
+                "zoneName": "Futures Rewritten (Ultimate)",
+                "progression": {
+                  "mechanic": { "name": "Caloric Theory", "number": 4 },
+                  "displayPercent": "41.13%"
+                }
+              }]
+            }]
+          }
+        }
+        """;
+
+        var shape = TomestoneProgressParser.DescribeResponseShape(json, new TomestoneEncounterParams(
+            "dawntrail",
+            "ultimates",
+            "futures-rewritten-ultimate",
+            TomestoneProgressKind.PhaseProgress,
+            ["futures-rewritten-ultimate"]));
+
+        Assert.Contains("rootKeys=[characterName,encounters]", shape);
+        Assert.Contains("targetNodes=1", shape);
+        Assert.Contains("displayPercent", shape);
+        Assert.DoesNotContain("Sensitive Player Name", shape);
+        Assert.DoesNotContain("41.13", shape);
+    }
+
+    [Fact]
     public void ParsePhaseProgress_extracts_best_phase_progress_from_activity_best_percent_rows()
     {
         const string json = """
@@ -230,7 +298,7 @@ public sealed class TomestoneProgressParserTests
         [
           { "phaseName": "Phase Alpha", "order": 2, "bestPull": "42%" },
           { "phase_name": "Phase Alpha", "order": 2, "boss_percentage": "21%" },
-          { "mechanic": { "name": "Phase Beta", "number": 1 }, "percent": 87 }
+          { "phase": { "name": "Phase Beta", "number": 1 }, "percent": 87 }
         ]
         """;
 
@@ -529,7 +597,7 @@ public sealed class TomestoneProgressParserTests
               {
                 "canonicalName": "unrelated-phase",
                 "progression": {
-                  "rawPercent": 3.25
+                  "displayPercent": "3.25% P1"
                 },
                 "mechanic": {
                   "number": 1
@@ -538,7 +606,7 @@ public sealed class TomestoneProgressParserTests
               {
                 "canonicalName": "target-phase",
                 "progression": {
-                  "rawPercent": 42.5
+                  "displayPercent": "42.5% P2"
                 },
                 "mechanic": {
                   "number": 2
@@ -559,6 +627,194 @@ public sealed class TomestoneProgressParserTests
         Assert.Equal(2, phase.Order);
         Assert.Equal(42.5, phase.BossPercentage);
         Assert.Equal("P2 42.5%", phase.DisplayText);
+    }
+
+    [Fact]
+    public void ParseProgress_keeps_nested_savage_encounters_targeted()
+    {
+        const string json = """
+        {"encounters":{"savage":[{"name":"Heavyweight","encounters":[
+          {"canonicalName":"red-hot-deep-blue","progression":{"displayPercent":"21.68%"}},
+          {"canonicalName":"vamp-fatale","progression":{"displayPercent":"1.00%"}}
+        ]}]}}
+        """;
+
+        var progress = TomestoneProgressParser.ParseProgress(json, M2SProgressTarget);
+
+        Assert.Equal(21.68, progress.BossPercentage);
+        Assert.Empty(progress.Phases);
+    }
+
+    [Fact]
+    public void ParseProgress_does_not_treat_mechanic_occurrence_as_a_phase()
+    {
+        const string json = """
+        {"encounters":{"ultimate":[{"canonicalName":"target-phase","progression":{
+          "mechanic":{"name":"Splattershed","number":2},"displayPercent":"75.71%"
+        }}]}}
+        """;
+
+        var progress = TomestoneProgressParser.ParseProgress(json, PhaseProgressTarget);
+
+        var phase = Assert.Single(progress.Phases);
+        Assert.Equal("mechanic-splattershed-2", phase.PhaseKey);
+        Assert.Equal("Splattershed #2", phase.PhaseName);
+        Assert.Equal(0, phase.Order);
+        Assert.Equal(75.71, phase.BossPercentage);
+        Assert.Null(progress.BossPercentage);
+        Assert.Empty(TomestoneProgressParser.ParsePhaseProgress(
+            """{"graph":[{"mechanic":{"name":"Splattershed","number":2},"percent":75.71}]}"""));
+    }
+
+    [Theory]
+    [InlineData("{\"phase\":\"P5\",\"rawPercent\":75.71}")]
+    [InlineData("{\"phase\":{\"name\":\"P5\"},\"displayPercent\":\"75.71%\"}")]
+    [InlineData("{\"phaseName\":\"P5\",\"rawPercent\":75.71}")]
+    [InlineData("{\"bestPercent\":\"75.71% P5\",\"mechanic\":{\"number\":2}}")]
+    public void ParseProgress_reads_only_explicit_profile_phase(string progression)
+    {
+        var json = "{\"encounters\":{\"ultimate\":[{\"canonicalName\":\"target-phase\",\"progression\":" + progression + "}]}}";
+
+        var phase = Assert.Single(TomestoneProgressParser.ParseProgress(json, PhaseProgressTarget).Phases);
+
+        Assert.Equal("P5", phase.PhaseName);
+        Assert.Equal(5, phase.Order);
+        Assert.Equal(75.71, phase.BossPercentage);
+    }
+
+    [Theory]
+    [InlineData("[{\"activity\":{\"bestPercent\":\"79.71% P5\"}}]")]
+    [InlineData("{\"results\":[{\"activity\":{\"bestPercent\":\"79.71% P5\"}}]}")]
+    [InlineData("{\"data\":[{\"bestPercent\":\"79.71% P5\"}]}")]
+    [InlineData("{\"data\":{\"paginator\":{\"data\":[{\"bestPercent\":\"79.71% P5\"}]}}}")]
+    public void ParseEncounterActivityProgress_supports_official_activity_response_shapes(string json)
+    {
+        var progress = TomestoneProgressParser.ParseEncounterActivityProgress(json, PhaseProgressTarget);
+
+        var phase = Assert.Single(progress.Phases);
+        Assert.Equal("P5", phase.PhaseName);
+        Assert.Equal(79.71, phase.BossPercentage);
+        Assert.Null(progress.BossPercentage);
+    }
+
+    [Theory]
+    [InlineData("21.68")]
+    [InlineData("\"21.68%\"")]
+    public void ParseEncounterActivityProgress_reads_numeric_and_plain_boss_percentages(string percent)
+    {
+        var json = "{\"data\":[{\"activity\":{\"bestPercent\":" + percent + ",\"killsCount\":0}}]}";
+
+        var progress = TomestoneProgressParser.ParseEncounterActivityProgress(json, M2SProgressTarget);
+
+        Assert.Empty(progress.Phases);
+        Assert.Equal(21.68, progress.BossPercentage);
+    }
+
+    [Fact]
+    public void ParseEncounterActivityProgress_rejects_unrelated_and_kill_rows_and_sources()
+    {
+        const string json = """
+        {"results":[
+          {"activity":{"bestPercent":"1% P6","encounter":{"canonical_name":"unrelated"}}},
+          {"activity":{"bestPercent":"0% P6","killsCount":1}},
+          {"bestPercent":"0% P6","killsCount":1},
+          {"activity":{"bestPercent":"75% P4","encounter":{"canonical_name":"target-phase"}},
+           "perspectives":{
+             "unrelated":{"bestPercent":"2% P6","encounter":{"canonical_name":"unrelated"}},
+             "kill":{"bestPercent":"0% P6","killsCount":1}
+           }},
+          {"bestPercent":"79.71% P5"}
+        ]}
+        """;
+
+        var phase = Assert.Single(TomestoneProgressParser.ParseEncounterActivityProgress(json, PhaseProgressTarget).Phases);
+
+        Assert.Equal("P5", phase.PhaseName);
+        Assert.Equal(79.71, phase.BossPercentage);
+    }
+
+    [Fact]
+    public void ParseProgress_does_not_assign_unlabelled_or_unrelated_profile_activity_to_target()
+    {
+        const string json = """
+        {"encounters":{"ultimate":[{"canonicalName":"unrelated","progression":{"displayPercent":"1% P6"}}]},
+         "activity":{"activities":{"activities":{"paginator":{"data":[
+          {"bestPercent":"1% P6"},
+          {"activity":{"bestPercent":"1% P6","encounter":{"canonical_name":"unrelated"}}}
+        ]}}}}}
+        """;
+
+        var progress = TomestoneProgressParser.ParseProgress(json, PhaseProgressTarget);
+
+        Assert.Empty(progress.Phases);
+        Assert.Null(progress.BossPercentage);
+    }
+
+    [Fact]
+    public void ParseProgress_accepts_only_matching_profile_activity_sources()
+    {
+        const string json = """
+        {"activity":{"activities":{"activities":{"paginator":{"data":[
+          {"activity":{"bestPercent":"79.71% P5","encounter":{"canonical_name":"target-phase"}},
+           "perspectives":{"other":{"bestPercent":"1% P6","encounter":{"canonical_name":"unrelated"}}}}
+        ]}}}}}
+        """;
+
+        var phase = Assert.Single(TomestoneProgressParser.ParseProgress(json, PhaseProgressTarget).Phases);
+
+        Assert.Equal("P5", phase.PhaseName);
+        Assert.Equal(79.71, phase.BossPercentage);
+    }
+
+    [Theory]
+    [InlineData("activity", "{\"completionWeek\":\"Week 3\"}")]
+    [InlineData("achievement", "{\"completionWeek\":\"Week 7\"}")]
+    [InlineData("achievement", "{\"completionWeek\":7}")]
+    [InlineData("achievement", "{\"completedAt\":\"2026-10-17T00:00:00Z\"}")]
+    public void ParseProgress_marks_profile_activity_or_public_achievement_as_cleared(string field, string clear)
+    {
+        var json = "{\"encounters\":{\"ultimate\":[{\"canonicalName\":\"target-phase\",\"" + field + "\":" + clear
+            + ",\"progression\":{\"displayPercent\":\"75.71% P5\"}}]}}";
+
+        var progress = TomestoneProgressParser.ParseProgress(json, PhaseProgressTarget);
+
+        Assert.True(progress.Cleared);
+        Assert.Empty(progress.Phases);
+        Assert.Null(progress.BossPercentage);
+    }
+
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("{\"completionWeek\":null}")]
+    [InlineData("{\"completionWeek\":\" \"}")]
+    [InlineData("{\"completionWeek\":0}")]
+    [InlineData("{\"completionWeek\":\"0\"}")]
+    [InlineData("{\"completedAt\":null}")]
+    public void ParseProgress_does_not_mark_empty_completion_metadata_as_cleared(string clear)
+    {
+        var json = "{\"encounters\":{\"ultimate\":[{\"canonicalName\":\"target-phase\",\"activity\":" + clear
+            + ",\"achievement\":" + clear + ",\"progression\":{\"displayPercent\":\"75.71% P5\"}}]}}";
+
+        var progress = TomestoneProgressParser.ParseProgress(json, PhaseProgressTarget);
+
+        Assert.False(progress.Cleared);
+        Assert.Single(progress.Phases);
+    }
+
+    [Fact]
+    public void ParseProgress_does_not_use_unrelated_encounter_completion_metadata()
+    {
+        const string json = """
+        {"encounters":{"ultimate":[
+          {"canonicalName":"unrelated","achievement":{"completionWeek":"Week 3"}},
+          {"canonicalName":"target-phase","progression":{"displayPercent":"75.71% P5"}}
+        ]}}
+        """;
+
+        var progress = TomestoneProgressParser.ParseProgress(json, PhaseProgressTarget);
+
+        Assert.False(progress.Cleared);
+        Assert.Single(progress.Phases);
     }
 
     private static string ReadFixture(

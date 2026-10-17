@@ -51,6 +51,73 @@ public sealed class TomestoneApiClientTests
     }
 
     [Fact]
+    public async Task Unauthorized_response_reports_rejected_key_without_exposing_it()
+    {
+        (ApiCredentialValidationState State, string Message)? status = null;
+        var handler = new RecordingHttpMessageHandler
+        {
+            OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Unauthorized)
+            {
+                Content = new StringContent("invalid bearer key"),
+            }),
+        };
+        using var client = new TomestoneApiClient(
+            new Configuration { TomestoneApiKey = "private-key" },
+            handler,
+            credentialStatusChanged: (state, message) => status = (state, message));
+
+        await client.GetRawAsync("/test", CancellationToken.None);
+
+        Assert.NotNull(status);
+        Assert.Equal(ApiCredentialValidationState.Rejected, status.Value.State);
+        Assert.Contains("HTTP 401", status.Value.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("private-key", status.Value.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("invalid bearer key", status.Value.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Forbidden_hidden_activity_does_not_misreport_a_valid_key_as_rejected()
+    {
+        (ApiCredentialValidationState State, string Message)? status = null;
+        var handler = new RecordingHttpMessageHandler
+        {
+            OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Forbidden)
+            {
+                Content = new StringContent("{\"error\":\"Character activity is hidden.\"}"),
+            }),
+        };
+        using var client = new TomestoneApiClient(
+            new Configuration { TomestoneApiKey = "private-key" },
+            handler,
+            credentialStatusChanged: (state, message) => status = (state, message));
+
+        var result = await client.GetRawAsync("/test", CancellationToken.None);
+
+        Assert.NotNull(result);
+        Assert.True(result.ActivityHidden);
+        Assert.NotNull(status);
+        Assert.Equal(ApiCredentialValidationState.Accepted, status.Value.State);
+        Assert.Contains("activity is hidden", status.Value.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("private-key", status.Value.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Successful_response_marks_api_key_accepted()
+    {
+        (ApiCredentialValidationState State, string Message)? status = null;
+        using var client = new TomestoneApiClient(
+            new Configuration { TomestoneApiKey = "private-key" },
+            new RecordingHttpMessageHandler(),
+            credentialStatusChanged: (state, message) => status = (state, message));
+
+        await client.GetRawAsync("/test", CancellationToken.None);
+
+        Assert.NotNull(status);
+        Assert.Equal(ApiCredentialValidationState.Accepted, status.Value.State);
+        Assert.DoesNotContain("private-key", status.Value.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task GetRawAsync_activates_cooldown_on_rate_limit_and_skips_follow_up_request()
     {
         var nowUtc = new DateTime(2026, 4, 15, 0, 0, 0, DateTimeKind.Utc);
