@@ -6,6 +6,7 @@ namespace RemotePartyFinderReborn;
 
 internal sealed class FFLogsSubmitBuffer
 {
+    private readonly object _sync = new();
     private readonly Dictionary<string, ParseResult> _pendingSubmitResults = new(StringComparer.Ordinal);
 
     internal static string GetParseResultKey(ParseResult result)
@@ -14,13 +15,38 @@ internal sealed class FFLogsSubmitBuffer
         return $"{result.ContentId}:{result.ZoneId}:{result.DifficultyId}";
     }
 
+    public bool HasPendingResults
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _pendingSubmitResults.Count > 0;
+            }
+        }
+    }
+
+    public int PendingCount
+    {
+        get
+        {
+            lock (_sync)
+            {
+                return _pendingSubmitResults.Count;
+            }
+        }
+    }
+
     public void QueueSubmitResults(IEnumerable<ParseResult> freshResults)
     {
         ArgumentNullException.ThrowIfNull(freshResults);
 
-        foreach (var result in freshResults)
+        lock (_sync)
         {
-            _pendingSubmitResults[GetParseResultKey(result)] = result;
+            foreach (var result in freshResults)
+            {
+                _pendingSubmitResults[GetParseResultKey(result)] = result;
+            }
         }
     }
 
@@ -28,24 +54,49 @@ internal sealed class FFLogsSubmitBuffer
     {
         ArgumentNullException.ThrowIfNull(freshResults);
 
-        QueueSubmitResults(freshResults);
-        if (_pendingSubmitResults.Count == 0)
+        lock (_sync)
         {
-            return [];
-        }
+            foreach (var result in freshResults)
+            {
+                _pendingSubmitResults[GetParseResultKey(result)] = result;
+            }
 
-        var batch = _pendingSubmitResults.Values.ToList();
-        _pendingSubmitResults.Clear();
-        return batch;
+            if (_pendingSubmitResults.Count == 0)
+            {
+                return [];
+            }
+
+            var batch = _pendingSubmitResults.Values.ToList();
+            _pendingSubmitResults.Clear();
+            return batch;
+        }
     }
 
     public void RequeueSubmitBatch(IEnumerable<ParseResult> failedBatch)
     {
         ArgumentNullException.ThrowIfNull(failedBatch);
 
-        foreach (var result in failedBatch)
+        lock (_sync)
         {
-            _pendingSubmitResults[GetParseResultKey(result)] = result;
+            foreach (var result in failedBatch)
+            {
+                _pendingSubmitResults[GetParseResultKey(result)] = result;
+            }
+        }
+    }
+
+    public List<ParseResult> DrainPendingResults()
+    {
+        lock (_sync)
+        {
+            if (_pendingSubmitResults.Count == 0)
+            {
+                return [];
+            }
+
+            var drained = _pendingSubmitResults.Values.ToList();
+            _pendingSubmitResults.Clear();
+            return drained;
         }
     }
 }

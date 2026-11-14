@@ -37,5 +37,51 @@ internal static class FFLogsQueryBuilder
     }
 
     internal static string EscapeGraphQlString(string s)
-        => s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+    {
+        if (string.IsNullOrEmpty(s))
+        {
+            return string.Empty;
+        }
+
+        var sb = new StringBuilder(s.Length);
+        foreach (var ch in s)
+        {
+            switch (ch)
+            {
+                case '\\':
+                    sb.Append("\\\\");
+                    break;
+                case '"':
+                    sb.Append("\\\"");
+                    break;
+                case '\n':
+                    sb.Append("\\n");
+                    break;
+                case '\r':
+                    sb.Append("\\r");
+                    break;
+                case '\t':
+                    sb.Append("\\t");
+                    break;
+                case '\b':
+                    sb.Append("\\b");
+                    break;
+                case '\f':
+                    sb.Append("\\f");
+                    break;
+                default:
+                    if (ch < ' ' || ch == '\x7f')
+                    {
+                        sb.Append($"\\u{(int)ch:x4}");
+                    }
+                    else
+                    {
+                        sb.Append(ch);
+                    }
+                    break;
+            }
+        }
+
+        return sb.ToString();
+    }
 }

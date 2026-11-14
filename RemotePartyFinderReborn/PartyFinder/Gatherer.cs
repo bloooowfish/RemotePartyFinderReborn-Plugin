@@ -18,10 +18,12 @@ internal sealed class Gatherer : IDisposable {
     private static readonly TimeSpan UploadedListingGrace = TimeSpan.FromMilliseconds(250);
 
     private readonly Plugin _plugin;
-    private readonly ConcurrentDictionary<int, ConcurrentQueue<IPartyFinderListing>> _batches = new();
+    private readonly object _batchesLock = new();
+    private Dictionary<int, List<UploadableListing>> _batches = new();
     private readonly ConcurrentDictionary<uint, DateTime> _lastUploadedListingAtUtc = new();
     private readonly Stopwatch _uploadTimer = new();
     private readonly HttpClient _httpClient = new();
+    private readonly CancellationTokenSource _disposeCts = new();
 
     private volatile bool _uploadInProgress;
     private long _lastSuccessfulUploadAtUtcTicks;
@@ -42,6 +44,9 @@ internal sealed class Gatherer : IDisposable {
     public void Dispose() {
         _plugin.Framework.Update -= OnUpdate;
         _plugin.PartyFinderGui.ReceiveListing -= OnListing;
+        _disposeCts.Cancel();
+        _disposeCts.Dispose();
+        _httpClient.Dispose();
     }
 
     internal bool WasListingUploadedAfter(uint listingId, DateTime observedAtUtc) {
@@ -62,8 +67,27 @@ internal sealed class Gatherer : IDisposable {
             return;
         }
 
-        var queue = _batches.GetOrAdd(args.BatchNumber, static _ => new ConcurrentQueue<IPartyFinderListing>());
-        queue.Enqueue(listing);
+        // Snapshot Lumina World/Duty values synchronously on the framework main thread.
+        UploadableListing uploadableListing;
+        try {
+            uploadableListing = new UploadableListing(listing);
+        } catch (ArgumentOutOfRangeException exception) {
+            Plugin.Log.Warning($"Gatherer: skipped listing with unsupported API15 id {listing.Id}. {exception.Message}");
+            return;
+        }
+
+        if (!ShouldUploadListing(uploadableListing)) {
+            return;
+        }
+
+        lock (_batchesLock) {
+            if (!_batches.TryGetValue(args.BatchNumber, out var list)) {
+                list = [];
+                _batches[args.BatchNumber] = list;
+            }
+
+            list.Add(uploadableListing);
+        }
     }
 
     private void OnUpdate(IFramework framework) {
@@ -111,23 +135,19 @@ internal sealed class Gatherer : IDisposable {
     }
 
     private List<UploadableListing> DrainBatches() {
+        Dictionary<int, List<UploadableListing>> drained;
+        lock (_batchesLock) {
+            if (_batches.Count == 0) {
+                return [];
+            }
+
+            drained = _batches;
+            _batches = new Dictionary<int, List<UploadableListing>>();
+        }
+
         var result = new List<UploadableListing>();
-
-        foreach (var (batchId, _) in _batches.ToList()) {
-            if (!_batches.TryRemove(batchId, out var queue) || queue == null) {
-                continue;
-            }
-
-            while (queue.TryDequeue(out var listing)) {
-                try {
-                    var uploadableListing = new UploadableListing(listing);
-                    if (ShouldUploadListing(uploadableListing)) {
-                        result.Add(uploadableListing);
-                    }
-                } catch (ArgumentOutOfRangeException exception) {
-                    Plugin.Log.Warning($"Gatherer: skipped listing with unsupported API15 id {listing.Id}. {exception.Message}");
-                }
-            }
+        foreach (var (_, list) in drained) {
+            result.AddRange(list);
         }
 
         return result;

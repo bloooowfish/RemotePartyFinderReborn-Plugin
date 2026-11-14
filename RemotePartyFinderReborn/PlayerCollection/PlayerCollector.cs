@@ -258,6 +258,7 @@ internal sealed class PlayerObservationWriter : IDisposable {
     private readonly Action<string> _errorSink;
     private readonly Action _onUpsertSucceeded;
     private readonly Task _worker;
+    private readonly CancellationTokenSource _shutdownCts = new();
     private int _completed;
     private long _overflowDropsSinceWarning;
     private long _lastOverflowWarningUtcTicks;
@@ -304,8 +305,10 @@ internal sealed class PlayerObservationWriter : IDisposable {
             _batches.Writer.TryComplete();
         }
 
+        _shutdownCts.Cancel();
         Signal();
         _worker.GetAwaiter().GetResult();
+        _shutdownCts.Dispose();
         _signal.Dispose();
     }
 
@@ -316,25 +319,8 @@ internal sealed class PlayerObservationWriter : IDisposable {
 
             while (true) {
                 if (Volatile.Read(ref _completed) != 0) {
-                    var pending = TakeAllPending(retryBatch);
-                    if (pending.Length == 0) {
+                    if (!DrainPendingOnShutdown(retryBatch)) {
                         return;
-                    }
-
-                    var persisted = false;
-                    for (var attempt = 1; attempt <= 3; attempt++) {
-                        if (TryUpsert(pending)) {
-                            persisted = true;
-                            break;
-                        }
-
-                        if (attempt < 3) {
-                            await Task.Delay(TimeSpan.FromSeconds(attempt)).ConfigureAwait(false);
-                        }
-                    }
-
-                    if (!persisted) {
-                        _warningSink($"PlayerCollector: Shutdown stopped after 3 failed database writes; dropped {pending.Length} pending player observations.");
                     }
 
                     return;
@@ -346,14 +332,22 @@ internal sealed class PlayerObservationWriter : IDisposable {
                         continue;
                     }
 
-                    await Task.Delay(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+                    try {
+                        await Task.Delay(TimeSpan.FromSeconds(1), _shutdownCts.Token).ConfigureAwait(false);
+                    } catch (OperationCanceledException) {
+                        // Shutdown requested; proceed immediately to shutdown drain.
+                    }
                     continue;
                 }
 
                 if (_batches.Reader.TryRead(out var batch)) {
                     if (!TryUpsert(batch)) {
                         retryBatch = batch;
-                        await Task.Delay(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+                        try {
+                            await Task.Delay(TimeSpan.FromSeconds(1), _shutdownCts.Token).ConfigureAwait(false);
+                        } catch (OperationCanceledException) {
+                            // Shutdown requested; proceed immediately to shutdown drain.
+                        }
                     }
                     continue;
                 }
@@ -367,7 +361,11 @@ internal sealed class PlayerObservationWriter : IDisposable {
                 if (overflow.Length > 0) {
                     if (!TryUpsert(overflow)) {
                         retryBatch = overflow;
-                        await Task.Delay(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+                        try {
+                            await Task.Delay(TimeSpan.FromSeconds(1), _shutdownCts.Token).ConfigureAwait(false);
+                        } catch (OperationCanceledException) {
+                            // Shutdown requested; proceed immediately to shutdown drain.
+                        }
                     }
                     continue;
                 }
@@ -438,28 +436,34 @@ internal sealed class PlayerObservationWriter : IDisposable {
         _warningSink($"PlayerCollector: Coalesced observation buffer reached {MaxCoalescedOverflowPlayers} unique players; dropped {droppedSinceWarning} new unique observations. Existing IDs continue to coalesce.");
     }
 
-    private UploadablePlayer[] TakeAllPending(UploadablePlayer[]? retryBatch) {
-        var pendingByContentId = new Dictionary<ulong, UploadablePlayer>();
-        if (retryBatch is not null) {
-            foreach (var player in retryBatch) {
-                pendingByContentId[player.ContentId] = player;
-            }
+    private bool DrainPendingOnShutdown(UploadablePlayer[]? retryBatch) {
+        if (retryBatch is { Length: > 0 } && !TryPersistShutdownBatch(retryBatch)) {
+            return false;
         }
 
         while (_batches.Reader.TryRead(out var queuedBatch)) {
-            foreach (var player in queuedBatch) {
-                pendingByContentId[player.ContentId] = player;
+            if (queuedBatch.Length > 0 && !TryPersistShutdownBatch(queuedBatch)) {
+                return false;
             }
         }
 
+        UploadablePlayer[] overflow;
         lock (_overflowLock) {
-            foreach (var player in _coalescedOverflow.Values) {
-                pendingByContentId[player.ContentId] = player;
-            }
-
+            overflow = _coalescedOverflow.Values.ToArray();
             _coalescedOverflow.Clear();
         }
 
-        return pendingByContentId.Values.ToArray();
+        return overflow.Length == 0 || TryPersistShutdownBatch(overflow);
+    }
+
+    private bool TryPersistShutdownBatch(UploadablePlayer[] pending) {
+        for (var attempt = 1; attempt <= 3; attempt++) {
+            if (TryUpsert(pending)) {
+                return true;
+            }
+        }
+
+        _warningSink($"PlayerCollector: Shutdown stopped after 3 failed database writes; dropped {pending.Length} pending player observations.");
+        return false;
     }
 }

@@ -7,6 +7,8 @@ using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Data.Sqlite;
 
 namespace RemotePartyFinderReborn;
@@ -15,18 +17,48 @@ internal sealed class PlayerLocalDatabase : IDisposable {
     public const int MaxBatchSize = 100;
 
     private const int CurrentSchemaVersion = 3;
+    private const int MaxCachedPlayers = 50_000;
+    private const int MaxCachedIdentities = 50_000;
+    private const int MaxCachedPartialIdentities = 20_000;
     private const string PlayersTableName = "players";
     private const string IdentitiesTableName = "player_identities";
     private const string PartialIdentitiesTableName = "player_identity_partials";
 
-    private readonly string _databasePath;
-    private readonly object _sync = new();
+    private static readonly TimeSpan CleanPlayerRetention = TimeSpan.FromDays(14);
+    private static readonly TimeSpan WriteCoalesceDelay = TimeSpan.FromMilliseconds(200);
+
+    private readonly string _connectionString;
+    private readonly object _stateLock = new();
+    private readonly object _dbLock = new();
+    private readonly SemaphoreSlim _flushSignal = new(0, int.MaxValue);
+    private readonly CancellationTokenSource _disposeCts = new();
+    private readonly Task _flushTask;
+
+    private readonly Dictionary<ulong, CachedPlayerEntry> _players = new();
+    private readonly Dictionary<ulong, CachedIdentityEntry> _identities = new();
+    private readonly Dictionary<ulong, PartialCharacterIdentitySnapshot> _partialIdentities = new();
+
+    private Dictionary<ulong, CachedPlayerEntry> _pendingPlayerMutations = new();
+    private Dictionary<ulong, DateTime> _pendingPlayerMarkUploadedOnly = new();
+    private Dictionary<ulong, CachedIdentityEntry> _pendingIdentityUpserts = new();
+    private Dictionary<ulong, DateTime> _pendingIdentitySubmittedOnly = new();
+    private Dictionary<ulong, PartialCharacterIdentitySnapshot> _pendingPartialUpserts = new();
+    private HashSet<ulong> _pendingPartialDeletes = new();
+
+    private bool _pendingMarkAllDirty;
+    private bool _pendingPruneCleanPlayers;
+    private bool _playersMayBeIncomplete;
+    private bool _identitiesMayBeIncomplete;
+    private bool _partialsMayBeIncomplete;
+    private int _dirtyPlayerCount;
+    private bool _flushScheduled;
+    private bool _disposing;
     private bool _disposed;
 
     public PlayerLocalDatabase(string databasePath) {
         ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
 
-        _databasePath = databasePath;
+        _connectionString = $"Data Source={databasePath};Mode=ReadWriteCreate";
 
         var directoryPath = Path.GetDirectoryName(databasePath);
         if (!string.IsNullOrWhiteSpace(directoryPath)) {
@@ -34,90 +66,93 @@ internal sealed class PlayerLocalDatabase : IDisposable {
         }
 
         Initialize();
+        _flushTask = Task.Run(FlushLoopAsync);
     }
 
     public int PendingCount {
         get {
-            lock (_sync) {
-                using var connection = OpenConnection();
-                using var command = connection.CreateCommand();
-                command.CommandText = "SELECT COUNT(*) FROM players WHERE dirty = 1;";
-                var value = command.ExecuteScalar();
-                return value is long count ? (int)Math.Min(count, int.MaxValue) : 0;
+            lock (_stateLock) {
+                ThrowIfDisposedLocked();
+                return _dirtyPlayerCount;
             }
         }
     }
 
     public void UpsertObservedPlayers(IEnumerable<UploadablePlayer> players) {
-        lock (_sync) {
-            using var connection = OpenConnection();
-            using var transaction = connection.BeginTransaction();
-            using var command = connection.CreateCommand();
-            command.Transaction = transaction;
-            command.CommandText = """
-                INSERT INTO players (
-                    content_id,
-                    name,
-                    home_world,
-                    current_world,
-                    account_id,
-                    payload_hash,
-                    dirty,
-                    first_seen_utc,
-                    last_seen_utc
-                )
-                VALUES (
-                    @content_id,
-                    @name,
-                    @home_world,
-                    @current_world,
-                    @account_id,
-                    @payload_hash,
-                    1,
-                    @observed_at,
-                    @observed_at
-                )
-                ON CONFLICT(content_id) DO UPDATE SET
-                    name = excluded.name,
-                    home_world = excluded.home_world,
-                    current_world = excluded.current_world,
-                    account_id = excluded.account_id,
-                    last_seen_utc = excluded.last_seen_utc,
-                    payload_hash = excluded.payload_hash,
-                    dirty = CASE
-                        WHEN players.payload_hash <> excluded.payload_hash THEN 1
-                        ELSE players.dirty
-                    END;
-                """;
+        ArgumentNullException.ThrowIfNull(players);
 
-            var contentIdParam = command.Parameters.Add("@content_id", SqliteType.Integer);
-            var nameParam = command.Parameters.Add("@name", SqliteType.Text);
-            var homeWorldParam = command.Parameters.Add("@home_world", SqliteType.Integer);
-            var currentWorldParam = command.Parameters.Add("@current_world", SqliteType.Integer);
-            var accountIdParam = command.Parameters.Add("@account_id", SqliteType.Integer);
-            var payloadHashParam = command.Parameters.Add("@payload_hash", SqliteType.Text);
-            var observedAtParam = command.Parameters.Add("@observed_at", SqliteType.Text);
+        var observedAtUtc = DateTime.UtcNow;
+        var playerList = players as ICollection<UploadablePlayer> ?? players.ToList();
+        if (playerList.Count == 0) {
+            return;
+        }
 
-            var observedAt = DateTimeOffset.UtcNow.ToString("O");
-            observedAtParam.Value = observedAt;
+        lock (_stateLock) {
+            ThrowIfDisposedLocked();
 
-            foreach (var player in players) {
-                contentIdParam.Value = (long)player.ContentId;
-                nameParam.Value = player.Name;
-                homeWorldParam.Value = (long)player.HomeWorld;
-                currentWorldParam.Value = (long)player.CurrentWorld;
-                accountIdParam.Value = unchecked((long)player.AccountId);
-                payloadHashParam.Value = ComputePayloadHash(player);
-                command.ExecuteNonQuery();
+            foreach (var player in playerList) {
+                var payloadHash = ComputePayloadHash(player);
+                var clonedPlayer = ClonePlayer(player);
+
+                CachedPlayerEntry nextEntry;
+                if (_players.TryGetValue(player.ContentId, out var existing)) {
+                    var dirty = existing.Dirty || !string.Equals(existing.PayloadHash, payloadHash, StringComparison.Ordinal);
+                    nextEntry = new CachedPlayerEntry(
+                        clonedPlayer,
+                        payloadHash,
+                        dirty,
+                        existing.FirstSeenUtc,
+                        observedAtUtc,
+                        existing.LastUploadedUtc
+                    );
+                } else {
+                    nextEntry = new CachedPlayerEntry(
+                        clonedPlayer,
+                        payloadHash,
+                        Dirty: true,
+                        FirstSeenUtc: observedAtUtc,
+                        LastSeenUtc: observedAtUtc,
+                        LastUploadedUtc: null
+                    );
+                }
+
+                SetPlayerCacheLocked(nextEntry);
+                _pendingPlayerMutations[player.ContentId] = nextEntry;
+                _pendingPlayerMarkUploadedOnly.Remove(player.ContentId);
             }
 
-            PruneCleanRows(connection, transaction);
-            transaction.Commit();
+            _pendingPruneCleanPlayers = true;
+            EnforcePlayerCacheLimitLocked(observedAtUtc);
+            SignalFlushLocked();
         }
     }
 
     public List<UploadablePlayer> TakePendingBatch(int maxBatchSize = MaxBatchSize) {
-        lock (_sync) {
+        var clampedLimit = Math.Clamp(maxBatchSize, 1, MaxBatchSize);
+        List<UploadablePlayer> batch;
+        bool shouldQueryOverflow;
+        lock (_stateLock) {
+            ThrowIfDisposedLocked();
+
+            batch = _players.Values
+                .Where(static entry => entry.Dirty)
+                .OrderByDescending(static entry => entry.LastSeenUtc)
+                .Take(clampedLimit)
+                .Select(static entry => ClonePlayer(entry.Player))
+                .ToList();
+            shouldQueryOverflow = _playersMayBeIncomplete && batch.Count < clampedLimit;
+        }
+
+        if (!shouldQueryOverflow) {
+            return batch;
+        }
+
+        var existingIds = batch.Select(static p => p.ContentId).ToHashSet();
+        lock (_dbLock) {
+            if (_disposed) {
+                throw new ObjectDisposedException(nameof(PlayerLocalDatabase));
+            }
+
             using var connection = OpenConnection();
             using var command = connection.CreateCommand();
             command.CommandText = """
@@ -127,25 +162,31 @@ internal sealed class PlayerLocalDatabase : IDisposable {
                 ORDER BY last_seen_utc DESC
                 LIMIT @limit;
                 """;
-            command.Parameters.AddWithValue("@limit", Math.Clamp(maxBatchSize, 1, MaxBatchSize));
+            command.Parameters.AddWithValue("@limit", clampedLimit + existingIds.Count);
 
-            var batch = new List<UploadablePlayer>();
             using var reader = command.ExecuteReader();
-            while (reader.Read()) {
+            while (reader.Read() && batch.Count < clampedLimit) {
+                var contentId = (ulong)reader.GetInt64(0);
+                if (!existingIds.Add(contentId)) {
+                    continue;
+                }
+
                 batch.Add(new UploadablePlayer {
-                    ContentId = (ulong)reader.GetInt64(0),
+                    ContentId = contentId,
                     Name = reader.GetString(1),
                     HomeWorld = Convert.ToUInt16(reader.GetInt64(2)),
                     CurrentWorld = Convert.ToUInt16(reader.GetInt64(3)),
                     AccountId = unchecked((ulong)reader.GetInt64(4)),
                 });
             }
-
-            return batch;
         }
+
+        return batch;
     }
 
     public void MarkBatchUploaded(IEnumerable<UploadablePlayer> uploadedPlayers) {
+        ArgumentNullException.ThrowIfNull(uploadedPlayers);
+
         var contentIds = uploadedPlayers
             .Select(static player => player.ContentId)
             .Distinct()
@@ -155,51 +196,80 @@ internal sealed class PlayerLocalDatabase : IDisposable {
             return;
         }
 
-        lock (_sync) {
-            using var connection = OpenConnection();
-            using var transaction = connection.BeginTransaction();
-            using var command = connection.CreateCommand();
-            command.Transaction = transaction;
-            command.CommandText = """
-                UPDATE players
-                SET dirty = 0,
-                    last_uploaded_utc = @uploaded_at
-                WHERE content_id = @content_id;
-                """;
-
-            var uploadedAtParam = command.Parameters.Add("@uploaded_at", SqliteType.Text);
-            var contentIdParam = command.Parameters.Add("@content_id", SqliteType.Integer);
-            uploadedAtParam.Value = DateTimeOffset.UtcNow.ToString("O");
+        var uploadedAtUtc = DateTime.UtcNow;
+        lock (_stateLock) {
+            ThrowIfDisposedLocked();
 
             foreach (var contentId in contentIds) {
-                contentIdParam.Value = (long)contentId;
-                command.ExecuteNonQuery();
+                if (_players.TryGetValue(contentId, out var existing)) {
+                    var updated = existing with {
+                        Dirty = false,
+                        LastUploadedUtc = uploadedAtUtc,
+                    };
+                    SetPlayerCacheLocked(updated);
+                    _pendingPlayerMutations[contentId] = updated;
+                    _pendingPlayerMarkUploadedOnly.Remove(contentId);
+                } else {
+                    _pendingPlayerMutations.Remove(contentId);
+                    _pendingPlayerMarkUploadedOnly[contentId] = uploadedAtUtc;
+                }
             }
 
-            transaction.Commit();
+            SignalFlushLocked();
         }
     }
 
     public int MarkAllPlayersDirty() {
-        lock (_sync) {
-            using var connection = OpenConnection();
-            using var command = connection.CreateCommand();
-            command.CommandText = """
-                UPDATE players
-                SET dirty = 1;
-                """;
+        lock (_stateLock) {
+            ThrowIfDisposedLocked();
 
-            var affected = command.ExecuteNonQuery();
-            return Math.Max(affected, 0);
+            foreach (var contentId in _players.Keys.ToArray()) {
+                var existing = _players[contentId];
+                if (!existing.Dirty) {
+                    SetPlayerCacheLocked(existing with { Dirty = true });
+                }
+            }
+
+            foreach (var contentId in _pendingPlayerMutations.Keys.ToArray()) {
+                var pending = _pendingPlayerMutations[contentId];
+                if (!pending.Dirty) {
+                    _pendingPlayerMutations[contentId] = pending with { Dirty = true };
+                }
+            }
+
+            _pendingPlayerMarkUploadedOnly.Clear();
+            _pendingMarkAllDirty = true;
+            SignalFlushLocked();
+            return _players.Count;
         }
     }
 
     public bool TryGetIdentity(ulong contentId, [NotNullWhen(true)] out CharacterIdentitySnapshot? snapshot) {
-        lock (_sync) {
+        bool shouldQuerySqlite;
+        lock (_stateLock) {
+            ThrowIfDisposedLocked();
+            if (_identities.TryGetValue(contentId, out var entry)) {
+                snapshot = entry.Snapshot;
+                return true;
+            }
+
+            shouldQuerySqlite = _identitiesMayBeIncomplete;
+        }
+
+        if (!shouldQuerySqlite) {
+            snapshot = null;
+            return false;
+        }
+
+        lock (_dbLock) {
+            if (_disposed) {
+                throw new ObjectDisposedException(nameof(PlayerLocalDatabase));
+            }
+
             using var connection = OpenConnection();
             using var command = connection.CreateCommand();
             command.CommandText = """
-                SELECT name, home_world, world_name, last_resolved_utc
+                SELECT name, home_world, world_name, last_resolved_utc, pending_upload, last_uploaded_utc
                 FROM player_identities
                 WHERE content_id = @content_id
                   AND name IS NOT NULL
@@ -216,13 +286,24 @@ internal sealed class PlayerLocalDatabase : IDisposable {
                 return false;
             }
 
-            snapshot = new CharacterIdentitySnapshot(
+            var loadedSnapshot = new CharacterIdentitySnapshot(
                 contentId,
                 reader.GetString(0),
                 Convert.ToUInt16(reader.GetInt64(1)),
                 reader.GetString(2),
                 ParseTimestamp(reader.GetString(3))
             );
+            var pendingUpload = reader.GetInt64(4) != 0;
+            var lastUploadedUtc = reader.IsDBNull(5) ? (DateTime?)null : ParseTimestamp(reader.GetString(5));
+            snapshot = loadedSnapshot;
+
+            lock (_stateLock) {
+                if (!_disposed && !_identities.ContainsKey(contentId) && !_pendingIdentityUpserts.ContainsKey(contentId)) {
+                    _identities[contentId] = new CachedIdentityEntry(loadedSnapshot, pendingUpload, lastUploadedUtc);
+                    EnforceIdentityCacheLimitLocked();
+                }
+            }
+
             return true;
         }
     }
@@ -236,19 +317,38 @@ internal sealed class PlayerLocalDatabase : IDisposable {
             return identities;
         }
 
-        // Keep well below SQLite's historical 999-parameter limit. This is used for
-        // party member batches (normally at most 48 IDs), while remaining safe for
-        // other callers that pass larger collections.
+        List<ulong>? missingIds = null;
+        lock (_stateLock) {
+            ThrowIfDisposedLocked();
+
+            foreach (var id in requestedIds) {
+                if (_identities.TryGetValue(id, out var entry)) {
+                    identities[id] = entry.Snapshot;
+                } else if (_identitiesMayBeIncomplete) {
+                    missingIds ??= new List<ulong>();
+                    missingIds.Add(id);
+                }
+            }
+        }
+
+        if (missingIds is null || missingIds.Count == 0) {
+            return identities;
+        }
+
         const int MaxParametersPerQuery = 900;
-        lock (_sync) {
+        lock (_dbLock) {
+            if (_disposed) {
+                throw new ObjectDisposedException(nameof(PlayerLocalDatabase));
+            }
+
             using var connection = OpenConnection();
-            for (var offset = 0; offset < requestedIds.Length; offset += MaxParametersPerQuery) {
-                var count = Math.Min(MaxParametersPerQuery, requestedIds.Length - offset);
+            for (var offset = 0; offset < missingIds.Count; offset += MaxParametersPerQuery) {
+                var count = Math.Min(MaxParametersPerQuery, missingIds.Count - offset);
                 using var command = connection.CreateCommand();
                 var parameterNames = new string[count];
                 for (var index = 0; index < count; index++) {
                     parameterNames[index] = $"@content_id_{index}";
-                    command.Parameters.AddWithValue(parameterNames[index], (long)requestedIds[offset + index]);
+                    command.Parameters.AddWithValue(parameterNames[index], (long)missingIds[offset + index]);
                 }
 
                 command.CommandText = $"""
@@ -263,9 +363,9 @@ internal sealed class PlayerLocalDatabase : IDisposable {
 
                 using var reader = command.ExecuteReader();
                 while (reader.Read()) {
-                    var contentId = (ulong)reader.GetInt64(0);
-                    identities[contentId] = new CharacterIdentitySnapshot(
-                        contentId,
+                    var id = (ulong)reader.GetInt64(0);
+                    identities[id] = new CharacterIdentitySnapshot(
+                        id,
                         reader.GetString(1),
                         Convert.ToUInt16(reader.GetInt64(2)),
                         reader.GetString(3),
@@ -279,7 +379,26 @@ internal sealed class PlayerLocalDatabase : IDisposable {
     }
 
     public bool TryGetPartialIdentity(ulong contentId, [NotNullWhen(true)] out PartialCharacterIdentitySnapshot? snapshot) {
-        lock (_sync) {
+        bool shouldQuerySqlite;
+        lock (_stateLock) {
+            ThrowIfDisposedLocked();
+            if (_partialIdentities.TryGetValue(contentId, out snapshot)) {
+                return true;
+            }
+
+            shouldQuerySqlite = _partialsMayBeIncomplete && !_pendingPartialDeletes.Contains(contentId);
+        }
+
+        if (!shouldQuerySqlite) {
+            snapshot = null;
+            return false;
+        }
+
+        lock (_dbLock) {
+            if (_disposed) {
+                throw new ObjectDisposedException(nameof(PlayerLocalDatabase));
+            }
+
             using var connection = OpenConnection();
             using var command = connection.CreateCommand();
             command.CommandText = """
@@ -310,43 +429,502 @@ internal sealed class PlayerLocalDatabase : IDisposable {
     public void UpsertPartialIdentityName(ulong contentId, string name, DateTime updatedAtUtc) {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
 
-        lock (_sync) {
-            using var connection = OpenConnection();
-            using var command = connection.CreateCommand();
-            command.CommandText = """
-                INSERT INTO player_identity_partials (
-                    content_id,
-                    name,
-                    home_world,
-                    world_name,
-                    last_updated_utc
-                )
-                VALUES (
-                    @content_id,
-                    @name,
-                    NULL,
-                    NULL,
-                    @last_updated_utc
-                )
-                ON CONFLICT(content_id) DO UPDATE SET
-                    name = excluded.name,
-                    last_updated_utc = excluded.last_updated_utc;
-                """;
+        var trimmedName = name.Trim();
+        lock (_stateLock) {
+            ThrowIfDisposedLocked();
 
-            command.Parameters.AddWithValue("@content_id", (long)contentId);
-            command.Parameters.AddWithValue("@name", name.Trim());
-            command.Parameters.AddWithValue("@last_updated_utc", updatedAtUtc.ToString("O"));
-            command.ExecuteNonQuery();
+            var next = _partialIdentities.TryGetValue(contentId, out var existing)
+                ? existing with { Name = trimmedName, LastUpdatedAtUtc = updatedAtUtc }
+                : new PartialCharacterIdentitySnapshot(contentId, trimmedName, null, null, updatedAtUtc);
+
+            _partialIdentities[contentId] = next;
+            _pendingPartialUpserts[contentId] = next;
+            _pendingPartialDeletes.Remove(contentId);
+            EnforcePartialCacheLimitLocked();
+            SignalFlushLocked();
         }
     }
 
     public void UpsertResolvedIdentity(CharacterIdentitySnapshot snapshot) {
-        lock (_sync) {
+        ArgumentNullException.ThrowIfNull(snapshot);
+
+        lock (_stateLock) {
+            ThrowIfDisposedLocked();
+
+            var entry = new CachedIdentityEntry(snapshot, PendingUpload: true, LastUploadedUtc: null);
+            _identities[snapshot.ContentId] = entry;
+            _pendingIdentityUpserts[snapshot.ContentId] = entry;
+            _pendingIdentitySubmittedOnly.Remove(snapshot.ContentId);
+
+            _partialIdentities.Remove(snapshot.ContentId);
+            _pendingPartialUpserts.Remove(snapshot.ContentId);
+            _pendingPartialDeletes.Add(snapshot.ContentId);
+
+            EnforceIdentityCacheLimitLocked();
+            SignalFlushLocked();
+        }
+    }
+
+    public List<CharacterIdentitySnapshot> TakePendingIdentityUploads(int maxBatchSize) {
+        var clampedLimit = Math.Clamp(maxBatchSize, 1, MaxBatchSize);
+        lock (_stateLock) {
+            ThrowIfDisposedLocked();
+
+            return _identities.Values
+                .Where(static entry => entry.PendingUpload)
+                .OrderByDescending(static entry => entry.Snapshot.LastResolvedAtUtc)
+                .ThenBy(static entry => entry.Snapshot.ContentId)
+                .Take(clampedLimit)
+                .Select(static entry => entry.Snapshot)
+                .ToList();
+        }
+    }
+
+    public void MarkIdentityUploadsSubmitted(IEnumerable<ulong> contentIds) {
+        ArgumentNullException.ThrowIfNull(contentIds);
+
+        var distinctContentIds = contentIds
+            .Distinct()
+            .ToArray();
+
+        if (distinctContentIds.Length == 0) {
+            return;
+        }
+
+        var uploadedAtUtc = DateTime.UtcNow;
+        lock (_stateLock) {
+            ThrowIfDisposedLocked();
+
+            foreach (var contentId in distinctContentIds) {
+                if (_identities.TryGetValue(contentId, out var existing)) {
+                    var updated = existing with {
+                        PendingUpload = false,
+                        LastUploadedUtc = uploadedAtUtc,
+                    };
+                    _identities[contentId] = updated;
+                    _pendingIdentityUpserts[contentId] = updated;
+                    _pendingIdentitySubmittedOnly.Remove(contentId);
+                } else {
+                    _pendingIdentityUpserts.Remove(contentId);
+                    _pendingIdentitySubmittedOnly[contentId] = uploadedAtUtc;
+                }
+            }
+
+            SignalFlushLocked();
+        }
+    }
+
+    internal void Flush() {
+        FlushPendingWrites();
+    }
+
+    public void Dispose() {
+        lock (_stateLock) {
+            if (_disposed || _disposing) {
+                return;
+            }
+
+            _disposing = true;
+        }
+
+        _disposeCts.Cancel();
+        try {
+            _flushTask.GetAwaiter().GetResult();
+        } catch (OperationCanceledException) {
+        } catch (Exception ex) {
+            Plugin.Log?.Error($"PlayerLocalDatabase background flush failed during shutdown: {ex}");
+        }
+
+        try {
+            FlushPendingWrites();
+        } catch (Exception ex) {
+            Plugin.Log?.Error($"PlayerLocalDatabase final flush failed during shutdown: {ex}");
+        }
+
+        lock (_stateLock) {
+            _disposed = true;
+        }
+
+        _disposeCts.Dispose();
+        _flushSignal.Dispose();
+
+        try {
+            SqliteConnection.ClearPool(new SqliteConnection(_connectionString));
+        } catch {
+            // Best-effort pool cleanup on dispose.
+        }
+    }
+
+    private void Initialize() {
+        lock (_dbLock) {
             using var connection = OpenConnection();
-            using var transaction = connection.BeginTransaction();
-            using var command = connection.CreateCommand();
-            command.Transaction = transaction;
-            command.CommandText = """
+            using (var pragmaCommand = connection.CreateCommand()) {
+                pragmaCommand.CommandText = """
+                    PRAGMA journal_mode = WAL;
+                    PRAGMA synchronous = NORMAL;
+                    PRAGMA busy_timeout = 3000;
+                    """;
+                pragmaCommand.ExecuteNonQuery();
+            }
+
+            EnsurePlayersTable(connection);
+            MigrateIdentityColumns(connection);
+            EnsurePartialIdentityTable(connection);
+            EnsureSchemaVersion(connection);
+
+            lock (_stateLock) {
+                LoadInitialCachesLocked(connection);
+            }
+        }
+    }
+
+    private SqliteConnection OpenConnection() {
+        if (_disposed) {
+            throw new ObjectDisposedException(nameof(PlayerLocalDatabase));
+        }
+
+        var connection = new SqliteConnection(_connectionString);
+        connection.Open();
+
+        using var timeoutCommand = connection.CreateCommand();
+        timeoutCommand.CommandText = "PRAGMA busy_timeout = 3000;";
+        timeoutCommand.ExecuteNonQuery();
+
+        return connection;
+    }
+
+    private void LoadInitialCachesLocked(SqliteConnection connection) {
+        _players.Clear();
+        _identities.Clear();
+        _partialIdentities.Clear();
+        _dirtyPlayerCount = 0;
+        _playersMayBeIncomplete = false;
+        _identitiesMayBeIncomplete = false;
+        _partialsMayBeIncomplete = false;
+
+        using (var playersCommand = connection.CreateCommand()) {
+            playersCommand.CommandText = """
+                SELECT content_id, name, home_world, current_world, account_id, payload_hash, dirty, first_seen_utc, last_seen_utc, last_uploaded_utc
+                FROM players
+                ORDER BY dirty DESC, last_seen_utc DESC
+                LIMIT @limit;
+                """;
+            playersCommand.Parameters.AddWithValue("@limit", MaxCachedPlayers + 1);
+
+            using var reader = playersCommand.ExecuteReader();
+            while (reader.Read()) {
+                if (_players.Count >= MaxCachedPlayers) {
+                    _playersMayBeIncomplete = true;
+                    break;
+                }
+
+                var player = new UploadablePlayer {
+                    ContentId = (ulong)reader.GetInt64(0),
+                    Name = reader.GetString(1),
+                    HomeWorld = Convert.ToUInt16(reader.GetInt64(2)),
+                    CurrentWorld = Convert.ToUInt16(reader.GetInt64(3)),
+                    AccountId = unchecked((ulong)reader.GetInt64(4)),
+                };
+                var entry = new CachedPlayerEntry(
+                    player,
+                    reader.GetString(5),
+                    reader.GetInt64(6) != 0,
+                    ParseTimestamp(reader.GetString(7)),
+                    ParseTimestamp(reader.GetString(8)),
+                    reader.IsDBNull(9) ? null : ParseTimestamp(reader.GetString(9))
+                );
+                SetPlayerCacheLocked(entry);
+            }
+        }
+
+        using (var identitiesCommand = connection.CreateCommand()) {
+            identitiesCommand.CommandText = """
+                SELECT content_id, name, home_world, world_name, last_resolved_utc, pending_upload, last_uploaded_utc
+                FROM player_identities
+                WHERE name IS NOT NULL
+                  AND home_world IS NOT NULL
+                  AND world_name IS NOT NULL
+                  AND last_resolved_utc IS NOT NULL
+                ORDER BY pending_upload DESC, last_resolved_utc DESC
+                LIMIT @limit;
+                """;
+            identitiesCommand.Parameters.AddWithValue("@limit", MaxCachedIdentities + 1);
+
+            using var reader = identitiesCommand.ExecuteReader();
+            while (reader.Read()) {
+                if (_identities.Count >= MaxCachedIdentities) {
+                    _identitiesMayBeIncomplete = true;
+                    break;
+                }
+
+                var snapshot = new CharacterIdentitySnapshot(
+                    (ulong)reader.GetInt64(0),
+                    reader.GetString(1),
+                    Convert.ToUInt16(reader.GetInt64(2)),
+                    reader.GetString(3),
+                    ParseTimestamp(reader.GetString(4))
+                );
+                var pendingUpload = reader.GetInt64(5) != 0;
+                var lastUploadedUtc = reader.IsDBNull(6) ? (DateTime?)null : ParseTimestamp(reader.GetString(6));
+                _identities[snapshot.ContentId] = new CachedIdentityEntry(snapshot, pendingUpload, lastUploadedUtc);
+            }
+        }
+
+        using (var partialsCommand = connection.CreateCommand()) {
+            partialsCommand.CommandText = """
+                SELECT content_id, name, home_world, world_name, last_updated_utc
+                FROM player_identity_partials
+                ORDER BY last_updated_utc DESC
+                LIMIT @limit;
+                """;
+            partialsCommand.Parameters.AddWithValue("@limit", MaxCachedPartialIdentities + 1);
+
+            using var reader = partialsCommand.ExecuteReader();
+            while (reader.Read()) {
+                if (_partialIdentities.Count >= MaxCachedPartialIdentities) {
+                    _partialsMayBeIncomplete = true;
+                    break;
+                }
+
+                var partial = new PartialCharacterIdentitySnapshot(
+                    (ulong)reader.GetInt64(0),
+                    reader.IsDBNull(1) ? null : reader.GetString(1),
+                    reader.IsDBNull(2) ? null : Convert.ToUInt16(reader.GetInt64(2)),
+                    reader.IsDBNull(3) ? null : reader.GetString(3),
+                    ParseTimestamp(reader.GetString(4))
+                );
+                _partialIdentities[partial.ContentId] = partial;
+            }
+        }
+    }
+
+    private async Task FlushLoopAsync() {
+        while (!_disposeCts.IsCancellationRequested) {
+            try {
+                await _flushSignal.WaitAsync(_disposeCts.Token).ConfigureAwait(false);
+                await Task.Delay(WriteCoalesceDelay, _disposeCts.Token).ConfigureAwait(false);
+            } catch (OperationCanceledException) {
+                break;
+            }
+
+            try {
+                FlushPendingWrites();
+            } catch (Exception ex) {
+                Plugin.Log?.Error($"PlayerLocalDatabase async flush error: {ex}");
+            }
+        }
+    }
+
+    private void FlushPendingWrites() {
+        lock (_dbLock) {
+            PendingWriteBatch batch;
+            lock (_stateLock) {
+                _flushScheduled = false;
+                if (!HasPendingWritesLocked()) {
+                    return;
+                }
+
+                batch = CapturePendingBatchLocked();
+            }
+
+            try {
+                WriteBatchToSqlite(batch);
+            } catch {
+                lock (_stateLock) {
+                    RestorePendingBatchLocked(batch);
+                }
+                throw;
+            }
+        }
+    }
+
+    private bool HasPendingWritesLocked() {
+        return _pendingMarkAllDirty
+               || _pendingPruneCleanPlayers
+               || _pendingPlayerMutations.Count > 0
+               || _pendingPlayerMarkUploadedOnly.Count > 0
+               || _pendingIdentityUpserts.Count > 0
+               || _pendingIdentitySubmittedOnly.Count > 0
+               || _pendingPartialUpserts.Count > 0
+               || _pendingPartialDeletes.Count > 0;
+    }
+
+    private PendingWriteBatch CapturePendingBatchLocked() {
+        var batch = new PendingWriteBatch(
+            MarkAllDirty: _pendingMarkAllDirty,
+            PruneCleanPlayers: _pendingPruneCleanPlayers,
+            PlayerMutations: _pendingPlayerMutations,
+            PlayerMarkUploadedOnly: _pendingPlayerMarkUploadedOnly,
+            IdentityUpserts: _pendingIdentityUpserts,
+            IdentitySubmittedOnly: _pendingIdentitySubmittedOnly,
+            PartialUpserts: _pendingPartialUpserts,
+            PartialDeletes: _pendingPartialDeletes
+        );
+
+        _pendingMarkAllDirty = false;
+        _pendingPruneCleanPlayers = false;
+        _pendingPlayerMutations = new Dictionary<ulong, CachedPlayerEntry>();
+        _pendingPlayerMarkUploadedOnly = new Dictionary<ulong, DateTime>();
+        _pendingIdentityUpserts = new Dictionary<ulong, CachedIdentityEntry>();
+        _pendingIdentitySubmittedOnly = new Dictionary<ulong, DateTime>();
+        _pendingPartialUpserts = new Dictionary<ulong, PartialCharacterIdentitySnapshot>();
+        _pendingPartialDeletes = new HashSet<ulong>();
+
+        return batch;
+    }
+
+    private void RestorePendingBatchLocked(PendingWriteBatch batch) {
+        if (batch.MarkAllDirty) {
+            _pendingMarkAllDirty = true;
+            foreach (var contentId in _pendingPlayerMutations.Keys.ToArray()) {
+                var current = _pendingPlayerMutations[contentId];
+                if (!current.Dirty) {
+                    _pendingPlayerMutations[contentId] = current with { Dirty = true };
+                }
+            }
+        }
+
+        _pendingPruneCleanPlayers |= batch.PruneCleanPlayers;
+
+        foreach (var (id, entry) in batch.PlayerMutations) {
+            if (!_pendingPlayerMutations.ContainsKey(id) && !_pendingPlayerMarkUploadedOnly.ContainsKey(id)) {
+                _pendingPlayerMutations[id] = entry;
+            }
+        }
+
+        foreach (var (id, uploadedAtUtc) in batch.PlayerMarkUploadedOnly) {
+            if (!_pendingPlayerMutations.ContainsKey(id) && !_pendingPlayerMarkUploadedOnly.ContainsKey(id)) {
+                _pendingPlayerMarkUploadedOnly[id] = uploadedAtUtc;
+            }
+        }
+
+        foreach (var (id, entry) in batch.IdentityUpserts) {
+            if (!_pendingIdentityUpserts.ContainsKey(id) && !_pendingIdentitySubmittedOnly.ContainsKey(id)) {
+                _pendingIdentityUpserts[id] = entry;
+            }
+        }
+
+        foreach (var (id, uploadedAtUtc) in batch.IdentitySubmittedOnly) {
+            if (!_pendingIdentityUpserts.ContainsKey(id) && !_pendingIdentitySubmittedOnly.ContainsKey(id)) {
+                _pendingIdentitySubmittedOnly[id] = uploadedAtUtc;
+            }
+        }
+
+        foreach (var (id, partial) in batch.PartialUpserts) {
+            if (!_pendingPartialUpserts.ContainsKey(id) && !_pendingPartialDeletes.Contains(id)) {
+                _pendingPartialUpserts[id] = partial;
+            }
+        }
+
+        foreach (var id in batch.PartialDeletes) {
+            if (!_pendingPartialUpserts.ContainsKey(id)) {
+                _pendingPartialDeletes.Add(id);
+            }
+        }
+    }
+
+    private void WriteBatchToSqlite(PendingWriteBatch batch) {
+        using var connection = OpenConnection();
+        using var transaction = connection.BeginTransaction();
+
+        if (batch.MarkAllDirty) {
+            using var markDirtyCommand = connection.CreateCommand();
+            markDirtyCommand.Transaction = transaction;
+            markDirtyCommand.CommandText = "UPDATE players SET dirty = 1;";
+            markDirtyCommand.ExecuteNonQuery();
+        }
+
+        if (batch.PlayerMutations.Count > 0) {
+            using var upsertCommand = connection.CreateCommand();
+            upsertCommand.Transaction = transaction;
+            upsertCommand.CommandText = """
+                INSERT INTO players (
+                    content_id,
+                    name,
+                    home_world,
+                    current_world,
+                    account_id,
+                    payload_hash,
+                    dirty,
+                    first_seen_utc,
+                    last_seen_utc,
+                    last_uploaded_utc
+                )
+                VALUES (
+                    @content_id,
+                    @name,
+                    @home_world,
+                    @current_world,
+                    @account_id,
+                    @payload_hash,
+                    @dirty,
+                    @first_seen_utc,
+                    @last_seen_utc,
+                    @last_uploaded_utc
+                )
+                ON CONFLICT(content_id) DO UPDATE SET
+                    name = excluded.name,
+                    home_world = excluded.home_world,
+                    current_world = excluded.current_world,
+                    account_id = excluded.account_id,
+                    payload_hash = excluded.payload_hash,
+                    dirty = excluded.dirty,
+                    last_seen_utc = excluded.last_seen_utc,
+                    last_uploaded_utc = excluded.last_uploaded_utc;
+                """;
+
+            var contentIdParam = upsertCommand.Parameters.Add("@content_id", SqliteType.Integer);
+            var nameParam = upsertCommand.Parameters.Add("@name", SqliteType.Text);
+            var homeWorldParam = upsertCommand.Parameters.Add("@home_world", SqliteType.Integer);
+            var currentWorldParam = upsertCommand.Parameters.Add("@current_world", SqliteType.Integer);
+            var accountIdParam = upsertCommand.Parameters.Add("@account_id", SqliteType.Integer);
+            var payloadHashParam = upsertCommand.Parameters.Add("@payload_hash", SqliteType.Text);
+            var dirtyParam = upsertCommand.Parameters.Add("@dirty", SqliteType.Integer);
+            var firstSeenParam = upsertCommand.Parameters.Add("@first_seen_utc", SqliteType.Text);
+            var lastSeenParam = upsertCommand.Parameters.Add("@last_seen_utc", SqliteType.Text);
+            var lastUploadedParam = upsertCommand.Parameters.Add("@last_uploaded_utc", SqliteType.Text);
+
+            foreach (var entry in batch.PlayerMutations.Values) {
+                contentIdParam.Value = (long)entry.Player.ContentId;
+                nameParam.Value = entry.Player.Name;
+                homeWorldParam.Value = (long)entry.Player.HomeWorld;
+                currentWorldParam.Value = (long)entry.Player.CurrentWorld;
+                accountIdParam.Value = unchecked((long)entry.Player.AccountId);
+                payloadHashParam.Value = entry.PayloadHash;
+                dirtyParam.Value = entry.Dirty ? 1 : 0;
+                firstSeenParam.Value = entry.FirstSeenUtc.ToString("O");
+                lastSeenParam.Value = entry.LastSeenUtc.ToString("O");
+                lastUploadedParam.Value = entry.LastUploadedUtc.HasValue
+                    ? entry.LastUploadedUtc.Value.ToString("O")
+                    : DBNull.Value;
+                upsertCommand.ExecuteNonQuery();
+            }
+        }
+
+        if (batch.PlayerMarkUploadedOnly.Count > 0) {
+            using var markUploadedCommand = connection.CreateCommand();
+            markUploadedCommand.Transaction = transaction;
+            markUploadedCommand.CommandText = """
+                UPDATE players
+                SET dirty = 0,
+                    last_uploaded_utc = @uploaded_at
+                WHERE content_id = @content_id;
+                """;
+
+            var uploadedAtParam = markUploadedCommand.Parameters.Add("@uploaded_at", SqliteType.Text);
+            var contentIdParam = markUploadedCommand.Parameters.Add("@content_id", SqliteType.Integer);
+
+            foreach (var (contentId, uploadedAtUtc) in batch.PlayerMarkUploadedOnly) {
+                uploadedAtParam.Value = uploadedAtUtc.ToString("O");
+                contentIdParam.Value = (long)contentId;
+                markUploadedCommand.ExecuteNonQuery();
+            }
+        }
+
+        if (batch.IdentityUpserts.Count > 0) {
+            using var identityCommand = connection.CreateCommand();
+            identityCommand.Transaction = transaction;
+            identityCommand.CommandText = """
                 INSERT INTO player_identities (
                     content_id,
                     name,
@@ -362,129 +940,241 @@ internal sealed class PlayerLocalDatabase : IDisposable {
                     @home_world,
                     @world_name,
                     @last_resolved_utc,
-                    1,
-                    NULL
+                    @pending_upload,
+                    @last_uploaded_utc
                 )
                 ON CONFLICT(content_id) DO UPDATE SET
                     name = excluded.name,
                     home_world = excluded.home_world,
                     world_name = excluded.world_name,
                     last_resolved_utc = excluded.last_resolved_utc,
-                    pending_upload = 1,
-                    last_uploaded_utc = NULL;
+                    pending_upload = excluded.pending_upload,
+                    last_uploaded_utc = excluded.last_uploaded_utc;
                 """;
 
-            command.Parameters.AddWithValue("@content_id", (long)snapshot.ContentId);
-            command.Parameters.AddWithValue("@name", snapshot.Name);
-            command.Parameters.AddWithValue("@home_world", (long)snapshot.HomeWorld);
-            command.Parameters.AddWithValue("@world_name", snapshot.WorldName);
-            command.Parameters.AddWithValue("@last_resolved_utc", snapshot.LastResolvedAtUtc.ToString("O"));
-            command.ExecuteNonQuery();
+            var contentIdParam = identityCommand.Parameters.Add("@content_id", SqliteType.Integer);
+            var nameParam = identityCommand.Parameters.Add("@name", SqliteType.Text);
+            var homeWorldParam = identityCommand.Parameters.Add("@home_world", SqliteType.Integer);
+            var worldNameParam = identityCommand.Parameters.Add("@world_name", SqliteType.Text);
+            var lastResolvedParam = identityCommand.Parameters.Add("@last_resolved_utc", SqliteType.Text);
+            var pendingUploadParam = identityCommand.Parameters.Add("@pending_upload", SqliteType.Integer);
+            var lastUploadedParam = identityCommand.Parameters.Add("@last_uploaded_utc", SqliteType.Text);
 
-            using var deletePartialCommand = connection.CreateCommand();
-            deletePartialCommand.Transaction = transaction;
-            deletePartialCommand.CommandText = """
-                DELETE FROM player_identity_partials
-                WHERE content_id = @content_id;
-                """;
-            deletePartialCommand.Parameters.AddWithValue("@content_id", (long)snapshot.ContentId);
-            deletePartialCommand.ExecuteNonQuery();
-            transaction.Commit();
-        }
-    }
-
-    public List<CharacterIdentitySnapshot> TakePendingIdentityUploads(int maxBatchSize) {
-        lock (_sync) {
-            using var connection = OpenConnection();
-            using var command = connection.CreateCommand();
-            command.CommandText = """
-                SELECT content_id, name, home_world, world_name, last_resolved_utc
-                FROM player_identities
-                WHERE pending_upload = 1
-                ORDER BY last_resolved_utc DESC, content_id ASC
-                LIMIT @limit;
-                """;
-            command.Parameters.AddWithValue("@limit", Math.Clamp(maxBatchSize, 1, MaxBatchSize));
-
-            var snapshots = new List<CharacterIdentitySnapshot>();
-            using var reader = command.ExecuteReader();
-            while (reader.Read()) {
-                snapshots.Add(new CharacterIdentitySnapshot(
-                    (ulong)reader.GetInt64(0),
-                    reader.GetString(1),
-                    Convert.ToUInt16(reader.GetInt64(2)),
-                    reader.GetString(3),
-                    ParseTimestamp(reader.GetString(4))
-                ));
+            foreach (var entry in batch.IdentityUpserts.Values) {
+                contentIdParam.Value = (long)entry.Snapshot.ContentId;
+                nameParam.Value = entry.Snapshot.Name;
+                homeWorldParam.Value = (long)entry.Snapshot.HomeWorld;
+                worldNameParam.Value = entry.Snapshot.WorldName;
+                lastResolvedParam.Value = entry.Snapshot.LastResolvedAtUtc.ToString("O");
+                pendingUploadParam.Value = entry.PendingUpload ? 1 : 0;
+                lastUploadedParam.Value = entry.LastUploadedUtc.HasValue
+                    ? entry.LastUploadedUtc.Value.ToString("O")
+                    : DBNull.Value;
+                identityCommand.ExecuteNonQuery();
             }
-
-            return snapshots;
-        }
-    }
-
-    public void MarkIdentityUploadsSubmitted(IEnumerable<ulong> contentIds) {
-        var distinctContentIds = contentIds
-            .Distinct()
-            .ToArray();
-
-        if (distinctContentIds.Length == 0) {
-            return;
         }
 
-        lock (_sync) {
-            using var connection = OpenConnection();
-            using var transaction = connection.BeginTransaction();
-            using var command = connection.CreateCommand();
-            command.Transaction = transaction;
-            command.CommandText = """
+        if (batch.IdentitySubmittedOnly.Count > 0) {
+            using var submittedCommand = connection.CreateCommand();
+            submittedCommand.Transaction = transaction;
+            submittedCommand.CommandText = """
                 UPDATE player_identities
                 SET pending_upload = 0,
                     last_uploaded_utc = @uploaded_at
                 WHERE content_id = @content_id;
                 """;
 
-            var uploadedAtParam = command.Parameters.Add("@uploaded_at", SqliteType.Text);
-            var contentIdParam = command.Parameters.Add("@content_id", SqliteType.Integer);
-            uploadedAtParam.Value = DateTimeOffset.UtcNow.ToString("O");
+            var uploadedAtParam = submittedCommand.Parameters.Add("@uploaded_at", SqliteType.Text);
+            var contentIdParam = submittedCommand.Parameters.Add("@content_id", SqliteType.Integer);
 
-            foreach (var contentId in distinctContentIds) {
+            foreach (var (contentId, uploadedAtUtc) in batch.IdentitySubmittedOnly) {
+                uploadedAtParam.Value = uploadedAtUtc.ToString("O");
                 contentIdParam.Value = (long)contentId;
-                command.ExecuteNonQuery();
+                submittedCommand.ExecuteNonQuery();
             }
-
-            transaction.Commit();
         }
-    }
 
-    public void Dispose() {
-        _disposed = true;
-    }
-
-    private void Initialize() {
-        lock (_sync) {
-            using var connection = OpenConnection();
-            using var pragmaCommand = connection.CreateCommand();
-            pragmaCommand.CommandText = """
-                PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = NORMAL;
+        if (batch.PartialUpserts.Count > 0) {
+            using var partialCommand = connection.CreateCommand();
+            partialCommand.Transaction = transaction;
+            partialCommand.CommandText = """
+                INSERT INTO player_identity_partials (
+                    content_id,
+                    name,
+                    home_world,
+                    world_name,
+                    last_updated_utc
+                )
+                VALUES (
+                    @content_id,
+                    @name,
+                    @home_world,
+                    @world_name,
+                    @last_updated_utc
+                )
+                ON CONFLICT(content_id) DO UPDATE SET
+                    name = excluded.name,
+                    last_updated_utc = excluded.last_updated_utc;
                 """;
-            pragmaCommand.ExecuteNonQuery();
 
-            EnsurePlayersTable(connection);
-            MigrateIdentityColumns(connection);
-            EnsurePartialIdentityTable(connection);
-            EnsureSchemaVersion(connection);
+            var contentIdParam = partialCommand.Parameters.Add("@content_id", SqliteType.Integer);
+            var nameParam = partialCommand.Parameters.Add("@name", SqliteType.Text);
+            var homeWorldParam = partialCommand.Parameters.Add("@home_world", SqliteType.Integer);
+            var worldNameParam = partialCommand.Parameters.Add("@world_name", SqliteType.Text);
+            var lastUpdatedParam = partialCommand.Parameters.Add("@last_updated_utc", SqliteType.Text);
+
+            foreach (var partial in batch.PartialUpserts.Values) {
+                contentIdParam.Value = (long)partial.ContentId;
+                nameParam.Value = partial.Name is null ? DBNull.Value : partial.Name;
+                homeWorldParam.Value = partial.HomeWorld.HasValue ? (long)partial.HomeWorld.Value : DBNull.Value;
+                worldNameParam.Value = partial.WorldName is null ? DBNull.Value : partial.WorldName;
+                lastUpdatedParam.Value = partial.LastUpdatedAtUtc.ToString("O");
+                partialCommand.ExecuteNonQuery();
+            }
         }
+
+        if (batch.PartialDeletes.Count > 0) {
+            using var deletePartialCommand = connection.CreateCommand();
+            deletePartialCommand.Transaction = transaction;
+            deletePartialCommand.CommandText = """
+                DELETE FROM player_identity_partials
+                WHERE content_id = @content_id;
+                """;
+            var contentIdParam = deletePartialCommand.Parameters.Add("@content_id", SqliteType.Integer);
+            foreach (var contentId in batch.PartialDeletes) {
+                contentIdParam.Value = (long)contentId;
+                deletePartialCommand.ExecuteNonQuery();
+            }
+        }
+
+        if (batch.PruneCleanPlayers) {
+            PruneCleanRows(connection, transaction);
+        }
+
+        if (batch.PartialUpserts.Count > 0) {
+            PruneOverflowPartials(connection, transaction);
+        }
+
+        transaction.Commit();
     }
 
-    private SqliteConnection OpenConnection() {
+    private void SignalFlushLocked() {
+        if (_disposing || _disposed || _flushScheduled) {
+            return;
+        }
+
+        _flushScheduled = true;
+        _flushSignal.Release();
+    }
+
+    private void ThrowIfDisposedLocked() {
         if (_disposed) {
             throw new ObjectDisposedException(nameof(PlayerLocalDatabase));
         }
+    }
 
-        var connection = new SqliteConnection($"Data Source={_databasePath};Mode=ReadWriteCreate;Cache=Shared");
-        connection.Open();
-        return connection;
+    private void SetPlayerCacheLocked(CachedPlayerEntry nextEntry) {
+        if (_players.TryGetValue(nextEntry.Player.ContentId, out var previous)) {
+            if (previous.Dirty != nextEntry.Dirty) {
+                _dirtyPlayerCount += nextEntry.Dirty ? 1 : -1;
+            }
+        } else if (nextEntry.Dirty) {
+            _dirtyPlayerCount++;
+        }
+
+        _players[nextEntry.Player.ContentId] = nextEntry;
+    }
+
+    private void RemovePlayerCacheLocked(ulong contentId) {
+        if (_players.Remove(contentId, out var removed)) {
+            if (removed.Dirty) {
+                _dirtyPlayerCount--;
+            }
+
+            _playersMayBeIncomplete = true;
+        }
+    }
+
+    private void EnforcePlayerCacheLimitLocked(DateTime nowUtc) {
+        var cutoff = nowUtc - CleanPlayerRetention;
+        List<ulong>? expiredIds = null;
+        foreach (var (contentId, entry) in _players) {
+            if (!entry.Dirty && entry.LastSeenUtc < cutoff) {
+                expiredIds ??= new List<ulong>();
+                expiredIds.Add(contentId);
+            }
+        }
+
+        if (expiredIds is not null) {
+            foreach (var contentId in expiredIds) {
+                RemovePlayerCacheLocked(contentId);
+            }
+        }
+
+        if (_players.Count <= MaxCachedPlayers) {
+            return;
+        }
+
+        var overflow = _players.Count - MaxCachedPlayers;
+        var evictionCandidates = _players.Values
+            .OrderBy(static entry => entry.Dirty)
+            .ThenBy(static entry => entry.LastSeenUtc)
+            .Take(overflow)
+            .Select(static entry => entry.Player.ContentId)
+            .ToArray();
+
+        foreach (var contentId in evictionCandidates) {
+            RemovePlayerCacheLocked(contentId);
+        }
+    }
+
+    private void EnforceIdentityCacheLimitLocked() {
+        if (_identities.Count <= MaxCachedIdentities) {
+            return;
+        }
+
+        var overflow = _identities.Count - MaxCachedIdentities;
+        var evictionCandidates = _identities.Values
+            .OrderBy(static entry => entry.PendingUpload)
+            .ThenBy(static entry => entry.Snapshot.LastResolvedAtUtc)
+            .Take(overflow)
+            .Select(static entry => entry.Snapshot.ContentId)
+            .ToArray();
+
+        foreach (var contentId in evictionCandidates) {
+            if (_identities.Remove(contentId)) {
+                _identitiesMayBeIncomplete = true;
+            }
+        }
+    }
+
+    private void EnforcePartialCacheLimitLocked() {
+        if (_partialIdentities.Count <= MaxCachedPartialIdentities) {
+            return;
+        }
+
+        var overflow = _partialIdentities.Count - MaxCachedPartialIdentities;
+        var evictionCandidates = _partialIdentities.Values
+            .OrderBy(static entry => entry.LastUpdatedAtUtc)
+            .Take(overflow)
+            .Select(static entry => entry.ContentId)
+            .ToArray();
+
+        foreach (var contentId in evictionCandidates) {
+            if (_partialIdentities.Remove(contentId)) {
+                _partialsMayBeIncomplete = true;
+            }
+        }
+    }
+
+    private static UploadablePlayer ClonePlayer(UploadablePlayer player) {
+        return new UploadablePlayer {
+            ContentId = player.ContentId,
+            Name = player.Name,
+            HomeWorld = player.HomeWorld,
+            CurrentWorld = player.CurrentWorld,
+            AccountId = player.AccountId,
+        };
     }
 
     private static void EnsurePlayersTable(SqliteConnection connection) {
@@ -648,6 +1338,48 @@ internal sealed class PlayerLocalDatabase : IDisposable {
         command.Parameters.AddWithValue("@cutoff", DateTimeOffset.UtcNow.AddDays(-14).ToString("O"));
         command.ExecuteNonQuery();
     }
+
+    private static void PruneOverflowPartials(SqliteConnection connection, SqliteTransaction transaction) {
+        using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            DELETE FROM player_identity_partials
+            WHERE content_id NOT IN (
+                SELECT content_id
+                FROM player_identity_partials
+                ORDER BY last_updated_utc DESC
+                LIMIT @limit
+            );
+            """;
+        command.Parameters.AddWithValue("@limit", MaxCachedPartialIdentities);
+        command.ExecuteNonQuery();
+    }
+
+    private sealed record CachedPlayerEntry(
+        UploadablePlayer Player,
+        string PayloadHash,
+        bool Dirty,
+        DateTime FirstSeenUtc,
+        DateTime LastSeenUtc,
+        DateTime? LastUploadedUtc
+    );
+
+    private sealed record CachedIdentityEntry(
+        CharacterIdentitySnapshot Snapshot,
+        bool PendingUpload,
+        DateTime? LastUploadedUtc
+    );
+
+    private sealed record PendingWriteBatch(
+        bool MarkAllDirty,
+        bool PruneCleanPlayers,
+        Dictionary<ulong, CachedPlayerEntry> PlayerMutations,
+        Dictionary<ulong, DateTime> PlayerMarkUploadedOnly,
+        Dictionary<ulong, CachedIdentityEntry> IdentityUpserts,
+        Dictionary<ulong, DateTime> IdentitySubmittedOnly,
+        Dictionary<ulong, PartialCharacterIdentitySnapshot> PartialUpserts,
+        HashSet<ulong> PartialDeletes
+    );
 }
 
 internal sealed class UploadablePlayer {

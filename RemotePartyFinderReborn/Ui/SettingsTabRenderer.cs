@@ -155,6 +155,56 @@ internal sealed class SettingsTabRenderer
             ImGui.SetTooltip("Enables official Tomestone API progression lookups. Tomestone failures do not block FFLogs uploads.");
         }
 
+        var enableWebFallback = _configuration.EnableTomestoneWebFallback;
+        if (ImGui.Checkbox("Enable Tomestone web fallback", ref enableWebFallback))
+        {
+            _configuration.EnableTomestoneWebFallback = enableWebFallback;
+            _configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Falls back to direct Tomestone web lookups (Tier 2) and optional obscura CDP (Tier 3) when the official API lacks data or is unavailable.");
+        }
+
+        var obscuraCdpUrl = _configuration.TomestoneObscuraCdpUrl ?? string.Empty;
+        if (ImGui.InputText("Obscura CDP URL##TomestoneObscuraCdpUrl", ref obscuraCdpUrl, 300))
+        {
+            _configuration.TomestoneObscuraCdpUrl = obscuraCdpUrl.Trim();
+            _configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Optional Tier 3 Chromium/obscura DevTools browser WebSocket URL (e.g. ws://127.0.0.1:9222/devtools/browser) for unhydrated SPA shells.");
+        }
+        if (!string.IsNullOrWhiteSpace(obscuraCdpUrl) &&
+            (!Uri.TryCreate(obscuraCdpUrl.Trim(), UriKind.Absolute, out var parsedCdpUri) ||
+             (parsedCdpUri.Scheme != "ws" && parsedCdpUri.Scheme != "wss")))
+        {
+            DrawColoredTextUnformatted(new Vector4(1.0f, 0.5f, 0.2f, 1.0f), $"Invalid CDP WebSocket URL: {obscuraCdpUrl}");
+        }
+
+        var obscuraCdpToken = _configuration.TomestoneObscuraCdpToken ?? string.Empty;
+        if (ImGui.InputText("Obscura CDP Token##TomestoneObscuraCdpToken", ref obscuraCdpToken, 256, ImGuiInputTextFlags.Password))
+        {
+            _configuration.TomestoneObscuraCdpToken = obscuraCdpToken.Trim();
+            _configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Optional Bearer token matching OBSCURA_CDP_TOKEN (required when obscura serve binds a non-loopback host).");
+        }
+
+        var preferObscura = _configuration.PreferTomestoneObscura;
+        if (ImGui.Checkbox("Prefer Obscura CDP over direct HTTP##PreferTomestoneObscura", ref preferObscura))
+        {
+            _configuration.PreferTomestoneObscura = preferObscura;
+            _configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("When checked and Obscura CDP URL is valid, routes Tomestone HTML and JSON lookups directly through obscura CDP instead of direct HTTP first.");
+        }
+
         var requestIntervalMs = Configuration.NormalizeTomestoneRequestIntervalMs(_configuration.TomestoneRequestIntervalMs);
         if (ImGui.SliderInt("Tomestone Request Interval", ref requestIntervalMs, 0, 60000, "%d ms"))
         {
@@ -193,6 +243,8 @@ internal sealed class SettingsTabRenderer
         ImGui.TextWrapped("Configure which endpoints receive party finder data.");
         ImGui.Spacing();
 
+        var uploadUrls = _configuration.GetUploadUrlsSnapshot();
+
         using (ImRaii.Table((ImU8String)"uploadUrls", 3, ImGuiTableFlags.SizingFixedFit | ImGuiTableFlags.Borders))
         {
             ImGui.TableSetupColumn("#", ImGuiTableColumnFlags.WidthFixed);
@@ -201,9 +253,9 @@ internal sealed class SettingsTabRenderer
             ImGui.TableHeadersRow();
 
             using var id = ImRaii.PushId((ImU8String)"urls");
-            foreach (var (uploadUrl, index) in _configuration.UploadUrls.Select((url, index) => (url, index + 1)))
+            foreach (var (uploadUrl, index) in uploadUrls.Select((url, index) => (url, index + 1)))
             {
-                id.Push(index);
+                id.Push((ImU8String)uploadUrl.Id.ToString("N"));
 
                 ImGui.TableNextRow();
                 ImGui.TableSetColumnIndex(0);
@@ -225,7 +277,8 @@ internal sealed class SettingsTabRenderer
                     ImGui.SameLine();
                     if (ImGuiComponents.IconButton(Dalamud.Interface.FontAwesomeIcon.Trash))
                     {
-                        _configuration.UploadUrls = _configuration.UploadUrls.Remove(uploadUrl);
+                        var removedId = uploadUrl.Id;
+                        _configuration.UpdateUploadUrls(urls => urls.RemoveAll(candidate => candidate.Id == removedId));
                         _configuration.Save();
                     }
                 }
@@ -242,20 +295,25 @@ internal sealed class SettingsTabRenderer
             if (!string.IsNullOrEmpty(_uploadUrlTempString) &&
                 ImGuiComponents.IconButton(Dalamud.Interface.FontAwesomeIcon.Plus))
             {
-                _uploadUrlTempString = _uploadUrlTempString.TrimEnd();
+                var candidateUrl = _uploadUrlTempString.TrimEnd();
+                _uploadUrlTempString = candidateUrl;
 
-                if (_configuration.UploadUrls.Any(r =>
-                        string.Equals(r.Url, _uploadUrlTempString, StringComparison.InvariantCultureIgnoreCase)))
+                var latestUrls = _configuration.GetUploadUrlsSnapshot();
+                if (latestUrls.Any(r =>
+                        string.Equals(r.Url, candidateUrl, StringComparison.InvariantCultureIgnoreCase)))
                 {
                     SetUploadUrlError("Endpoint already exists.");
                 }
-                else if (!IngestEndpointResolver.IsValidUploadUrl(_uploadUrlTempString, out var validationError))
+                else if (!IngestEndpointResolver.IsValidUploadUrl(candidateUrl, out var validationError))
                 {
                     SetUploadUrlError(validationError);
                 }
                 else
                 {
-                    _configuration.UploadUrls = _configuration.UploadUrls.Add(new(_uploadUrlTempString));
+                    _configuration.UpdateUploadUrls(urls =>
+                        urls.Any(r => string.Equals(r.Url, candidateUrl, StringComparison.InvariantCultureIgnoreCase))
+                            ? urls
+                            : urls.Add(new(candidateUrl)));
                     _configuration.Save();
                     _uploadUrlTempString = string.Empty;
                 }
@@ -270,11 +328,15 @@ internal sealed class SettingsTabRenderer
         }
 
         ImGui.SameLine();
-        ImGui.TextColored(new Vector4(1, 0, 0, 1), _uploadUrlError.Current(DateTime.UtcNow));
+        var currentError = _uploadUrlError.Current(DateTime.UtcNow);
+        if (!string.IsNullOrEmpty(currentError))
+        {
+            DrawColoredTextUnformatted(new Vector4(1, 0, 0, 1), currentError);
+        }
 
         DrawSeparatorSpacing();
 
-        ImGui.Text("Endpoint Status:");
+        ImGui.TextUnformatted("Endpoint Status:");
 
         if (ImGui.BeginTable("cbStatusTable", 4, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable))
         {
@@ -284,36 +346,36 @@ internal sealed class SettingsTabRenderer
             ImGui.TableSetupColumn("Action", ImGuiTableColumnFlags.WidthFixed, 60);
             ImGui.TableHeadersRow();
 
-            foreach (var url in _configuration.UploadUrls)
+            foreach (var url in uploadUrls)
             {
                 ImGui.TableNextRow();
 
                 ImGui.TableSetColumnIndex(0);
-                ImGui.Text(url.Url);
+                ImGui.TextUnformatted(url.Url);
 
                 ImGui.TableSetColumnIndex(1);
                 var circuitStatus = UploadAttemptRecorder.GetCircuitStatus(url, _configuration, DateTime.UtcNow);
-                ImGui.Text($"{circuitStatus.FailureCount} / {_configuration.CircuitBreakerFailureThreshold}");
+                ImGui.TextUnformatted($"{circuitStatus.FailureCount} / {_configuration.CircuitBreakerFailureThreshold}");
 
                 ImGui.TableSetColumnIndex(2);
                 if (circuitStatus.FailureCount >= _configuration.CircuitBreakerFailureThreshold)
                 {
                     if (circuitStatus.IsOpen)
                     {
-                        ImGui.TextColored(new Vector4(1, 0, 0, 1), $"OPEN ({circuitStatus.RemainingBreakDuration.TotalSeconds:F0}s)");
+                        DrawColoredTextUnformatted(new Vector4(1, 0, 0, 1), $"OPEN ({circuitStatus.RemainingBreakDuration.TotalSeconds:F0}s)");
                     }
                     else
                     {
-                        ImGui.TextColored(new Vector4(1, 1, 0, 1), "HALF-OPEN");
+                        DrawColoredTextUnformatted(new Vector4(1, 1, 0, 1), "HALF-OPEN");
                     }
                 }
                 else
                 {
-                    ImGui.TextColored(new Vector4(0, 1, 0, 1), "CLOSED");
+                    DrawColoredTextUnformatted(new Vector4(0, 1, 0, 1), "CLOSED");
                 }
 
                 ImGui.TableSetColumnIndex(3);
-                if (ImGui.Button($"Reset##{url.GetHashCode()}"))
+                if (ImGui.Button($"Reset##{url.Id:N}"))
                 {
                     UploadAttemptRecorder.RecordSuccess(url);
                     _configuration.Save();
@@ -445,13 +507,13 @@ internal sealed class SettingsTabRenderer
         if (_plugin.TryGetFFLogsRateLimitCooldownRemaining(out var cooldownRemaining))
         {
             var untilLocal = FormatLocalClock(_plugin.FFLogsRateLimitCooldownUntilUtc);
-            ImGui.TextColored(
+            DrawColoredTextUnformatted(
                 new Vector4(1.0f, 0.8f, 0.2f, 1.0f),
                 $"ACTIVE - remaining {cooldownRemaining.TotalMinutes:F1} min (until {untilLocal} Local)");
         }
         else
         {
-            ImGui.TextColored(new Vector4(0.0f, 1.0f, 0.0f, 1.0f), "INACTIVE");
+            DrawColoredTextUnformatted(new Vector4(0.0f, 1.0f, 0.0f, 1.0f), "INACTIVE");
         }
 
         if (ImGui.Button("Reset FFLogs Rate-Limit Lockout"))
@@ -466,7 +528,7 @@ internal sealed class SettingsTabRenderer
 
         if (!string.IsNullOrEmpty(_fflogsCooldownStatus))
         {
-            ImGui.TextWrapped(_fflogsCooldownStatus);
+            DrawWrappedTextUnformatted(_fflogsCooldownStatus);
         }
 
         DrawSeparatorSpacing();
@@ -476,13 +538,13 @@ internal sealed class SettingsTabRenderer
         if (_plugin.TryGetTomestoneRateLimitCooldownRemaining(out var tomestoneCooldownRemaining))
         {
             var untilLocal = FormatLocalClock(_plugin.TomestoneRateLimitCooldownUntilUtc);
-            ImGui.TextColored(
+            DrawColoredTextUnformatted(
                 new Vector4(1.0f, 0.8f, 0.2f, 1.0f),
                 $"ACTIVE - remaining {tomestoneCooldownRemaining.TotalMinutes:F1} min (until {untilLocal} Local)");
         }
         else
         {
-            ImGui.TextColored(new Vector4(0.0f, 1.0f, 0.0f, 1.0f), "INACTIVE");
+            DrawColoredTextUnformatted(new Vector4(0.0f, 1.0f, 0.0f, 1.0f), "INACTIVE");
         }
 
         if (ImGui.Button("Reset Tomestone Rate-Limit Lockout"))
@@ -497,7 +559,7 @@ internal sealed class SettingsTabRenderer
 
         if (!string.IsNullOrEmpty(_tomestoneCooldownStatus))
         {
-            ImGui.TextWrapped(_tomestoneCooldownStatus);
+            DrawWrappedTextUnformatted(_tomestoneCooldownStatus);
         }
 
         DrawSeparatorSpacing();
@@ -526,7 +588,7 @@ internal sealed class SettingsTabRenderer
         ImGui.TextWrapped("Chat commands: /rpr players-upload, /rpr players-resync");
         if (!string.IsNullOrEmpty(_playerManualUploadStatus))
         {
-            ImGui.TextWrapped(_playerManualUploadStatus);
+            DrawWrappedTextUnformatted(_playerManualUploadStatus);
         }
     }
 
@@ -539,7 +601,7 @@ internal sealed class SettingsTabRenderer
 
     private void ResetToDefault()
     {
-        _configuration.UploadUrls = Configuration.DefaultUploadUrls();
+        _configuration.UpdateUploadUrls(_ => Configuration.DefaultUploadUrls());
         _configuration.Save();
     }
 
@@ -557,7 +619,7 @@ internal sealed class SettingsTabRenderer
     {
         if (featureEnabled && !isConfigured)
         {
-            ImGui.TextColored(new Vector4(1.0f, 0.65f, 0.2f, 1.0f), $"{provider}: {missingCredentialsMessage}");
+            DrawColoredTextUnformatted(new Vector4(1.0f, 0.65f, 0.2f, 1.0f), $"{provider}: {missingCredentialsMessage}");
             return;
         }
 
@@ -572,7 +634,26 @@ internal sealed class SettingsTabRenderer
         var checkedAt = status.UpdatedAtUtc == DateTime.MinValue
             ? string.Empty
             : $" (updated {FormatLocalClock(status.UpdatedAtUtc)} Local)";
-        ImGui.TextColored(color, $"{provider} credential status: {status.Message}{checkedAt}");
+        DrawColoredTextUnformatted(color, $"{provider} credential status: {status.Message}{checkedAt}");
+    }
+
+    private static void DrawColoredTextUnformatted(Vector4 color, string text)
+    {
+        ImGui.PushStyleColor(ImGuiCol.Text, color);
+        try
+        {
+            ImGui.TextUnformatted(text);
+        }
+        finally
+        {
+            ImGui.PopStyleColor();
+        }
+    }
+
+    private static void DrawWrappedTextUnformatted(string text)
+    {
+        using var wrap = ImRaii.TextWrapPos(0.0f);
+        ImGui.TextUnformatted(text);
     }
 
     private static string FormatLocalClock(DateTime utcTime)

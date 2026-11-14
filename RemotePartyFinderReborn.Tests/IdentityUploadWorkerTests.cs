@@ -283,16 +283,29 @@ public sealed class IdentityUploadWorkerTests {
     public async Task Cancellation_during_background_probe_releases_single_worker_gate() {
         using var harness = new TempPlayerCacheDatabase();
         using var database = new PlayerLocalDatabase(harness.DatabasePath);
+        database.UpsertResolvedIdentity(new CharacterIdentitySnapshot(
+            2399UL,
+            "Cancel Player",
+            21,
+            "Ravana",
+            new DateTime(2026, 4, 13, 11, 13, 0, DateTimeKind.Utc)
+        ));
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         using var disposeCts = new CancellationTokenSource();
         var pump = new IdentityUploadPump(
             database,
             () => DateTime.UtcNow,
-            (payloads, cancellationToken) => Task.FromResult(true),
+            async (payloads, cancellationToken) => {
+                started.TrySetResult();
+                return await release.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            },
             disposeCts.Token
         );
 
         pump.PumpPendingIdentityUploads();
-        await WaitUntilAsync(() => pump.IsWorkerBusy);
+        await started.Task;
+        Assert.True(pump.IsWorkerBusy);
         disposeCts.Cancel();
         await WaitUntilAsync(() => !pump.IsWorkerBusy);
     }

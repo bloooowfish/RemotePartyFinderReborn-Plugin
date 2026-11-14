@@ -74,27 +74,29 @@ public sealed class TomestoneEncounterMappingTests
     }
 
     [Theory]
-    [InlineData(62u, 93u, "aac-light-heavyweight-savage", "black-cat")]
-    [InlineData(62u, 94u, "aac-light-heavyweight-savage", "honey-b-lovely")]
-    [InlineData(62u, 95u, "aac-light-heavyweight-savage", "brute-bomber")]
-    [InlineData(62u, 96u, "aac-light-heavyweight-savage", "wicked-thunder")]
-    [InlineData(68u, 97u, "aac-cruiserweight-savage", "dancing-green")]
-    [InlineData(68u, 98u, "aac-cruiserweight-savage", "sugar-riot")]
-    [InlineData(68u, 99u, "aac-cruiserweight-savage", "brute-abombinator")]
-    [InlineData(68u, 100u, "aac-cruiserweight-savage", "howling-blade")]
-    [InlineData(72u, 1084u, "trials-extreme", "enuo")]
-    public void TryGetProgressionTarget_supports_other_server_savage_and_extreme_targets(
+    [InlineData(62u, 93u, "aac-light-heavyweight-savage", "black-cat", new[] { "black-cat" })]
+    [InlineData(62u, 94u, "aac-light-heavyweight-savage", "honey-b.-lovely", new[] { "honey-b.-lovely", "honey-b-lovely" })]
+    [InlineData(62u, 95u, "aac-light-heavyweight-savage", "brute-bomber", new[] { "brute-bomber" })]
+    [InlineData(62u, 96u, "aac-light-heavyweight-savage", "wicked-thunder", new[] { "wicked-thunder" })]
+    [InlineData(68u, 97u, "aac-cruiserweight-savage", "dancing-green", new[] { "dancing-green" })]
+    [InlineData(68u, 98u, "aac-cruiserweight-savage", "sugar-riot", new[] { "sugar-riot" })]
+    [InlineData(68u, 99u, "aac-cruiserweight-savage", "brute-abombinator", new[] { "brute-abombinator" })]
+    [InlineData(68u, 100u, "aac-cruiserweight-savage", "howling-blade", new[] { "howling-blade" })]
+    [InlineData(72u, 1084u, "trials-extreme", "enuo", new[] { "enuo", "the-unmaking-extreme" })]
+    [InlineData(66u, 2061u, "chaotic", "the-cloud-of-darkness-chaotic", new[] { "the-cloud-of-darkness-chaotic", "cloud-of-darkness-chaotic", "the-cloud-of-darkness", "cloud-of-darkness" })]
+    public void TryGetProgressionTarget_supports_other_server_savage_extreme_and_chaotic_targets(
         uint zoneId,
         uint encounterId,
         string category,
-        string encounter)
+        string encounter,
+        string[] expectedCanonicals)
     {
         Assert.True(TomestoneEncounterMapping.TryGetProgressionTarget(zoneId, encounterId, out var encounterParams));
         Assert.Equal("dawntrail", encounterParams.Expansion);
         Assert.Equal(category, encounterParams.Category);
         Assert.Equal(encounter, encounterParams.Encounter);
         Assert.Equal(TomestoneProgressKind.BossPercentage, encounterParams.ProgressKind);
-        Assert.Equal([encounter], encounterParams.TargetCanonicalNames);
+        Assert.Equal(expectedCanonicals, encounterParams.TargetCanonicalNames);
 
         Assert.True(TomestoneEncounterMapping.TryGetProgressionTargetByEncounterId(encounterId, out var mappedZoneId, out var byId));
         Assert.Equal(zoneId, mappedZoneId);
@@ -105,9 +107,9 @@ public sealed class TomestoneEncounterMappingTests
     [Fact]
     public void TryGetProgressionTarget_does_not_guess_unsupported_targets()
     {
-        Assert.False(TomestoneEncounterMapping.TryGetProgressionTarget(66, 2061, out var chaotic));
-        Assert.Null(chaotic);
         Assert.False(TomestoneEncounterMapping.TryGetProgressionTarget(68, 101, out var wrongZone));
         Assert.Null(wrongZone);
+        Assert.False(TomestoneEncounterMapping.TryGetProgressionTarget(999, 9999, out var unknown));
+        Assert.Null(unknown);
     }
 }

@@ -170,6 +170,117 @@ public sealed class TomestoneApiClientTests
         Assert.Equal(DateTime.MinValue, client.RateLimitCooldownUntilUtc);
     }
 
+    [Fact]
+    public async Task GetRawAsync_parses_numeric_retry_after_header_into_adaptive_cooldown()
+    {
+        var nowUtc = new DateTime(2026, 4, 15, 0, 0, 0, DateTimeKind.Utc);
+        var handler = new RecordingHttpMessageHandler
+        {
+            OnSendAsync = static (_, _) =>
+            {
+                var response = new HttpResponseMessage((HttpStatusCode)429)
+                {
+                    Content = new StringContent("rate limited"),
+                };
+                response.Headers.TryAddWithoutValidation("Retry-After", "45");
+                return Task.FromResult(response);
+            },
+        };
+        using var client = new TomestoneApiClient(
+            new Configuration { TomestoneApiKey = "secret-token" },
+            handler,
+            () => nowUtc,
+            static _ => { },
+            static _ => { },
+            static _ => { });
+
+        var result = await client.GetRawAsync("/test", CancellationToken.None);
+
+        Assert.Null(result);
+        Assert.True(client.TryGetRateLimitRemaining(out var remaining));
+        Assert.Equal(TimeSpan.FromSeconds(45), remaining);
+        Assert.Equal(nowUtc.AddSeconds(45), client.RateLimitCooldownUntilUtc);
+    }
+
+    [Fact]
+    public async Task GetRawAsync_parses_http_date_retry_after_header_and_clamps_to_max_cooldown()
+    {
+        var nowUtc = new DateTime(2026, 4, 15, 0, 0, 0, DateTimeKind.Utc);
+        var handler = new RecordingHttpMessageHandler
+        {
+            OnSendAsync = (_, _) =>
+            {
+                var response = new HttpResponseMessage((HttpStatusCode)429)
+                {
+                    Content = new StringContent("rate limited"),
+                };
+                response.Headers.TryAddWithoutValidation("Retry-After", nowUtc.AddHours(3).ToString("R"));
+                return Task.FromResult(response);
+            },
+        };
+        using var client = new TomestoneApiClient(
+            new Configuration { TomestoneApiKey = "secret-token" },
+            handler,
+            () => nowUtc,
+            static _ => { },
+            static _ => { },
+            static _ => { });
+
+        var result = await client.GetRawAsync("/test", CancellationToken.None);
+
+        Assert.Null(result);
+        Assert.True(client.TryGetRateLimitRemaining(out var remaining));
+        Assert.Equal(TimeSpan.FromHours(1), remaining);
+    }
+
+    [Fact]
+    public async Task GetRawAsync_refuses_3xx_redirect_responses_without_following_location()
+    {
+        var handler = new RecordingHttpMessageHandler
+        {
+            OnSendAsync = static (_, _) =>
+            {
+                var response = new HttpResponseMessage(HttpStatusCode.Found)
+                {
+                    Content = new StringContent("redirecting"),
+                };
+                response.Headers.Location = new Uri("https://evil.example/redirect");
+                return Task.FromResult(response);
+            },
+        };
+        using var client = new TomestoneApiClient(
+            new Configuration { TomestoneApiKey = "secret-token" },
+            handler);
+
+        var result = await client.GetRawOutcomeAsync("/test", CancellationToken.None);
+
+        Assert.False(result.Succeeded);
+        Assert.False(result.TransientFailure);
+        Assert.Contains("redirect", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Single(handler.Requests);
+    }
+
+    [Fact]
+    public void Default_constructor_configures_twenty_second_timeout_and_disables_auto_redirect()
+    {
+        using var client = new TomestoneApiClient(new Configuration());
+        var httpClientField = typeof(TomestoneApiClient)
+            .GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            .FirstOrDefault(static f => f.FieldType == typeof(HttpClient));
+
+        Assert.NotNull(httpClientField);
+        var httpClient = Assert.IsType<HttpClient>(httpClientField!.GetValue(client));
+        Assert.Equal(TimeSpan.FromSeconds(20), httpClient.Timeout);
+
+        var handlerField = typeof(HttpMessageInvoker)
+            .GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+            .FirstOrDefault(static f => typeof(HttpMessageHandler).IsAssignableFrom(f.FieldType));
+        if (handlerField?.GetValue(httpClient) is HttpClientHandler innerHandler)
+        {
+            Assert.False(innerHandler.AllowAutoRedirect);
+        }
+    }
+
     private sealed class RecordingHttpMessageHandler : HttpMessageHandler
     {
         public List<HttpRequestMessage> Requests { get; } = [];

@@ -41,7 +41,115 @@ internal sealed class FFLogsLeaseAbandoner
         ArgumentNullException.ThrowIfNull(debugLog);
 
         var abandonBatch = BuildAbandonLeaseBatch(leasedJobs, processedResults, reason);
-        if (abandonBatch.Count == 0)
+        await SendAbandonBatchAsync(
+            configuration,
+            leaseSession.UploadUrl,
+            abandonBatch,
+            cancellationToken,
+            warningLog,
+            debugLog).ConfigureAwait(false);
+    }
+
+    public async Task AbandonOversizedResultLeaseAsync(
+        Configuration configuration,
+        UploadUrl uploadUrl,
+        ParseResult oversizedResult,
+        string reason,
+        CancellationToken cancellationToken,
+        Action<string> warningLog,
+        Action<string> debugLog)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentNullException.ThrowIfNull(uploadUrl);
+        ArgumentNullException.ThrowIfNull(oversizedResult);
+        ArgumentNullException.ThrowIfNull(reason);
+        ArgumentNullException.ThrowIfNull(warningLog);
+        ArgumentNullException.ThrowIfNull(debugLog);
+
+        if (string.IsNullOrWhiteSpace(oversizedResult.LeaseToken))
+        {
+            return;
+        }
+
+        await SendAbandonBatchAsync(
+            configuration,
+            uploadUrl,
+            [
+                new AbandonFflogsLease
+                {
+                    ContentId = oversizedResult.ContentId,
+                    ZoneId = oversizedResult.ZoneId,
+                    DifficultyId = oversizedResult.DifficultyId,
+                    LeaseToken = oversizedResult.LeaseToken,
+                    Reason = reason,
+                    ProcessorKind = FFLogsJobLeaseClient.ProcessorKindValue,
+                },
+            ],
+            cancellationToken,
+            warningLog,
+            debugLog).ConfigureAwait(false);
+    }
+
+    public async Task AbandonResultLeasesAsync(
+        Configuration configuration,
+        UploadUrl uploadUrl,
+        IEnumerable<ParseResult> unsubmittedResults,
+        string reason,
+        CancellationToken cancellationToken,
+        Action<string> warningLog,
+        Action<string> debugLog)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentNullException.ThrowIfNull(uploadUrl);
+        ArgumentNullException.ThrowIfNull(unsubmittedResults);
+        ArgumentNullException.ThrowIfNull(reason);
+        ArgumentNullException.ThrowIfNull(warningLog);
+        ArgumentNullException.ThrowIfNull(debugLog);
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var abandonBatch = new List<AbandonFflogsLease>();
+        foreach (var result in unsubmittedResults)
+        {
+            if (string.IsNullOrWhiteSpace(result.LeaseToken))
+            {
+                continue;
+            }
+
+            var key = FFLogsSubmitBuffer.GetParseResultKey(result);
+            if (!seen.Add(key))
+            {
+                continue;
+            }
+
+            abandonBatch.Add(new AbandonFflogsLease
+            {
+                ContentId = result.ContentId,
+                ZoneId = result.ZoneId,
+                DifficultyId = result.DifficultyId,
+                LeaseToken = result.LeaseToken,
+                Reason = reason,
+                ProcessorKind = FFLogsJobLeaseClient.ProcessorKindValue,
+            });
+        }
+
+        await SendAbandonBatchAsync(
+            configuration,
+            uploadUrl,
+            abandonBatch,
+            cancellationToken,
+            warningLog,
+            debugLog).ConfigureAwait(false);
+    }
+
+    private async Task SendAbandonBatchAsync(
+        Configuration configuration,
+        UploadUrl uploadUrl,
+        IReadOnlyList<AbandonFflogsLease> abandonBatch,
+        CancellationToken cancellationToken,
+        Action<string> warningLog,
+        Action<string> debugLog)
+    {
+        if (abandonBatch.Count == 0 || uploadUrl == null)
         {
             return;
         }
@@ -49,7 +157,7 @@ internal sealed class FFLogsLeaseAbandoner
         var jsonContent = JsonConvert.SerializeObject(abandonBatch);
         var result = await _protectedExecutor.ExecuteAsync(
             configuration,
-            leaseSession.UploadUrl,
+            uploadUrl,
             IngestRoutes.FflogsLeasesAbandon,
             ProtectedEndpointCapabilityKind.FflogsLeasesAbandon,
             HttpMethod.Post,
@@ -130,6 +238,7 @@ internal sealed class FFLogsLeaseAbandoner
                 DifficultyId = job.DifficultyId,
                 LeaseToken = job.LeaseToken,
                 Reason = reason,
+                ProcessorKind = FFLogsJobLeaseClient.ProcessorKindValue,
             });
         }
 
@@ -141,5 +250,4 @@ internal sealed class FFLogsLeaseAbandoner
         parsed = null;
         return IngestJson.TryDeserializeObject(content, out parsed);
     }
-
 }

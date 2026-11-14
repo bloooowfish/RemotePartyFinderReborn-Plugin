@@ -33,6 +33,14 @@ internal static class PartyDetailUploadPolicy {
         return nowUtc.AddMilliseconds(ComputeRetryDelayMs(attemptCount, nextJitterMs));
     }
 
+    internal static DateTime ComputeDeferredNextAttemptAtUtc(
+        DateTime nowUtc,
+        int deferCount,
+        Func<int, int, int> nextJitterMs
+    ) {
+        return nowUtc.AddMilliseconds(ComputeRetryDelayMs(Math.Max(1, deferCount), nextJitterMs));
+    }
+
     internal static int NormalizeRetryCount(int configuredRetries) {
         return Math.Max(0, configuredRetries);
     }

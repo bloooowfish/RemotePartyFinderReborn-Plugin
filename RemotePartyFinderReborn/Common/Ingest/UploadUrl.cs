@@ -6,6 +6,8 @@ namespace RemotePartyFinderReborn;
 
 public record UploadUrl(string Url)
 {
+    [Newtonsoft.Json.JsonIgnore]
+    public Guid Id { get; } = Guid.NewGuid();
     public string Url { get; set; } = Url;
     public bool IsDefault { get; init; }
     public bool IsEnabled { get; set; } = true;

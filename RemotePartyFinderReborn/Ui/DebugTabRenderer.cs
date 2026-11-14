@@ -2,6 +2,7 @@ using System;
 using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Utility.Raii;
 
 namespace RemotePartyFinderReborn;
 
@@ -123,7 +124,7 @@ internal sealed class DebugTabRenderer
         }
         if (!string.IsNullOrEmpty(_detailUploadStatus))
         {
-            ImGui.TextWrapped(_detailUploadStatus);
+            DrawWrappedTextUnformatted(_detailUploadStatus);
         }
 
         ImGui.TextUnformatted($"Collected Listings: {_plugin.DebugPfScanner.CollectedListingCount}");
@@ -166,7 +167,7 @@ internal sealed class DebugTabRenderer
 
         if (!string.IsNullOrEmpty(_scannerCollectionStatus))
         {
-            ImGui.TextWrapped(_scannerCollectionStatus);
+            DrawWrappedTextUnformatted(_scannerCollectionStatus);
         }
 
         if (ImGui.Button("Reset Scanner Session"))
@@ -202,7 +203,7 @@ internal sealed class DebugTabRenderer
 
         if (!string.IsNullOrWhiteSpace(snapshot.Comment))
         {
-            ImGui.TextWrapped($"Comment: {snapshot.Comment}");
+            DrawWrappedTextUnformatted($"Comment: {snapshot.Comment}");
         }
 
         var visibleMembers = snapshot.Members
@@ -249,7 +250,7 @@ internal sealed class DebugTabRenderer
         ImGui.Separator();
         ImGui.TextColored(new Vector4(1.0f, 0.8f, 0.4f, 1.0f), "[CharaCard Resolver]");
         ImGui.TextUnformatted($"Enabled: {_plugin.CharaCardResolver.IsEnabled}");
-        ImGui.TextWrapped($"Preflight: {_plugin.CharaCardResolver.Preflight.Reason}");
+        DrawWrappedTextUnformatted($"Preflight: {_plugin.CharaCardResolver.Preflight.Reason}");
 
         if (!_plugin.CharaCardResolver.TryGetLatestDebugSnapshot(out var latest))
         {
@@ -263,6 +264,12 @@ internal sealed class DebugTabRenderer
         ImGui.TextUnformatted($"World: {latest.WorldId} ({latest.WorldName})");
         ImGui.TextUnformatted($"Packet: state={latest.SomeState} version={latest.Version} flags=0x{latest.Flags:X2} privacy=0x{latest.PrivacyFlags:X2}");
         ImGui.TextUnformatted($"Status: notCreated={latest.IsNotCreated} fantasiaReset={latest.WasResetDueToFantasia} visibleToNoOne={latest.IsVisibleToNoOne} friendsOnly={latest.IsFriendsOnly}");
+    }
+
+    private static void DrawWrappedTextUnformatted(string text)
+    {
+        using var wrap = ImRaii.TextWrapPos(0.0f);
+        ImGui.TextUnformatted(text);
     }
 
     private static string FormatLocalClock(DateTime utcTime)

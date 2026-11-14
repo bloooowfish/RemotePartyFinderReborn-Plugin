@@ -185,6 +185,8 @@ internal sealed class PartyDetailCollector : IDisposable {
     }
 
     private void StartDueUploads(DateTime nowUtc) {
+        _pendingDetailQueue.PruneExpiredManualEntries(nowUtc, TimeSpan.FromMinutes(1));
+        _captureState.PruneExpiredManualRequests();
         var maxConcurrency = PartyDetailUploadPolicy.NormalizeDetailUploadConcurrency(_configuration?.DetailUploadMaxConcurrency ?? 1);
         var batchSize = PartyDetailUploadPolicy.NormalizeDetailUploadBatchSize(_configuration?.DetailUploadBatchSize ?? 1);
         while (Volatile.Read(ref _activeUploadWorkers) < maxConcurrency) {
@@ -278,7 +280,11 @@ internal sealed class PartyDetailCollector : IDisposable {
                 break;
 
             case DetailUploadResult.Deferred:
-                DropManualBestEffortDetail(pending, uploadOutcome.Result);
+                if (DropManualBestEffortDetail(pending, uploadOutcome.Result)) {
+                    break;
+                }
+
+                ScheduleDeferredBackoff(pending);
                 break;
 
             default:
@@ -325,6 +331,28 @@ internal sealed class PartyDetailCollector : IDisposable {
                 _utcNow(),
                 nextAttemptCount,
                 retryAfterSeconds,
+                _nextJitterMs
+            ),
+        };
+
+        _pendingDetailQueue.TryUpdate(current, updated);
+    }
+
+    private void ScheduleDeferredBackoff(PendingDetailEntry pending) {
+        if (!_pendingDetailQueue.TryGet(pending.Detail.ListingId, out var current)) {
+            return;
+        }
+
+        if (current.Fingerprint != pending.Fingerprint) {
+            return;
+        }
+
+        var nextDeferredCount = current.DeferredCount + 1;
+        var updated = current with {
+            DeferredCount = nextDeferredCount,
+            NextAttemptAtUtc = PartyDetailUploadPolicy.ComputeDeferredNextAttemptAtUtc(
+                _utcNow(),
+                nextDeferredCount,
                 _nextJitterMs
             ),
         };

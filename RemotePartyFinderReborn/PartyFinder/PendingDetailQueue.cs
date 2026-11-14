@@ -71,6 +71,7 @@ internal sealed class PendingDetailQueue {
 
                 var updated = current with {
                     AttemptCount = 0,
+                    DeferredCount = 0,
                     NextAttemptAtUtc = nowUtc,
                 };
 
@@ -82,6 +83,25 @@ internal sealed class PendingDetailQueue {
         }
 
         return triggered;
+    }
+
+    internal int PruneExpiredManualEntries(DateTime nowUtc, TimeSpan maxAge) {
+        if (maxAge <= TimeSpan.Zero) {
+            return 0;
+        }
+
+        var removed = 0;
+        foreach (var (listingId, current) in _pendingDetails) {
+            if (current.Owner != PartyDetailRequestOwner.Manual || _inFlightDetails.ContainsKey(listingId)) {
+                continue;
+            }
+
+            if (nowUtc - current.QueuedAtUtc >= maxAge && TryRemoveExact(listingId, current)) {
+                removed++;
+            }
+        }
+
+        return removed;
     }
 
     internal void ReleaseInFlight(IEnumerable<PendingDetailEntry> entries) {
@@ -131,5 +151,6 @@ internal sealed record PendingDetailEntry(
     PartyDetailRequestOwner Owner,
     DateTime QueuedAtUtc,
     int AttemptCount,
-    DateTime NextAttemptAtUtc
+    DateTime NextAttemptAtUtc,
+    int DeferredCount = 0
 );

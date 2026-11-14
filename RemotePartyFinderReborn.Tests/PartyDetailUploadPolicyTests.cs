@@ -555,7 +555,7 @@ public sealed class PartyDetailUploadPolicyTests {
         Assert.Null(collector.GetPendingDetailForTesting(9001U));
         var skipped = collector.GetPendingDetailForTesting(9002U).GetValueOrDefault();
         Assert.Equal(0, skipped.AttemptCount);
-        Assert.Equal(now, skipped.NextAttemptAtUtc);
+        Assert.Equal(now.AddSeconds(2), skipped.NextAttemptAtUtc);
         Assert.Equal(1, collector.PendingQueueCount);
         Assert.Equal(1, handler.StartedCount);
     }

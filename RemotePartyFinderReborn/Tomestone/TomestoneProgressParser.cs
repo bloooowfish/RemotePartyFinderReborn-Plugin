@@ -2,13 +2,15 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Net;
 using System.Text;
+using System.Text.RegularExpressions;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
 namespace RemotePartyFinderReborn.Tomestone;
 
-public static class TomestoneProgressParser
+public static partial class TomestoneProgressParser
 {
     private static readonly string[] PercentFields =
     [
@@ -86,6 +88,23 @@ public static class TomestoneProgressParser
             return TomestoneProgressData.Empty;
         }
 
+        return ParseProgress(root, target);
+    }
+
+    public static TomestoneProgressData ParseProgress(JToken root, TomestoneEncounterParams target)
+    {
+        if (root is null)
+        {
+            return TomestoneProgressData.Empty;
+        }
+
+        if (target is null)
+        {
+            return new TomestoneProgressData(
+                ParsePhaseProgress(root),
+                ParseBestBossPercentage(root));
+        }
+
         var targetCanonicalNames = BuildTargetCanonicalNames(target);
         if (targetCanonicalNames.Count == 0)
         {
@@ -133,6 +152,79 @@ public static class TomestoneProgressParser
         {
             return TomestoneProgressData.Empty;
         }
+    }
+
+    public static TomestoneProgressData ParseEncounterActivityProgress(JToken root, TomestoneEncounterParams target)
+    {
+        if (root is null || target is null)
+        {
+            return TomestoneProgressData.Empty;
+        }
+
+        return ParseEncounterActivityProgress(root, target, allowUnlabelled: true);
+    }
+
+    public static TomestoneProgressData ParseGraphProgress(JToken root)
+    {
+        if (root is null)
+        {
+            return TomestoneProgressData.Empty;
+        }
+
+        var graph = FindGraphArray(root);
+        if (graph is null)
+        {
+            return TomestoneProgressData.Empty;
+        }
+
+        var phases = ParseGraphProgress(graph);
+        var values = new List<double>();
+        CollectGraphBossPercentages(graph, values);
+        double? bestBoss = values.Count > 0 ? values.Min() : null;
+
+        return new TomestoneProgressData(phases, bestBoss, IsAuthoritative: phases.Count > 0 || bestBoss.HasValue);
+    }
+
+    public static TomestoneProgressData MergeProgressData(
+        TomestoneProgressData primary,
+        TomestoneProgressData secondary)
+    {
+        if (primary is null && secondary is null)
+        {
+            return TomestoneProgressData.Empty;
+        }
+
+        if (primary is null)
+        {
+            return secondary;
+        }
+
+        if (secondary is null)
+        {
+            return primary;
+        }
+
+        if (primary.Cleared || secondary.Cleared)
+        {
+            return TomestoneProgressData.ClearedProgress;
+        }
+
+        var phases = primary.Phases.Count >= secondary.Phases.Count
+            ? primary.Phases
+            : secondary.Phases;
+        double? bossPercentage = (primary.BossPercentage, secondary.BossPercentage) switch
+        {
+            (double a, double b) => Math.Min(a, b),
+            (double a, null) => a,
+            (null, double b) => b,
+            _ => null,
+        };
+
+        return new TomestoneProgressData(
+            phases,
+            bossPercentage,
+            Cleared: false,
+            IsAuthoritative: primary.IsAuthoritative || secondary.IsAuthoritative);
     }
 
     private static TomestoneProgressData ParseEncounterActivityProgress(
@@ -283,20 +375,33 @@ public static class TomestoneProgressParser
     private static IReadOnlyList<string> BuildTargetCanonicalNames(TomestoneEncounterParams target)
     {
         var canonicalNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void AddWithDotAlias(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return;
+            }
+
+            var trimmed = value.Trim();
+            canonicalNames.Add(trimmed);
+            var dotless = trimmed.Replace(".", string.Empty, StringComparison.Ordinal);
+            if (!string.IsNullOrWhiteSpace(dotless))
+            {
+                canonicalNames.Add(dotless);
+            }
+        }
+
         if (target.TargetCanonicalNames is not null)
         {
             foreach (var canonicalName in target.TargetCanonicalNames)
             {
-                if (!string.IsNullOrWhiteSpace(canonicalName))
-                {
-                    canonicalNames.Add(canonicalName.Trim());
-                }
+                AddWithDotAlias(canonicalName);
             }
         }
 
         if (canonicalNames.Count == 0 && !string.IsNullOrWhiteSpace(target.Encounter))
         {
-            canonicalNames.Add(target.Encounter.Trim());
+            AddWithDotAlias(target.Encounter);
         }
 
         return canonicalNames.ToList();
@@ -1282,6 +1387,211 @@ public static class TomestoneProgressParser
     {
         return value.ToString("0.##", CultureInfo.InvariantCulture);
     }
+
+    public static string ExtractProgressionGraphUrl(JToken content)
+    {
+        if (content is null)
+        {
+            return null;
+        }
+
+        if (content["activity"]?["progressionGraphUrl"] is JValue directValue
+            && directValue.Type == JTokenType.String
+            && directValue.Value<string>() is { } directUrl
+            && !string.IsNullOrWhiteSpace(directUrl))
+        {
+            return directUrl.Trim();
+        }
+
+        var queue = new Queue<JToken>();
+        queue.Enqueue(content);
+        while (queue.Count > 0)
+        {
+            var current = queue.Dequeue();
+            if (current is JObject obj)
+            {
+                if (obj.TryGetValue("progressionGraphUrl", StringComparison.OrdinalIgnoreCase, out var urlToken)
+                    && urlToken.Type == JTokenType.String
+                    && urlToken.Value<string>() is { } found
+                    && !string.IsNullOrWhiteSpace(found))
+                {
+                    return found.Trim();
+                }
+
+                foreach (var prop in obj.Properties())
+                {
+                    if (prop.Value is JObject or JArray)
+                    {
+                        queue.Enqueue(prop.Value);
+                    }
+                }
+            }
+            else if (current is JArray array)
+            {
+                foreach (var item in array)
+                {
+                    if (item is JObject or JArray)
+                    {
+                        queue.Enqueue(item);
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    public static string ExtractDataPageJsonFromHtml(string html)
+    {
+        if (string.IsNullOrWhiteSpace(html))
+        {
+            return null;
+        }
+
+        foreach (Match divMatch in AppDivTagRegex().Matches(html))
+        {
+            var tag = divMatch.Value;
+            if (!AppIdAttributeRegex().IsMatch(tag))
+            {
+                continue;
+            }
+
+            var dataPageMatch = DataPageAttributeRegex().Match(tag);
+            if (!dataPageMatch.Success)
+            {
+                continue;
+            }
+
+            var rawValue = dataPageMatch.Groups["dq"].Success
+                ? dataPageMatch.Groups["dq"].Value
+                : dataPageMatch.Groups["sq"].Value;
+            var decoded = WebUtility.HtmlDecode(rawValue)?.Trim();
+            if (!string.IsNullOrEmpty(decoded) && decoded.StartsWith('{'))
+            {
+                return decoded;
+            }
+        }
+
+        return null;
+    }
+
+    public static bool LooksLikeUnhydratedSpaShell(string html)
+    {
+        if (string.IsNullOrWhiteSpace(html))
+        {
+            return false;
+        }
+
+        if (TomestoneChallengeDetector.DetectTextChallenge(html) is not null)
+        {
+            return false;
+        }
+
+        var looksLikeHtml = html.Contains("<html", StringComparison.OrdinalIgnoreCase)
+            || html.Contains("<!doctype", StringComparison.OrdinalIgnoreCase);
+        return looksLikeHtml && ExtractDataPageJsonFromHtml(html) is null;
+    }
+
+    public static string ExtractInertiaVersion(string input)
+    {
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            return null;
+        }
+
+        var dataPageJson = ExtractDataPageJsonFromHtml(input);
+        if (!string.IsNullOrEmpty(dataPageJson))
+        {
+            try
+            {
+                var token = JToken.Parse(dataPageJson);
+                if (token["version"]?.Value<string>() is { Length: > 0 } dataPageVersion)
+                {
+                    return dataPageVersion;
+                }
+            }
+            catch (JsonException)
+            {
+            }
+        }
+
+        var trimmed = input.TrimStart();
+        if (trimmed.StartsWith('{'))
+        {
+            try
+            {
+                var token = JToken.Parse(trimmed);
+                if (token["version"]?.Value<string>() is { Length: > 0 } jsonVersion)
+                {
+                    return jsonVersion;
+                }
+            }
+            catch (JsonException)
+            {
+            }
+        }
+
+        var match = JsonVersionRegex().Match(input);
+        if (match.Success && match.Groups[1].Value.Length > 0)
+        {
+            return match.Groups[1].Value;
+        }
+
+        var encodedMatch = HtmlEncodedVersionRegex().Match(input);
+        return encodedMatch.Success && encodedMatch.Groups[1].Value.Length > 0
+            ? encodedMatch.Groups[1].Value
+            : null;
+    }
+
+    public static JToken UnwrapCharacterPageContent(string payloadJson)
+    {
+        if (string.IsNullOrWhiteSpace(payloadJson))
+        {
+            throw new JsonReaderException("Empty Tomestone JSON payload.");
+        }
+
+        return UnwrapCharacterPageContent(JToken.Parse(payloadJson));
+    }
+
+    public static JToken UnwrapCharacterPageContent(JToken parsed)
+    {
+        if (parsed is null)
+        {
+            return new JObject();
+        }
+
+        if (parsed["props"]?["characterPageContent"] is { Type: not JTokenType.Null and not JTokenType.Undefined } pageContent)
+        {
+            return pageContent;
+        }
+
+        if (parsed is JObject obj && (obj.ContainsKey("encounters") || obj.ContainsKey("activity")))
+        {
+            return parsed;
+        }
+
+        if (parsed["data"] is { Type: not JTokenType.Null and not JTokenType.Undefined } dataContent)
+        {
+            return dataContent;
+        }
+
+        return parsed;
+    }
+
+    [GeneratedRegex(@"<div\b[^>]*>", RegexOptions.IgnoreCase | RegexOptions.Singleline)]
+    private static partial Regex AppDivTagRegex();
+
+    [GeneratedRegex(@"\bid\s*=\s*(?:""app""|'app'|app(?:\s|>))", RegexOptions.IgnoreCase | RegexOptions.Singleline)]
+    private static partial Regex AppIdAttributeRegex();
+
+    [GeneratedRegex(@"\bdata-page\s*=\s*(?:""(?<dq>[^""]*)""|'(?<sq>[^']*)')", RegexOptions.IgnoreCase | RegexOptions.Singleline)]
+    private static partial Regex DataPageAttributeRegex();
+
+    [GeneratedRegex(@"""version""\s*:\s*""([^""]+)""", RegexOptions.Singleline)]
+    private static partial Regex JsonVersionRegex();
+
+    [GeneratedRegex(@"&quot;version&quot;\s*:\s*&quot;([^&]+)&quot;", RegexOptions.Singleline)]
+    private static partial Regex HtmlEncodedVersionRegex();
 
     private sealed record ParsedPhase(
         string PhaseKey,

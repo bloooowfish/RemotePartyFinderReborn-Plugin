@@ -40,11 +40,15 @@ internal sealed class FFLogsBatchProcessor
             if (_seams.ApiClient.TryGetRateLimitRemaining(out cooldownRemaining))
             {
                 var tomestoneOnlyResults = new Dictionary<ulong, ParseResult>();
+                await _tomestoneProgressEnricher.EnrichClearsFallbackAsync(
+                    jobs,
+                    tomestoneOnlyResults,
+                    cancellationToken).ConfigureAwait(false);
                 await _tomestoneProgressEnricher.EnrichProgressAsync(
                     jobs,
                     tomestoneOnlyResults,
                     zoneId,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 results.AddRange(tomestoneOnlyResults.Values);
                 hitRateLimitCooldown = true;
                 break;
@@ -56,16 +60,20 @@ internal sealed class FFLogsBatchProcessor
                 candidateQueries,
                 (int)zoneId,
                 difficultyId,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
 
             if (!fetchedOutcome.Succeeded)
             {
                 var tomestoneOnlyResults = new Dictionary<ulong, ParseResult>();
+                await _tomestoneProgressEnricher.EnrichClearsFallbackAsync(
+                    jobs,
+                    tomestoneOnlyResults,
+                    cancellationToken).ConfigureAwait(false);
                 await _tomestoneProgressEnricher.EnrichProgressAsync(
                     jobs,
                     tomestoneOnlyResults,
                     zoneId,
-                    cancellationToken);
+                    cancellationToken).ConfigureAwait(false);
                 results.AddRange(tomestoneOnlyResults.Values);
                 hadTransientFailure |= fetchedOutcome.TransientFailure;
                 hitRateLimitCooldown = TryCaptureCooldown(out cooldownRemaining);
@@ -77,11 +85,16 @@ internal sealed class FFLogsBatchProcessor
             var candidateMatch = candidateMatcher.MatchFetchedCandidates(fetchedByKey);
             var resultsByContentId = candidateMatch.ResultsByContentId;
 
+            await _tomestoneProgressEnricher.EnrichClearsFallbackAsync(
+                jobs,
+                resultsByContentId,
+                cancellationToken).ConfigureAwait(false);
+
             await _tomestoneProgressEnricher.EnrichProgressAsync(
                 jobs,
                 resultsByContentId,
                 zoneId,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
 
             if (_seams.ApiClient.TryGetRateLimitRemaining(out cooldownRemaining))
             {
@@ -91,7 +104,7 @@ internal sealed class FFLogsBatchProcessor
             }
 
             results.AddRange(resultsByContentId.Values);
-            await Task.Delay(1000, cancellationToken);
+            await Task.Delay(1000, cancellationToken).ConfigureAwait(false);
         }
 
         return new FFLogsBatchProcessResult(

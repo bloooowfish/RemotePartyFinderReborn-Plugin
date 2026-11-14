@@ -25,11 +25,12 @@ public sealed class UploadableSlotTests {
         const ulong beastmaster = 1UL << 32;
         var source = CreatePartyFinderSlot(beastmaster);
 
-        // Dalamud's current public Accepting collection drops this flag because its indexer
-        // truncates JobFlags to UInt32. Upload serialization must retain the stored raw mask.
+        // Dalamud API 15 fixed PartyFinderSlot.Accepting so Beastmaster (1UL << 32) is preserved.
         var accepting = source.GetType().GetProperty("Accepting")?.GetValue(source) as IEnumerable;
         Assert.NotNull(accepting);
-        Assert.Empty(accepting.Cast<object>());
+        var flags = accepting.Cast<object>().ToArray();
+        Assert.Single(flags);
+        Assert.Equal("Beastmaster", flags[0].ToString());
 
         var payload = SerializeSlot(source);
         Assert.Equal(JTokenType.String, payload["accepting"]?.Type);

@@ -113,6 +113,10 @@ internal sealed class ProtectedIngestEndpointExecutor
                 transientFailure,
                 retryAfterSeconds);
         }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
         catch (Exception ex)
         {
             RecordFailure(uploadUrl, GetUtcNow(), recordUploadAttempt);

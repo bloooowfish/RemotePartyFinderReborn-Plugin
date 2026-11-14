@@ -59,6 +59,7 @@ public class AbandonFflogsLease
     public int DifficultyId { get; set; }
     public string LeaseToken { get; set; } = "";
     public string Reason { get; set; } = "";
+    public string ProcessorKind { get; set; } = "";
 }
 
 [Serializable]

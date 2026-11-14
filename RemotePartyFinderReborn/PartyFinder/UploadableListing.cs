@@ -118,18 +118,25 @@ internal sealed class UploadableSlot {
     private static readonly FieldInfo RawAcceptingField = typeof(PartyFinderSlot).GetField(
         "accepting",
         BindingFlags.Instance | BindingFlags.NonPublic
-    ) ?? throw new MissingFieldException(typeof(PartyFinderSlot).FullName, "accepting");
+    );
 
     [JsonConverter(typeof(AcceptingFlagsJsonConverter))]
     public ulong Accepting { get; }
 
     internal UploadableSlot(PartyFinderSlot source) {
         ArgumentNullException.ThrowIfNull(source);
-        // Dalamud's Accepting collection currently uses an indexer that casts JobFlags to uint.
-        // That makes every flag above bit 31 (including Beastmaster) appear unset, so preserve
-        // the raw mask stored by PartyFinderSlot instead of rebuilding it from that collection.
-        Accepting = (ulong)(RawAcceptingField.GetValue(source)
-            ?? throw new InvalidOperationException("PartyFinderSlot accepting flags were unavailable."));
+        // Preserve the underlying 64-bit mask directly when available so both API 15 Beastmaster
+        // and any unmapped high bits survive unchanged; fall back to aggregating source.Accepting.
+        if (RawAcceptingField?.GetValue(source) is ulong rawMask) {
+            Accepting = rawMask;
+            return;
+        }
+
+        ulong mask = 0;
+        foreach (var flag in source.Accepting) {
+            mask |= (ulong)flag;
+        }
+        Accepting = mask;
     }
 }
 

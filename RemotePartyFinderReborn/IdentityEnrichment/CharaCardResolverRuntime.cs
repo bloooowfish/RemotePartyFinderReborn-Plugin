@@ -221,12 +221,19 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
         Action<string>? debugSink = null
     ) {
         _interopProvider = interopProvider ?? throw new ArgumentNullException(nameof(interopProvider));
+        if (instanceResolver == null) {
+            throw new ArgumentNullException(nameof(instanceResolver));
+        }
         _instanceResolver = instanceResolver;
         _warningSink = warningSink;
         _debugSink = debugSink;
     }
 
-    public ResolverPreflightResult CheckAvailability() => CharaCardResolver.CheckAvailability();
+    public ResolverPreflightResult CheckAvailability() => ResolverPreflightEvaluator.Evaluate(
+        (nint)CharaCard.Addresses.RequestCharaCardForContentId.Value,
+        (nint)CharaCard.Addresses.HandleCurrentCharaCardDataPacket.Value,
+        (nint)AgentCharaCard.Addresses.OpenCharaCardForPacket.Value
+    );
 
     public void Initialize(
         Func<CharaCardPacketModel, bool> packetHandler,
@@ -254,8 +261,12 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
         _selectOkDialogHandler = selectOkDialogHandler;
         var hooks = new InteropHookBundle();
         try {
+            var packetHookAddress = (nint)CharaCard.Addresses.HandleCurrentCharaCardDataPacket.Value;
+            if (packetHookAddress == 0) {
+                throw new InvalidOperationException("HandleCurrentCharaCardDataPacket interop address is unavailable.");
+            }
             _packetHook = _interopProvider.HookFromAddress<CharaCard.Delegates.HandleCurrentCharaCardDataPacket>(
-                (nint)CharaCard.Addresses.HandleCurrentCharaCardDataPacket.Value,
+                packetHookAddress,
                 HandleCurrentCharaCardDataPacketDetour
             );
             _debugSink?.Invoke("CharaCardResolver: initialized required HandleCurrentCharaCardDataPacket hook from FFXIVClientStructs address.");
@@ -306,8 +317,12 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
     }
 
     public bool TryRequest(ulong contentId) {
+        if (contentId == 0 || (nint)CharaCard.Addresses.RequestCharaCardForContentId.Value == 0) {
+            return false;
+        }
+
         var charaCard = _instanceResolver();
-        if (charaCard == null) {
+        if (charaCard == null || (nuint)charaCard < 0x10000) {
             return false;
         }
 
@@ -400,7 +415,7 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
                 _loggedPacketDetourHit = true;
                 _debugSink?.Invoke("CharaCardResolver: hit HandleCurrentCharaCardDataPacket detour.");
             }
-            if (packet != null) {
+            if (IsValidPointer(packet)) {
                 shouldPropagateOriginal = _packetHandler?.Invoke(CreatePacketModel(packet)) ?? true;
             }
         } catch (Exception exception) {
@@ -433,7 +448,7 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
     private void AgentOpenCharaCardForPacketDetour(AgentCharaCard* thisPtr, CharaCardPacket* packet, bool a3) {
         var shouldPropagateOriginal = true;
         try {
-            if (packet != null) {
+            if (IsValidPointer(packet)) {
                 shouldPropagateOriginal = _agentPacketHandler?.Invoke(CreatePacketModel(packet)) ?? true;
             }
         } catch (Exception exception) {
@@ -539,6 +554,10 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
     }
 
     private static CharaCardPacketModel CreatePacketModel(CharaCardPacket* packet) {
+        if (!IsValidPointer(packet)) {
+            return default;
+        }
+
         return new CharaCardPacketModel(
             packet->ContentId,
             packet->WorldId,
@@ -550,11 +569,25 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
         );
     }
 
-    private static string ReadPacketName(CharaCardPacket* packet) {
+    internal static string ReadPacketName(CharaCardPacket* packet) {
+        if (!IsValidPointer(packet)) {
+            return string.Empty;
+        }
+
         // API15 client code reads the CharaCard packet name at 0x1A9. The current generated
         // FFXIVClientStructs field is four bytes early, so packet->NameString is empty.
-        var bytes = new ReadOnlySpan<byte>((byte*)packet + CharaCardPacketNameOffset, CharaCardPacketNameLength);
+        var remainingBytes = sizeof(CharaCardPacket) - CharaCardPacketNameOffset;
+        if (remainingBytes <= 0) {
+            return string.Empty;
+        }
+
+        var boundedLength = Math.Min(CharaCardPacketNameLength, remainingBytes);
+        var bytes = new ReadOnlySpan<byte>((byte*)packet + CharaCardPacketNameOffset, boundedLength);
         return DecodeNullTerminatedUtf8(bytes);
+    }
+
+    private static bool IsValidPointer(void* pointer) {
+        return (nuint)pointer >= 0x10000;
     }
 
     internal static string DecodeNullTerminatedUtf8(ReadOnlySpan<byte> bytes) {

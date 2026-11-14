@@ -35,7 +35,15 @@ internal sealed class InteropHookBundle : IDisposable {
 
         _disposed = true;
         for (var index = _hooks.Count - 1; index >= 0; index--) {
-            _hooks[index].Dispose();
+            try {
+                _hooks[index].Dispose();
+            } catch (Exception ex) {
+                try {
+                    Plugin.Log?.Error(ex, "InteropHookBundle: failed to dispose hook.");
+                } catch {
+                    // Ignore when Plugin.Log is uninitialized in unit tests.
+                }
+            }
         }
 
         _hooks.Clear();

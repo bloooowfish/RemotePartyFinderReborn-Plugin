@@ -32,7 +32,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     private const string OpenListingSignature =
         "48 89 5C 24 ?? 57 48 83 EC ?? 48 8B FA 48 8B D9 E8 ?? ?? ?? ?? 48 8B 8B ?? ?? ?? ?? 48 85 C9";
     private const string OpenListingByContentIdSignature =
-        "40 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 84 C0 74 07 C6 83 ?? ?? ?? ?? ?? 48 83 C4 20 5B C3 CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC 40 53";
+        "40 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 84 C0 74 07 C6 83 ?? ?? ?? ?? ?? 48 83 C4 20 5B C3";
     private const string OpenAddonSignature =
         "4C 89 4C 24 20 44 89 44 24 18 53 55 56 57 41 57 48 81 EC ?? ?? ?? ?? 80 B9 ?? ?? ?? ?? ?? 48 8B F9 8B B4 24 ?? ?? ?? ?? 8B DA";
     private const uint PfDetailAddonId = 275U;
@@ -271,19 +271,33 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     }
 
     private bool OpenListingDetour(nint agent, ulong listingId) {
-        EnsureRequestCycleForIntercept(listingId, 0UL);
+        try {
+            EnsureRequestCycleForIntercept(listingId, 0UL);
+        } catch (Exception ex) {
+            Plugin.Log?.Warning(ex, "PartyDetailCaptureRuntime: OpenListingDetour failed.");
+        }
+
         return true;
     }
 
     private bool OpenListingByContentIdDetour(nint agent, ulong contentId) {
-        EnsureRequestCycleForIntercept(0UL, contentId);
+        try {
+            EnsureRequestCycleForIntercept(0UL, contentId);
+        } catch (Exception ex) {
+            Plugin.Log?.Warning(ex, "PartyDetailCaptureRuntime: OpenListingByContentIdDetour failed.");
+        }
+
         return true;
     }
 
     private void PopulateListingDataDetour(nint agent, nint listingData) {
         _ = agent;
         _ = listingData;
-        RaisePostRequestPopulationSignal();
+        try {
+            RaisePostRequestPopulationSignal();
+        } catch (Exception ex) {
+            Plugin.Log?.Warning(ex, "PartyDetailCaptureRuntime: PopulateListingDataDetour failed.");
+        }
     }
 
     private bool PfDetailOpenDetour(
@@ -303,26 +317,31 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         _ = unk;
         _ = addonRowId;
         _ = openFlags;
-        var suppress = _requestCoordinator.ShouldSuppressScannerPfDetailOpen(_state, addonId);
-        EnsureManualCycleForDetailOpen(addonId, suppress);
+        try {
+            var suppress = _requestCoordinator.ShouldSuppressScannerPfDetailOpen(_state, addonId);
+            EnsureManualCycleForDetailOpen(addonId, suppress);
 
-        var hasScannerAttempt = _requestCoordinator.TryGetScannerAttemptDebugState(out var scannerAttempt);
-        if (Plugin.Log is not null && (addonId == PfDetailAddonId || hasScannerAttempt)) {
-            Plugin.Log.Debug(
-                "PartyDetailCaptureRuntime: pf_detail_open addon={AddonId} suppress={Suppress} backend={Backend} currentOwner={CurrentOwner} currentSerial={CurrentSerial} armedSerial={ArmedSerial} allowHeadless={AllowHeadless} listing={ListingId} content={ContentId}",
-                addonId,
-                suppress,
-                _scannerHeadlessBackendKind,
-                _state.CurrentOwner?.ToString() ?? "none",
-                _state.CurrentRequestSerial?.ToString() ?? "none",
-                hasScannerAttempt ? scannerAttempt.RequestSerial?.ToString() ?? "none" : "none",
-                hasScannerAttempt && scannerAttempt.AllowHeadless,
-                hasScannerAttempt ? scannerAttempt.ListingId : 0UL,
-                hasScannerAttempt ? scannerAttempt.ContentId : 0UL
-            );
+            var hasScannerAttempt = _requestCoordinator.TryGetScannerAttemptDebugState(out var scannerAttempt);
+            if (Plugin.Log is not null && (addonId == PfDetailAddonId || hasScannerAttempt)) {
+                Plugin.Log.Debug(
+                    "PartyDetailCaptureRuntime: pf_detail_open addon={AddonId} suppress={Suppress} backend={Backend} currentOwner={CurrentOwner} currentSerial={CurrentSerial} armedSerial={ArmedSerial} allowHeadless={AllowHeadless} listing={ListingId} content={ContentId}",
+                    addonId,
+                    suppress,
+                    _scannerHeadlessBackendKind,
+                    _state.CurrentOwner?.ToString() ?? "none",
+                    _state.CurrentRequestSerial?.ToString() ?? "none",
+                    hasScannerAttempt ? scannerAttempt.RequestSerial?.ToString() ?? "none" : "none",
+                    hasScannerAttempt && scannerAttempt.AllowHeadless,
+                    hasScannerAttempt ? scannerAttempt.ListingId : 0UL,
+                    hasScannerAttempt ? scannerAttempt.ContentId : 0UL
+                );
+            }
+
+            return !suppress;
+        } catch (Exception ex) {
+            Plugin.Log?.Warning(ex, "PartyDetailCaptureRuntime: PfDetailOpenDetour failed.");
+            return true;
         }
-
-        return !suppress;
     }
 
     private void EnsureRequestCycleForIntercept(ulong listingId, ulong contentId) {
@@ -563,8 +582,13 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
                 );
                 hooks.Add(openListingHookScope);
 
+                var populateAddress = (nint)AgentLookingForGroup.MemberFunctionPointers.PopulateListingData;
+                if (populateAddress == 0) {
+                    throw new InvalidOperationException("AgentLookingForGroup.PopulateListingData address is unavailable.");
+                }
+
                 populateListingDataHook = _interopProvider.HookFromAddress<PopulateListingDataDelegate>(
-                    (nint)AgentLookingForGroup.MemberFunctionPointers.PopulateListingData,
+                    populateAddress,
                     (agent, listingData) => {
                         populateListingDataHook!.Original(agent, listingData);
                         populateListingDataDetour(agent, listingData);

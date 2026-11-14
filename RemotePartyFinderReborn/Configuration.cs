@@ -19,10 +19,30 @@ public class Configuration : IPluginConfiguration {
     public int CharaCardResolveRetryCount { get; set; } = 1;
     public int AutoDetailScanRetryCount { get; set; } = 1;
     
-    public ImmutableList<UploadUrl> UploadUrls = DefaultUploadUrls();
+    [Newtonsoft.Json.JsonIgnore]
+    private readonly object _uploadUrlsSync = new();
+    private ImmutableList<UploadUrl> _uploadUrls = DefaultUploadUrls();
+
+    public ImmutableList<UploadUrl> UploadUrls {
+        get {
+            lock (_uploadUrlsSync) {
+                return _uploadUrls;
+            }
+        }
+        set {
+            lock (_uploadUrlsSync) {
+                _uploadUrls = value ?? ImmutableList<UploadUrl>.Empty;
+            }
+        }
+    }
+
+    [Newtonsoft.Json.JsonIgnore]
+    internal bool HasPendingSecretMigration { get; private set; }
 
     // FFLogs API Settings
     public string FFLogsClientId { get; set; } = string.Empty;
+
+    [Newtonsoft.Json.JsonConverter(typeof(DpapiProtectedStringJsonConverter))]
     public string FFLogsClientSecret { get; set; } = string.Empty;
     public bool EnableFFLogsWorker { get; set; } = true;
     public int FFLogsWorkerBaseDelayMs { get; set; } = 5000;
@@ -31,13 +51,22 @@ public class Configuration : IPluginConfiguration {
     public int FFLogsWorkerJitterMs { get; set; } = 2000;
 
     // Tomestone API Settings
+    [Newtonsoft.Json.JsonConverter(typeof(DpapiProtectedStringJsonConverter))]
     public string TomestoneApiKey { get; set; } = string.Empty;
     public bool EnableTomestoneProgressEnrichment { get; set; } = false;
+    public bool EnableTomestoneWebFallback { get; set; } = true;
+    public bool PreferTomestoneObscura { get; set; } = false;
+    public string TomestoneObscuraCdpUrl { get; set; } = string.Empty;
+
+    [Newtonsoft.Json.JsonConverter(typeof(DpapiProtectedStringJsonConverter))]
+    public string TomestoneObscuraCdpToken { get; set; } = string.Empty;
     public int TomestoneRequestIntervalMs { get; set; } = 750;
     public int TomestoneMaxConcurrency { get; set; } = 1;
 
     // Ingest security metadata
     public string IngestClientId { get; set; } = string.Empty;
+
+    [Newtonsoft.Json.JsonConverter(typeof(DpapiProtectedStringJsonConverter))]
     public string IngestSharedSecret { get; set; } = "rpf-reborn-public-ingest-v1";
 
     // Debug scanner: auto-open PF detail windows
@@ -51,6 +80,33 @@ public class Configuration : IPluginConfiguration {
     public int AutoDetailScanMaxConsecutiveFailures { get; set; } = 5;
     public int AutoDetailScanMaxPerRun { get; set; } = 0;
     
+    internal ImmutableList<UploadUrl> GetUploadUrlsSnapshot() {
+        lock (_uploadUrlsSync) {
+            return _uploadUrls;
+        }
+    }
+
+    internal void UpdateUploadUrls(Func<ImmutableList<UploadUrl>, ImmutableList<UploadUrl>> updater) {
+        ArgumentNullException.ThrowIfNull(updater);
+        lock (_uploadUrlsSync) {
+            _uploadUrls = updater(_uploadUrls) ?? ImmutableList<UploadUrl>.Empty;
+        }
+    }
+
+    internal void ClearPendingSecretMigration() {
+        HasPendingSecretMigration = false;
+    }
+
+    [System.Runtime.Serialization.OnDeserializing]
+    private void OnDeserializing(System.Runtime.Serialization.StreamingContext context) {
+        DpapiSecretProtector.BeginDeserialization();
+    }
+
+    [System.Runtime.Serialization.OnDeserialized]
+    private void OnDeserialized(System.Runtime.Serialization.StreamingContext context) {
+        HasPendingSecretMigration = DpapiSecretProtector.EndDeserialization();
+    }
+
     public static ImmutableList<UploadUrl> DefaultUploadUrls() => [
         new("http://127.0.0.1:8000") { IsDefault = true }
     ];

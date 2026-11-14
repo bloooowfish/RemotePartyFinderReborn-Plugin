@@ -10,6 +10,7 @@ namespace RemotePartyFinderReborn.Tomestone;
 public sealed class TomestoneApiClient : IDisposable
 {
     private static readonly Uri DefaultBaseUri = new("https://tomestone.gg/api/");
+    private static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan RateLimitCooldownDuration = TimeSpan.FromHours(1);
 
     private readonly Configuration _configuration;
@@ -31,7 +32,7 @@ public sealed class TomestoneApiClient : IDisposable
         Action<ApiCredentialValidationState, string> credentialStatusChanged)
         : this(
             configuration,
-            new HttpClient(),
+            CreateDefaultHttpClient(),
             static () => DateTime.UtcNow,
             message => Plugin.Log.Info(message),
             message => Plugin.Log.Warning(message),
@@ -50,7 +51,7 @@ public sealed class TomestoneApiClient : IDisposable
         Action<ApiCredentialValidationState, string> credentialStatusChanged = null)
         : this(
             configuration,
-            new HttpClient(messageHandler),
+            CreateHttpClientWithTimeout(messageHandler),
             utcNow ?? (static () => DateTime.UtcNow),
             infoLog ?? (static _ => { }),
             warningLog ?? (static _ => { }),
@@ -113,26 +114,69 @@ public sealed class TomestoneApiClient : IDisposable
         try
         {
             _debugLog($"Tomestone API GET {requestUri}");
-            using var response = await _httpClient.SendAsync(request, cancellationToken);
-            var body = await response.Content.ReadAsStringAsync(cancellationToken);
+            using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            var body = response.Content != null
+                ? await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false)
+                : string.Empty;
             _debugLog($"Tomestone API GET {requestUri} returned {(int)response.StatusCode} with {body.Length} byte(s).");
 
-            if (response.StatusCode == HttpStatusCode.TooManyRequests)
+            if ((int)response.StatusCode is >= 300 and < 400)
             {
                 ReportCredentialStatus(
                     ApiCredentialValidationState.RequestFailed,
+                    $"Tomestone API attempted redirect (HTTP {(int)response.StatusCode}); API key validity was not confirmed.");
+                _warningLog($"Tomestone API GET {requestUri} attempted redirect ({(int)response.StatusCode}), which is disabled.");
+                return OperationOutcome<TomestoneRawResponse>.Failure(
+                    transientFailure: false,
+                    $"Tomestone API request attempted redirect ({(int)response.StatusCode}).");
+            }
+
+            if (response.StatusCode == HttpStatusCode.TooManyRequests)
+            {
+                var cooldownDuration = TomestoneChallengeDetector.TryParseRetryAfter(
+                    response.Headers,
+                    _utcNow(),
+                    out var parsedRetryAfter)
+                    ? parsedRetryAfter
+                    : RateLimitCooldownDuration;
+                ReportCredentialStatus(
+                    ApiCredentialValidationState.RequestFailed,
                     "Tomestone rate-limited the request; API key validity was not confirmed.");
-                ActivateRateLimitCooldown($"GET {requestUri}");
+                ActivateRateLimitCooldown($"GET {requestUri}", cooldownDuration);
                 return OperationOutcome<TomestoneRawResponse>.Failure(
                     transientFailure: true,
                     "Tomestone API request was rate limited.");
             }
 
+            var activityHidden = response.StatusCode == HttpStatusCode.Forbidden
+                && body.Contains("hidden", StringComparison.OrdinalIgnoreCase);
+
+            var antiBotChallenge = !response.IsSuccessStatusCode
+                ? TomestoneChallengeDetector.DetectApiNonSuccessChallenge(
+                    response.StatusCode,
+                    response.Headers,
+                    body,
+                    _utcNow(),
+                    activityHidden)
+                : TomestoneChallengeDetector.DetectTextChallenge(body);
+
+            if (antiBotChallenge != null)
+            {
+                var cooldownDuration = TomestoneChallengeDetector.EffectiveCooldownDuration(
+                    antiBotChallenge,
+                    TomestoneChallengeDetector.DefaultChallengeCooldown);
+                ReportCredentialStatus(
+                    ApiCredentialValidationState.RequestFailed,
+                    $"Tomestone API returned anti-bot challenge ({antiBotChallenge.Label}); API key validity was not confirmed.");
+                ActivateRateLimitCooldown($"GET {requestUri} ({antiBotChallenge.Label})", cooldownDuration);
+                return OperationOutcome<TomestoneRawResponse>.Failure(
+                    transientFailure: false,
+                    $"Tomestone API anti-bot challenge detected ({antiBotChallenge.Label}).");
+            }
+
             if (!response.IsSuccessStatusCode)
             {
                 var statusCode = (int)response.StatusCode;
-                var activityHidden = response.StatusCode == HttpStatusCode.Forbidden
-                    && body.Contains("hidden", StringComparison.OrdinalIgnoreCase);
                 var credentialState = activityHidden
                     ? ApiCredentialValidationState.Accepted
                     : response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
@@ -168,8 +212,7 @@ public sealed class TomestoneApiClient : IDisposable
             {
                 StatusCode = response.StatusCode,
                 Body = body,
-                ActivityHidden = response.StatusCode == HttpStatusCode.Forbidden
-                    && body.Contains("hidden", StringComparison.OrdinalIgnoreCase),
+                ActivityHidden = activityHidden,
             });
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -187,12 +230,33 @@ public sealed class TomestoneApiClient : IDisposable
         _httpClient.Dispose();
     }
 
-    private void ActivateRateLimitCooldown(string source)
+    private static HttpClient CreateDefaultHttpClient()
     {
-        _rateLimitCooldown.Activate(_utcNow(), RateLimitCooldownDuration);
+        var handler = new HttpClientHandler
+        {
+            AllowAutoRedirect = false,
+        };
+        return new HttpClient(handler, disposeHandler: true)
+        {
+            Timeout = DefaultTimeout,
+        };
+    }
+
+    private static HttpClient CreateHttpClientWithTimeout(HttpMessageHandler messageHandler)
+    {
+        ArgumentNullException.ThrowIfNull(messageHandler);
+        return new HttpClient(messageHandler)
+        {
+            Timeout = DefaultTimeout,
+        };
+    }
+
+    private void ActivateRateLimitCooldown(string source, TimeSpan duration)
+    {
+        _rateLimitCooldown.Activate(_utcNow(), duration);
 
         _warningLog(
-            $"Tomestone API rate limited at {source}. Pausing Tomestone requests until {RateLimitCooldownUntilUtc:O} (1 hour lockout).");
+            $"Tomestone API rate limited at {source}. Pausing Tomestone requests until {RateLimitCooldownUntilUtc:O} ({Math.Ceiling(duration.TotalSeconds)}s lockout).");
     }
 
     private void ReportCredentialStatus(ApiCredentialValidationState state, string message)

@@ -20,12 +20,7 @@ pack/
 mono_crash.*
 
 # Build results
-[Dd]ebug/
-!RemotePartyFinderReborn/Debug/
-RemotePartyFinderReborn/Debug/*
-!RemotePartyFinderReborn/Debug/DebugPfScanStateMachine.cs
-!RemotePartyFinderReborn/Debug/DebugPfListingQueue.cs
-!RemotePartyFinderReborn/Debug/DebugPfScanner.cs
+/[Dd]ebug/
 [Dd]ebugPublic/
 [Rr]elease/
 [Rr]eleases/

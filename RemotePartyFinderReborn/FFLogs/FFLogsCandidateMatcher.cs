@@ -86,6 +86,12 @@ internal sealed class FFLogsCandidateMatcher
                     continue;
                 }
 
+                var isCandidateSearch = job.CandidateServers != null && job.CandidateServers.Count > 0;
+                if (isCandidateSearch && !data.Exists)
+                {
+                    continue;
+                }
+
                 var score = ScoreCandidate(data, job.EncounterId, job.SecondaryEncounterId);
                 if (bestIdx < 0 || score > bestScore)
                 {

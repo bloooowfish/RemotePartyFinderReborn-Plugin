@@ -4,8 +4,12 @@ using System.Collections.Generic;
 namespace RemotePartyFinderReborn;
 
 internal sealed class PartyDetailCaptureState {
+    internal static readonly TimeSpan StaleManualRequestTtl = TimeSpan.FromSeconds(30);
+
     private readonly object _gate = new();
     private readonly Dictionary<long, PartyDetailRequestCycle> _pendingRequests = new();
+    private readonly Dictionary<long, DateTime> _pendingRequestCreatedAtUtc = new();
+    private readonly Func<DateTime> _utcNow;
 
     private long _nextRequestSerial;
     private long _latestArrivalGeneration;
@@ -14,6 +18,14 @@ internal sealed class PartyDetailCaptureState {
     private PartyDetailLatestDebugSnapshot _latestDebugSnapshot;
     private bool _hasLatestArrival;
     private bool _hasLatestDebugSnapshot;
+
+    internal PartyDetailCaptureState()
+        : this(() => DateTime.UtcNow) {
+    }
+
+    internal PartyDetailCaptureState(Func<DateTime> utcNow) {
+        _utcNow = utcNow ?? throw new ArgumentNullException(nameof(utcNow));
+    }
 
     internal long LatestArrivalGeneration {
         get {
@@ -73,8 +85,12 @@ internal sealed class PartyDetailCaptureState {
 
     internal PartyDetailRequestCycle BeginRequest(PartyDetailRequestOwner owner, ulong listingId, ulong contentId) {
         lock (_gate) {
+            var nowUtc = _utcNow();
+            PruneExpiredManualRequestsLocked(nowUtc);
+
             var cycle = new PartyDetailRequestCycle(++_nextRequestSerial, owner, listingId, contentId);
             _pendingRequests[cycle.RequestSerial] = cycle;
+            _pendingRequestCreatedAtUtc[cycle.RequestSerial] = nowUtc;
             return cycle;
         }
     }
@@ -86,6 +102,8 @@ internal sealed class PartyDetailCaptureState {
             if (!_pendingRequests.Remove(requestSerial, out var cycle)) {
                 return false;
             }
+
+            _pendingRequestCreatedAtUtc.Remove(requestSerial);
 
             var generation = ++_latestArrivalGeneration;
             _latestArrival = new PartyDetailArrival(generation, cycle, CloneSnapshot(snapshot));
@@ -123,7 +141,14 @@ internal sealed class PartyDetailCaptureState {
         }
 
         lock (_gate) {
+            _pendingRequestCreatedAtUtc.Remove(requestSerial);
             return _pendingRequests.Remove(requestSerial);
+        }
+    }
+
+    internal int PruneExpiredManualRequests() {
+        lock (_gate) {
+            return PruneExpiredManualRequestsLocked(_utcNow());
         }
     }
 
@@ -260,12 +285,45 @@ internal sealed class PartyDetailCaptureState {
     }
 
     private bool TryGetCurrentCycle(out PartyDetailRequestCycle cycle) {
+        PruneExpiredManualRequestsLocked(_utcNow());
         if (_nextRequestSerial <= 0) {
             cycle = default;
             return false;
         }
 
         return _pendingRequests.TryGetValue(_nextRequestSerial, out cycle);
+    }
+
+    private int PruneExpiredManualRequestsLocked(DateTime nowUtc) {
+        if (_pendingRequests.Count == 0) {
+            return 0;
+        }
+
+        List<long> expiredSerials = null;
+        foreach (var (serial, cycle) in _pendingRequests) {
+            if (cycle.Owner != PartyDetailRequestOwner.Manual) {
+                continue;
+            }
+
+            if (_pendingRequestCreatedAtUtc.TryGetValue(serial, out var createdAtUtc)
+                && nowUtc - createdAtUtc < StaleManualRequestTtl) {
+                continue;
+            }
+
+            expiredSerials ??= new List<long>();
+            expiredSerials.Add(serial);
+        }
+
+        if (expiredSerials is null) {
+            return 0;
+        }
+
+        foreach (var serial in expiredSerials) {
+            _pendingRequests.Remove(serial);
+            _pendingRequestCreatedAtUtc.Remove(serial);
+        }
+
+        return expiredSerials.Count;
     }
 
     private sealed record PartyDetailArrival(long Generation, PartyDetailRequestCycle Cycle, UploadablePartyDetail Snapshot);

@@ -1,3 +1,6 @@
+using System.Linq;
+using System.Reflection;
+using Newtonsoft.Json;
 using Xunit;
 
 namespace RemotePartyFinderReborn.Tests;
@@ -16,8 +19,18 @@ public sealed class TomestoneConfigurationTests
 
         Assert.Equal(string.Empty, configuration.TomestoneApiKey);
         Assert.False(configuration.EnableTomestoneProgressEnrichment);
+        Assert.True(configuration.EnableTomestoneWebFallback);
+        Assert.False(configuration.PreferTomestoneObscura);
+        Assert.Equal(string.Empty, configuration.TomestoneObscuraCdpUrl);
+        Assert.Equal(string.Empty, configuration.TomestoneObscuraCdpToken);
         Assert.Equal(750, configuration.TomestoneRequestIntervalMs);
         Assert.Equal(1, configuration.TomestoneMaxConcurrency);
+
+        var tokenProp = typeof(Configuration).GetProperty(nameof(Configuration.TomestoneObscuraCdpToken));
+        Assert.NotNull(tokenProp);
+        var converterAttr = tokenProp!.GetCustomAttributes<JsonConverterAttribute>().SingleOrDefault();
+        Assert.NotNull(converterAttr);
+        Assert.Equal(typeof(DpapiProtectedStringJsonConverter), converterAttr!.ConverterType);
     }
 
     [Theory]

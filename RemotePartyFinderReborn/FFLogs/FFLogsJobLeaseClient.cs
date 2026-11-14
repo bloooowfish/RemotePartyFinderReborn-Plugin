@@ -15,7 +15,12 @@ internal sealed record FFLogsJobLeaseAttempt(
 
 internal class FFLogsJobLeaseClient
 {
-    private const string WorkerRegionHeader = "X-RPF-FFLogs-Worker-Region";
+    internal const string WorkerRegionHeader = "X-RPF-FFLogs-Worker-Region";
+    internal const string ProcessorKindHeader = "X-RPF-FFLogs-Processor-Kind";
+    internal const string ProcessorKindValue = "dalamud_plugin_worker";
+    internal const string JobModeHeader = "X-RPF-FFLogs-Job-Mode";
+    internal const string JobModeValue = "candidate-capable";
+
     private readonly FFLogsCollectorSeams _seams;
     private readonly ProtectedIngestEndpointExecutor _protectedExecutor;
     private readonly IFFLogsWorkerRegionProvider _workerRegionProvider;
@@ -48,7 +53,7 @@ internal class FFLogsJobLeaseClient
             return new FFLogsJobLeaseAttempt(null, false);
         }
 
-        if (!TryBuildWorkerRegionHeaders(_workerRegionProvider, debugLog, out var extraHeaders))
+        if (!TryBuildWorkerHeaders(_workerRegionProvider, debugLog, out var extraHeaders))
         {
             return new FFLogsJobLeaseAttempt(null, false);
         }
@@ -103,44 +108,54 @@ internal class FFLogsJobLeaseClient
         return new FFLogsJobLeaseAttempt(emptySession, result.TransientFailure);
     }
 
-    private static bool TryBuildWorkerRegionHeaders(
+    internal UploadUrl SelectAvailableUploadUrl(Configuration configuration, Action<string> warningLog)
+        => SelectUploadUrl(configuration, warningLog);
+
+    private static bool TryBuildWorkerHeaders(
         IFFLogsWorkerRegionProvider workerRegionProvider,
         Action<string> debugLog,
         out IReadOnlyDictionary<string, string> extraHeaders)
     {
-        extraHeaders = null;
+        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            [ProcessorKindHeader] = ProcessorKindValue,
+            [JobModeHeader] = JobModeValue,
+        };
+
         if (workerRegionProvider == null)
         {
+            extraHeaders = headers;
             return true;
         }
 
         if (workerRegionProvider is IFFLogsWorkerRegionSnapshotState { HasObservedSnapshot: false })
         {
+            extraHeaders = null;
             return false;
         }
 
         if (!workerRegionProvider.TryGetWorkerRegion(out var region))
         {
             debugLog("FFLogsCollector: worker region unavailable; skipping regional jobs poll.");
+            extraHeaders = null;
             return false;
         }
 
         if (string.IsNullOrWhiteSpace(region))
         {
             debugLog("FFLogsCollector: worker region was blank; skipping regional jobs poll.");
+            extraHeaders = null;
             return false;
         }
 
-        extraHeaders = new Dictionary<string, string>
-        {
-            [WorkerRegionHeader] = region.Trim(),
-        };
+        headers[WorkerRegionHeader] = region.Trim();
+        extraHeaders = headers;
         return true;
     }
 
     private UploadUrl SelectUploadUrl(Configuration configuration, Action<string> warningLog)
     {
-        foreach (var candidate in configuration.UploadUrls.Where(static uploadUrl => uploadUrl.IsEnabled))
+        foreach (var candidate in configuration.GetUploadUrlsSnapshot().Where(static uploadUrl => uploadUrl.IsEnabled))
         {
             if (UploadAttemptRecorder.IsCircuitOpen(candidate, configuration, _seams.TimeProvider.UtcNow))
             {

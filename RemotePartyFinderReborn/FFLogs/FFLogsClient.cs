@@ -4,7 +4,6 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
@@ -22,6 +21,7 @@ public class FFLogsClient : IDisposable
     private readonly Action<string> _errorLog;
     private readonly Action<Exception, string> _exceptionLog;
     private readonly Action<ApiCredentialValidationState, string> _credentialStatusChanged;
+    private readonly SemaphoreSlim _tokenLock = new(1, 1);
     private string _accessToken = string.Empty;
     private string _tokenClientId = string.Empty;
     private string _tokenClientSecret = string.Empty;
@@ -99,6 +99,7 @@ public class FFLogsClient : IDisposable
     public void Dispose()
     {
         _httpClient.Dispose();
+        _tokenLock.Dispose();
     }
 
     public DateTime RateLimitCooldownUntilUtc
@@ -132,87 +133,107 @@ public class FFLogsClient : IDisposable
         _warningLog($"FFLogs cooldown active. Skipping FFLogs query for about {minutesRemaining} minute(s).");
     }
 
-    private async Task<OperationOutcome<bool>> EnsureTokenAsync()
+    private async Task<OperationOutcome<string>> EnsureTokenAsync(
+        CancellationToken cancellationToken,
+        string invalidatedToken = null)
     {
-        var clientId = _configuration.FFLogsClientId?.Trim() ?? string.Empty;
-        var clientSecret = _configuration.FFLogsClientSecret?.Trim() ?? string.Empty;
-        if (!string.Equals(_tokenClientId, clientId, StringComparison.Ordinal)
-            || !string.Equals(_tokenClientSecret, clientSecret, StringComparison.Ordinal))
-        {
-            _accessToken = string.Empty;
-            _tokenExpiration = DateTime.MinValue;
-            _tokenClientId = clientId;
-            _tokenClientSecret = clientSecret;
-        }
-
-        if (!string.IsNullOrEmpty(_accessToken) && _utcNow() < _tokenExpiration)
-        {
-            return OperationOutcome<bool>.Success(true);
-        }
-
-        if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret))
-        {
-            ReportCredentialStatus(
-                ApiCredentialValidationState.NotChecked,
-                "Client ID and Client Secret are both required.");
-            return OperationOutcome<bool>.Failure(false, "FFLogs credentials are not configured.");
-        }
-
+        await _tokenLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var request = new HttpRequestMessage(HttpMethod.Post, TokenUrl);
-            var form = new Dictionary<string, string>
+            var clientId = _configuration.FFLogsClientId?.Trim() ?? string.Empty;
+            var clientSecret = _configuration.FFLogsClientSecret?.Trim() ?? string.Empty;
+            if (!string.Equals(_tokenClientId, clientId, StringComparison.Ordinal)
+                || !string.Equals(_tokenClientSecret, clientSecret, StringComparison.Ordinal))
             {
-                { "grant_type", "client_credentials" },
-                { "client_id", clientId },
-                { "client_secret", clientSecret }
-            };
-            request.Content = new FormUrlEncodedContent(form);
+                _accessToken = string.Empty;
+                _tokenExpiration = DateTime.MinValue;
+                _tokenClientId = clientId;
+                _tokenClientSecret = clientSecret;
+            }
+            else if (!string.IsNullOrEmpty(invalidatedToken)
+                     && string.Equals(_accessToken, invalidatedToken, StringComparison.Ordinal))
+            {
+                _accessToken = string.Empty;
+                _tokenExpiration = DateTime.MinValue;
+            }
 
-            var response = await _httpClient.SendAsync(request);
-            if (!response.IsSuccessStatusCode)
+            if (!string.IsNullOrEmpty(_accessToken) && _utcNow() < _tokenExpiration)
             {
-                var transientFailure = IsTransientStatusCode(response.StatusCode);
+                return OperationOutcome<string>.Success(_accessToken);
+            }
+
+            if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret))
+            {
                 ReportCredentialStatus(
-                    IsOAuthCredentialsRejected(response.StatusCode)
-                        ? ApiCredentialValidationState.Rejected
-                        : ApiCredentialValidationState.RequestFailed,
-                    IsOAuthCredentialsRejected(response.StatusCode)
-                        ? $"FFLogs rejected the Client ID/Secret (HTTP {(int)response.StatusCode})."
-                        : $"FFLogs authentication request failed (HTTP {(int)response.StatusCode}).");
-                if ((int)response.StatusCode == 429)
+                    ApiCredentialValidationState.NotChecked,
+                    "Client ID and Client Secret are both required.");
+                return OperationOutcome<string>.Failure(false, "FFLogs credentials are not configured.");
+            }
+
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Post, TokenUrl);
+                var form = new Dictionary<string, string>
                 {
-                    ActivateRateLimitCooldown("oauth token request");
-                    transientFailure = true;
+                    { "grant_type", "client_credentials" },
+                    { "client_id", clientId },
+                    { "client_secret", clientSecret }
+                };
+                request.Content = new FormUrlEncodedContent(form);
+
+                using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+                if (!response.IsSuccessStatusCode)
+                {
+                    var transientFailure = IsTransientStatusCode(response.StatusCode);
+                    ReportCredentialStatus(
+                        IsOAuthCredentialsRejected(response.StatusCode)
+                            ? ApiCredentialValidationState.Rejected
+                            : ApiCredentialValidationState.RequestFailed,
+                        IsOAuthCredentialsRejected(response.StatusCode)
+                            ? $"FFLogs rejected the Client ID/Secret (HTTP {(int)response.StatusCode})."
+                            : $"FFLogs authentication request failed (HTTP {(int)response.StatusCode}).");
+                    if ((int)response.StatusCode == 429)
+                    {
+                        ActivateRateLimitCooldown("oauth token request");
+                        transientFailure = true;
+                    }
+
+                    _errorLog($"FFLogs OAuth request failed: {response.StatusCode}");
+                    return OperationOutcome<string>.Failure(
+                        transientFailure,
+                        $"FFLogs OAuth request failed: {response.StatusCode}");
                 }
 
-                _errorLog($"FFLogs OAuth request failed: {response.StatusCode}");
-                return OperationOutcome<bool>.Failure(
-                    transientFailure,
-                    $"FFLogs OAuth request failed: {response.StatusCode}");
+                var content = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                var json = JObject.Parse(content);
+
+                _accessToken = json["access_token"]?.ToString() ?? string.Empty;
+                var expiresIn = json["expires_in"]?.ToObject<int>() ?? 0;
+                _tokenExpiration = _utcNow().AddSeconds(expiresIn - 60); // Buffer 60s
+
+                if (!string.IsNullOrEmpty(_accessToken))
+                {
+                    ReportCredentialStatus(ApiCredentialValidationState.Accepted, "FFLogs accepted the credentials.");
+                    return OperationOutcome<string>.Success(_accessToken);
+                }
+
+                ReportCredentialStatus(ApiCredentialValidationState.RequestFailed, "FFLogs response did not include an access token.");
+                return OperationOutcome<string>.Failure(false, "FFLogs OAuth response did not include an access token.");
             }
-
-            var content = await response.Content.ReadAsStringAsync();
-            var json = JObject.Parse(content);
-
-            _accessToken = json["access_token"]?.ToString();
-            var expiresIn = json["expires_in"]?.ToObject<int>() ?? 0;
-            _tokenExpiration = _utcNow().AddSeconds(expiresIn - 60); // Buffer 60s
-
-            if (!string.IsNullOrEmpty(_accessToken))
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                ReportCredentialStatus(ApiCredentialValidationState.Accepted, "FFLogs accepted the credentials.");
-                return OperationOutcome<bool>.Success(true);
+                throw;
             }
-
-            ReportCredentialStatus(ApiCredentialValidationState.RequestFailed, "FFLogs response did not include an access token.");
-            return OperationOutcome<bool>.Failure(false, "FFLogs OAuth response did not include an access token.");
+            catch (Exception ex)
+            {
+                ReportCredentialStatus(ApiCredentialValidationState.RequestFailed, "Could not reach FFLogs to check the credentials.");
+                _exceptionLog(ex, "Failed to authenticate with FFLogs.");
+                return OperationOutcome<string>.Failure(true, ex.Message);
+            }
         }
-        catch (Exception ex)
+        finally
         {
-            ReportCredentialStatus(ApiCredentialValidationState.RequestFailed, "Could not reach FFLogs to check the credentials.");
-            _exceptionLog(ex, "Failed to authenticate with FFLogs.");
-            return OperationOutcome<bool>.Failure(true, ex.Message);
+            _tokenLock.Release();
         }
     }
 
@@ -233,147 +254,99 @@ public class FFLogsClient : IDisposable
             return OperationOutcome<JObject>.Failure(true, "FFLogs rate-limit cooldown is active.");
         }
 
-        var tokenOutcome = await EnsureTokenAsync();
-        if (!tokenOutcome.Succeeded)
+        string invalidatedToken = null;
+        for (var attempt = 0; attempt < 2; attempt++)
         {
-            return OperationOutcome<JObject>.Failure(
-                tokenOutcome.TransientFailure,
-                tokenOutcome.ErrorMessage);
-        }
-
-        try
-        {
-            var request = new HttpRequestMessage(HttpMethod.Post, GraphQlUrl);
-            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _accessToken);
-             
-            var payload = new { query };
-            request.Content = new StringContent(JsonConvert.SerializeObject(payload), Encoding.UTF8, "application/json");
-
-            var response = await _httpClient.SendAsync(request, cancellationToken);
-            if (!response.IsSuccessStatusCode)
+            var tokenOutcome = await EnsureTokenAsync(cancellationToken, invalidatedToken).ConfigureAwait(false);
+            if (!tokenOutcome.Succeeded)
             {
-                var errorBody = await response.Content.ReadAsStringAsync();
-                if (IsCredentialRejected(response.StatusCode))
-                {
-                    ReportCredentialStatus(
-                        ApiCredentialValidationState.Rejected,
-                        $"FFLogs rejected API authorization (HTTP {(int)response.StatusCode}).");
-                }
-
-                var transientFailure = IsTransientStatusCode(response.StatusCode);
-                if ((int)response.StatusCode == 429)
-                {
-                    ActivateRateLimitCooldown("GraphQL query");
-                    transientFailure = true;
-                }
-
-                _errorLog($"FFLogs API Query failed: {response.StatusCode} - {errorBody}");
                 return OperationOutcome<JObject>.Failure(
-                    transientFailure,
-                    $"FFLogs API query failed: {response.StatusCode}");
+                    tokenOutcome.TransientFailure,
+                    tokenOutcome.ErrorMessage);
             }
 
-            var content = await response.Content.ReadAsStringAsync();
-            var json = JObject.Parse(content);
-
-            if (json["errors"] is JArray errors && errors.Count > 0)
+            var accessToken = tokenOutcome.Value;
+            try
             {
-                var msg = errors[0]?["message"]?.ToString();
-                if (!string.IsNullOrWhiteSpace(msg))
+                using var request = new HttpRequestMessage(HttpMethod.Post, GraphQlUrl);
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+
+                var payload = new { query };
+                request.Content = new StringContent(JsonConvert.SerializeObject(payload), System.Text.Encoding.UTF8, "application/json");
+
+                using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+                if (!response.IsSuccessStatusCode)
                 {
-                    var now = _utcNow();
-                    if (!string.Equals(msg, _lastGraphQlErrorMessage, StringComparison.Ordinal)
-                        || (now - _lastGraphQlErrorLog) > TimeSpan.FromSeconds(60))
+                    if (response.StatusCode == HttpStatusCode.Unauthorized && attempt == 0)
                     {
-                        _lastGraphQlErrorMessage = msg;
-                        _lastGraphQlErrorLog = now;
-                        _errorLog($"FFLogs GraphQL error: {msg}");
+                        invalidatedToken = accessToken;
+                        continue;
+                    }
+
+                    var errorBody = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                    if (IsCredentialRejected(response.StatusCode))
+                    {
+                        ReportCredentialStatus(
+                            ApiCredentialValidationState.Rejected,
+                            $"FFLogs rejected API authorization (HTTP {(int)response.StatusCode}).");
+                    }
+
+                    var transientFailure = IsTransientStatusCode(response.StatusCode);
+                    if ((int)response.StatusCode == 429)
+                    {
+                        ActivateRateLimitCooldown("GraphQL query");
+                        transientFailure = true;
+                    }
+
+                    _errorLog($"FFLogs API Query failed: {response.StatusCode} - {errorBody}");
+                    return OperationOutcome<JObject>.Failure(
+                        transientFailure,
+                        $"FFLogs API query failed: {response.StatusCode}");
+                }
+
+                var content = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                var json = JObject.Parse(content);
+
+                if (json["errors"] is JArray errors && errors.Count > 0)
+                {
+                    var msg = errors[0]?["message"]?.ToString();
+                    if (!string.IsNullOrWhiteSpace(msg))
+                    {
+                        var now = _utcNow();
+                        if (!string.Equals(msg, _lastGraphQlErrorMessage, StringComparison.Ordinal)
+                            || (now - _lastGraphQlErrorLog) > TimeSpan.FromSeconds(60))
+                        {
+                            _lastGraphQlErrorMessage = msg;
+                            _lastGraphQlErrorLog = now;
+                            _errorLog($"FFLogs GraphQL error: {msg}");
+                        }
+                    }
+
+                    if (json["data"] is not JObject data || !data.Properties().Any())
+                    {
+                        return OperationOutcome<JObject>.Failure(IsTransientGraphQlError(msg), msg);
                     }
                 }
 
-                if (json["data"] is not JObject data || !data.Properties().Any())
-                {
-                    return OperationOutcome<JObject>.Failure(IsTransientGraphQlError(msg), msg);
-                }
+                return OperationOutcome<JObject>.Success(json);
             }
-
-            return OperationOutcome<JObject>.Success(json);
-        }
-        catch (Exception ex)
-        {
-            _exceptionLog(ex, "Failed to query FFLogs API.");
-            return OperationOutcome<JObject>.Failure(true, ex.Message);
-        }
-    }
-
-    public async Task<Dictionary<ulong, List<(int EncounterId, double Percentile)>>> FetchCharacterParsesBatchAsync(
-        List<(ulong ContentId, string Name, string Server, string Region)> characters,
-        int zoneId,
-        int? difficultyId = null)
-    {
-        if (characters.Count == 0) return new();
-
-        var sb = new StringBuilder();
-        sb.Append("query { characterData {");
-
-        for (int i = 0; i < characters.Count; i++)
-        {
-            var charInfo = characters[i];
-            // Alias: c{index}
-            sb.Append($" c{i}: character(name: \"{charInfo.Name}\", serverSlug: \"{charInfo.Server}\", serverRegion: \"{charInfo.Region}\") {{");
-            
-            // Build zoneRankings arguments
-            var args = new List<string> { $"zoneID: {zoneId}" };
-            if (difficultyId.HasValue) args.Add($"difficulty: {difficultyId.Value}");
-            args.Add("metric: rdps");
-            args.Add("timeframe: Historical");
-
-            sb.Append($" zoneRankings({string.Join(", ", args)})");
-            sb.Append(" }");
-        }
-
-        sb.Append(" }}");
-
-        var result = await QueryAsync(sb.ToString());
-        var output = new Dictionary<ulong, List<(int, double)>>();
-
-        if (result?["data"]?["characterData"] is not JObject data)
-        {
-            return output;
-        }
-
-        for (int i = 0; i < characters.Count; i++)
-        {
-            var charInfo = characters[i];
-            var alias = $"c{i}";
-            var characterData = data[alias];
-             
-            var encounterParses = new List<(int, double)>();
-
-            if (characterData is JObject && characterData["zoneRankings"]?["rankings"] is JArray rankings)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                foreach (var rank in rankings)
-                {
-                    if (rank is not JObject) continue;
-
-                    var encounterId = rank["encounter"]?["id"]?.ToObject<int>();
-                    var percentile = rank["rankPercent"]?.ToObject<double?>();
-
-                    if (encounterId.HasValue && percentile.HasValue)
-                    {
-                        encounterParses.Add((encounterId.Value, percentile.Value));
-                    }
-                }
+                return OperationOutcome<JObject>.Failure(true, "FFLogs API query was cancelled.");
             }
-            
-            output[charInfo.ContentId] = encounterParses;
+            catch (Exception ex)
+            {
+                _exceptionLog(ex, "Failed to query FFLogs API.");
+                return OperationOutcome<JObject>.Failure(true, ex.Message);
+            }
         }
 
-        return output;
+        return OperationOutcome<JObject>.Failure(false, "FFLogs API query unauthorized after token refresh.");
     }
 
     public sealed class CharacterFetchedData
     {
+        public bool Exists { get; init; } = true;
         public bool Hidden { get; init; }
         public List<CharacterEncounterParse> Parses { get; init; } = new();
     }
@@ -391,94 +364,6 @@ public class FFLogsClient : IDisposable
         public string Name { get; set; } = "";
         public string Server { get; set; } = "";
         public string Region { get; set; } = "";
-    }
-
-    public async Task<Dictionary<ulong, CharacterFetchedData>> FetchCharacterDataBatchAsync(
-        List<(ulong ContentId, string Name, string Server, string Region)> characters,
-        int zoneId,
-        int? difficultyId,
-        CancellationToken cancellationToken)
-    {
-        if (characters.Count == 0) return new();
-
-        var sb = new StringBuilder();
-        sb.Append("query { characterData {");
-
-        for (var i = 0; i < characters.Count; i++)
-        {
-            var charInfo = characters[i];
-            var name = FFLogsQueryBuilder.EscapeGraphQlString(charInfo.Name);
-            var server = FFLogsQueryBuilder.EscapeGraphQlString(charInfo.Server);
-            var region = FFLogsQueryBuilder.EscapeGraphQlString(charInfo.Region);
-
-            sb.Append($" c{i}: character(name: \"{name}\", serverSlug: \"{server}\", serverRegion: \"{region}\") {{");
-            sb.Append(" hidden ");
-
-            // zoneRankings (parse)
-            var args = new List<string> { $"zoneID: {zoneId}" };
-            if (difficultyId.HasValue) args.Add($"difficulty: {difficultyId.Value}");
-            args.Add("metric: rdps");
-            args.Add("timeframe: Historical");
-
-            sb.Append($" zoneRankings({string.Join(", ", args)}) ");
-
-            sb.Append(" }");
-        }
-
-        sb.Append(" } }");
-
-        var result = await QueryAsync(sb.ToString(), cancellationToken);
-        var output = new Dictionary<ulong, CharacterFetchedData>();
-
-        if (result?[
-                "data"]?[
-                "characterData"] is not JObject data)
-        {
-            return output;
-        }
-
-        for (var i = 0; i < characters.Count; i++)
-        {
-            var charInfo = characters[i];
-            var alias = $"c{i}";
-            if (data[alias] is not JObject character)
-            {
-                // Character not found on that server/region.
-                // Return empty data so the server can negative-cache this lookup.
-                output[charInfo.ContentId] = new CharacterFetchedData { Hidden = false };
-                continue;
-            }
-
-            var hidden = character["hidden"]?.ToObject<bool?>() ?? false;
-            var parses = new List<CharacterEncounterParse>();
-
-            if (character["zoneRankings"]?["rankings"] is JArray rankings)
-            {
-                foreach (var rank in rankings)
-                {
-                    if (rank is not JObject) continue;
-                    var encounterId = rank["encounter"]?["id"]?.ToObject<int?>();
-                    var percentile = rank["rankPercent"]?.ToObject<double?>();
-                    if (encounterId.HasValue && percentile.HasValue)
-                    {
-                        parses.Add(new CharacterEncounterParse
-                        {
-                            EncounterId = encounterId.Value,
-                            Percentile = percentile.Value,
-                            ClearCount = ReadClearCount(rank),
-                        });
-                    }
-                }
-            }
-
-            output[charInfo.ContentId] = new CharacterFetchedData
-            {
-                Hidden = hidden,
-                Parses = parses,
-            };
-        }
-
-        return output;
     }
 
     public async Task<Dictionary<string, CharacterFetchedData>> FetchCharacterCandidateDataBatchAsync(
@@ -517,7 +402,7 @@ public class FFLogsClient : IDisposable
                 chunk,
                 zoneId,
                 difficultyId);
-            var result = await QueryOutcomeAsync(query, cancellationToken);
+            var result = await QueryOutcomeAsync(query, cancellationToken).ConfigureAwait(false);
             if (!result.Succeeded)
             {
                 return OperationOutcome<Dictionary<string, CharacterFetchedData>>.Failure(
@@ -535,8 +420,8 @@ public class FFLogsClient : IDisposable
                 var alias = $"c{i}";
                 if (data[alias] is not JObject character)
                 {
-                    // Character not found on that server/region.
-                    output[chunk[i].Key] = new CharacterFetchedData { Hidden = false };
+                    // Character not found on that server/region; preserve non-existence explicitly.
+                    output[chunk[i].Key] = new CharacterFetchedData { Exists = false, Hidden = false };
                     continue;
                 }
 
@@ -564,6 +449,7 @@ public class FFLogsClient : IDisposable
 
                 output[chunk[i].Key] = new CharacterFetchedData
                 {
+                    Exists = true,
                     Hidden = hidden,
                     Parses = parses,
                 };
