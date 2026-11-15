@@ -926,21 +926,25 @@ public sealed class TomestoneApiClientAdapterTests
         Assert.Single(handler.Requests);
     }
 
-    [Fact]
-    public async Task Service_follows_same_origin_progressionGraphUrl_and_rejects_cross_origin()
+    [Theory]
+    [InlineData("/character/progress-graph/777/1079")]
+    [InlineData("https://tomestone.gg/character/777/alpha/activity/fru/graph")]
+    [InlineData("https://evil.example/steal-bearer")]
+    public async Task Service_ignores_progressionGraphUrl_and_only_queries_official_api_endpoints(string graphUrl)
     {
+        var warnings = new List<string>();
         var handler = new RecordingTomestoneHttpMessageHandler
         {
             OnSendAsync = (request, _) =>
             {
-                var uri = request.RequestUri!.AbsoluteUri;
-                if (uri.Contains("/profile/", StringComparison.Ordinal))
+                var path = request.RequestUri!.AbsolutePath;
+                if (path.StartsWith("/api/character/profile/", StringComparison.Ordinal))
                 {
                     return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
                     {
-                        Content = new StringContent("""
+                        Content = new StringContent($$$"""
                         {
-                          "progressionGraphUrl": "/character/777/alpha/activity/fru/graph",
+                          "progressionGraphUrl": "{{{graphUrl}}}",
                           "encounters": {
                             "ultimate": [
                               {
@@ -954,15 +958,19 @@ public sealed class TomestoneApiClientAdapterTests
                     });
                 }
 
-                if (uri.Equals("https://tomestone.gg/character/777/alpha/activity/fru/graph", StringComparison.Ordinal))
+                if (path.StartsWith("/api/character/activity/", StringComparison.Ordinal))
                 {
                     return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
                     {
-                        Content = new StringContent("""
+                        Content = new StringContent($$$"""
                         {
-                          "data": {
-                            "graph": [
-                              { "phase": { "name": "P2", "number": 2 }, "bestPull": "42%" }
+                          "activity": {
+                            "progressionGraphUrl": "{{{graphUrl}}}",
+                            "encounters": [
+                              {
+                                "canonicalName": "futures-rewritten-ultimate",
+                                "progression": { "displayPercent": "10%" }
+                              }
                             ]
                           }
                         }
@@ -975,63 +983,82 @@ public sealed class TomestoneApiClientAdapterTests
         };
 
         var config = EnabledConfiguration();
-        using var client = new TomestoneApiClient(config, handler);
-        var service = CreateAdapter(client, config);
+        using var client = new TomestoneApiClient(config, handler, warningLog: warnings.Add);
+        var service = CreateAdapter(client, config, warningLog: warnings.Add);
 
-        var sameOriginOutcome = await service.FetchProgressionDataAsync(
+        var outcome = await service.FetchProgressionDataAsync(
             "Alpha",
             "Tonberry",
             65,
             1079,
             CancellationToken.None);
 
-        Assert.True(sameOriginOutcome.Succeeded);
-        var phase = Assert.Single(sameOriginOutcome.Value!.Phases);
-        Assert.Equal("p2", phase.PhaseKey);
-        Assert.Equal(42, phase.BossPercentage);
-        Assert.Contains(handler.Requests, static r => r.RequestUri!.AbsoluteUri == "https://tomestone.gg/character/777/alpha/activity/fru/graph");
+        Assert.True(outcome.Succeeded);
+        Assert.Collection(
+            handler.Requests,
+            profile => Assert.StartsWith("/api/character/profile/", profile.RequestUri!.AbsolutePath, StringComparison.Ordinal),
+            activity => Assert.StartsWith("/api/character/activity/", activity.RequestUri!.AbsolutePath, StringComparison.Ordinal));
+        Assert.All(handler.Requests, static r => Assert.Equal("tomestone.gg", r.RequestUri!.Host));
+        Assert.Empty(warnings);
+    }
 
+    [Fact]
+    public async Task Client_rejects_non_api_and_off_origin_uris_without_sending_bearer_token()
+    {
         var warnings = new List<string>();
-        var evilHandler = new RecordingTomestoneHttpMessageHandler
+        var handler = new RecordingTomestoneHttpMessageHandler
         {
-            OnSendAsync = (request, _) =>
+            OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
             {
-                if (request.RequestUri!.AbsoluteUri.Contains("/profile/", StringComparison.Ordinal))
-                {
-                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
-                    {
-                        Content = new StringContent("""
-                        {
-                          "progressionGraphUrl": "https://evil.example/steal-bearer",
-                          "encounters": {
-                            "ultimate": [
-                              {
-                                "canonicalName": "futures-rewritten-ultimate",
-                                "progression": { "displayPercent": "10%" }
-                              }
-                            ]
-                          }
-                        }
-                        """),
-                    });
-                }
-
-                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{}") });
-            },
+                Content = new StringContent("{}"),
+            }),
         };
-        using var evilClient = new TomestoneApiClient(config, evilHandler);
-        var evilService = CreateAdapter(evilClient, config, warningLog: warnings.Add);
 
-        var crossOriginOutcome = await evilService.FetchProgressionDataAsync(
-            "Beta",
-            "Tonberry",
-            65,
-            1079,
-            CancellationToken.None);
+        var config = EnabledConfiguration();
+        using var client = new TomestoneApiClient(config, handler, warningLog: warnings.Add);
 
-        Assert.True(crossOriginOutcome.Succeeded);
-        Assert.DoesNotContain(evilHandler.Requests, static r => r.RequestUri!.Host.Contains("evil.example", StringComparison.OrdinalIgnoreCase));
-        Assert.Contains(warnings, static w => w.Contains("cross-origin", StringComparison.OrdinalIgnoreCase));
+        string[] rejectedUris =
+        [
+            "/character/progress-graph/777/1079",
+            "https://tomestone.gg/character/progress-graph/777/1079",
+            "../character/progress-graph/777/1079",
+            "https://evil.example/api/character/profile/Tonberry/Alpha",
+            "//evil.example/api/character/profile/Tonberry/Alpha",
+            "/api/../character/progress-graph/777/1079",
+            "https://tomestone.gg/api/",
+            "/api/",
+            @"api\character\profile\Tonberry\Alpha",
+        ];
+
+        foreach (var rejectedUri in rejectedUris)
+        {
+            warnings.Clear();
+            var outcome = await client.GetRawOutcomeAsync(rejectedUri, CancellationToken.None);
+
+            Assert.False(outcome.Succeeded);
+            Assert.False(outcome.TransientFailure);
+            Assert.Empty(handler.Requests);
+            Assert.Contains(warnings, static w => w.Contains("off-origin or non-API URI", StringComparison.OrdinalIgnoreCase));
+        }
+
+        string[] acceptedUris =
+        [
+            "/api/character/profile/Tonberry/Alpha",
+            "character/profile/Tonberry/Alpha",
+            "api/character/profile/Tonberry/Alpha",
+        ];
+
+        foreach (var acceptedUri in acceptedUris)
+        {
+            handler.Requests.Clear();
+            var outcome = await client.GetRawOutcomeAsync(acceptedUri, CancellationToken.None);
+
+            Assert.True(outcome.Succeeded);
+            var request = Assert.Single(handler.Requests);
+            Assert.Equal("https://tomestone.gg/api/character/profile/Tonberry/Alpha", request.RequestUri!.AbsoluteUri);
+            Assert.Equal("Bearer", request.Headers.Authorization?.Scheme);
+            Assert.Equal("secret-token", request.Headers.Authorization?.Parameter);
+        }
     }
 
     private static Configuration EnabledConfiguration() => new()

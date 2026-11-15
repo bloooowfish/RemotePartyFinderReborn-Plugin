@@ -153,12 +153,12 @@ public sealed class TomestoneApiClient : IDisposable
                 "Tomestone API rate-limit cooldown is active.");
         }
 
-        if (!TryResolveSameOriginUri(path, out var requestUri))
+        if (!TryResolveSameOriginApiUri(path, out var requestUri))
         {
-            _warningLog($"Refused Tomestone API request to off-origin or invalid URI '{path}'.");
+            _warningLog($"Refused Tomestone API request to off-origin or non-API URI '{path}'.");
             return OperationOutcome<TomestoneRawResponse>.Failure(
                 transientFailure: false,
-                "Refused Tomestone request to an untrusted off-origin URL.");
+                "Refused Tomestone request to an off-origin or non-API URI.");
         }
 
         using var request = CreateAuthenticatedGet(requestUri, apiKey);
@@ -339,9 +339,9 @@ public sealed class TomestoneApiClient : IDisposable
 
     private static HttpRequestMessage CreateAuthenticatedGet(Uri requestUri, string apiKey)
     {
-        if (!IsSameOriginTomestoneUri(requestUri))
+        if (!IsSameOriginTomestoneApiUri(requestUri))
         {
-            throw new InvalidOperationException("Refused to attach Tomestone API credentials to an off-origin URI.");
+            throw new InvalidOperationException("Refused to attach Tomestone API credentials to an off-origin or non-API URI.");
         }
 
         var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
@@ -354,37 +354,57 @@ public sealed class TomestoneApiClient : IDisposable
         return request;
     }
 
-    private static bool TryResolveSameOriginUri(string path, out Uri requestUri)
+    private static bool TryResolveSameOriginApiUri(string path, out Uri requestUri)
     {
+        requestUri = null;
         if (string.IsNullOrWhiteSpace(path))
         {
-            requestUri = null;
             return false;
         }
 
-        if (Uri.TryCreate(path, UriKind.Absolute, out var absoluteUri))
+        var trimmed = path.Trim();
+        if (trimmed.Contains('\\'))
         {
-            if (IsSameOriginTomestoneUri(absoluteUri))
+            return false;
+        }
+
+        if (!trimmed.StartsWith('/') && Uri.TryCreate(trimmed, UriKind.Absolute, out var absoluteUri))
+        {
+            if (IsSameOriginTomestoneApiUri(absoluteUri))
             {
                 requestUri = absoluteUri;
                 return true;
             }
 
-            requestUri = null;
             return false;
         }
 
-        if (path.Contains("://", StringComparison.Ordinal))
+        if (trimmed.Contains("://", StringComparison.Ordinal))
         {
-            requestUri = null;
             return false;
         }
 
-        var normalizedPath = path.TrimStart('/');
-        if (!Uri.TryCreate(DefaultBaseUri, normalizedPath, out var combined)
-            || !IsSameOriginTomestoneUri(combined))
+        string subPath;
+        if (trimmed.StartsWith('/'))
         {
-            requestUri = null;
+            if (trimmed.StartsWith("//", StringComparison.Ordinal)
+                || !trimmed.StartsWith("/api/", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            subPath = trimmed.Substring("/api/".Length);
+        }
+        else
+        {
+            subPath = trimmed.StartsWith("api/", StringComparison.OrdinalIgnoreCase)
+                ? trimmed.Substring("api/".Length)
+                : trimmed;
+        }
+
+        if (!Uri.TryCreate(DefaultBaseUri, subPath, out var combined)
+            || !IsSameOriginTomestoneApiUri(combined))
+        {
             return false;
         }
 
@@ -392,13 +412,15 @@ public sealed class TomestoneApiClient : IDisposable
         return true;
     }
 
-    private static bool IsSameOriginTomestoneUri(Uri uri)
+    private static bool IsSameOriginTomestoneApiUri(Uri uri)
     {
         return uri != null
             && uri.IsAbsoluteUri
             && string.Equals(uri.Scheme, DefaultBaseUri.Scheme, StringComparison.OrdinalIgnoreCase)
             && string.Equals(uri.Host, DefaultBaseUri.Host, StringComparison.OrdinalIgnoreCase)
             && uri.Port == DefaultBaseUri.Port
-            && string.IsNullOrEmpty(uri.UserInfo);
+            && string.IsNullOrEmpty(uri.UserInfo)
+            && uri.AbsolutePath.StartsWith("/api/", StringComparison.OrdinalIgnoreCase)
+            && uri.AbsolutePath.Length > "/api/".Length;
     }
 }

@@ -37,11 +37,6 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
         TomestoneRawResponse Response,
         JToken ParsedRoot);
 
-    private sealed record CachedGraphEntry(
-        DateTime ExpiresAt,
-        TomestoneProgressData Progress);
-
-    private static readonly Uri TomestoneSiteOrigin = new("https://tomestone.gg", UriKind.Absolute);
     private static readonly object ShapeDiagnosticLock = new();
     private static readonly HashSet<string> LoggedShapeDiagnostics = new(StringComparer.Ordinal);
 
@@ -52,7 +47,6 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
     private readonly Func<DateTime> _utcNow;
     private readonly object _profileCacheLock = new();
     private readonly Dictionary<(string Path, string Credential), CachedProfileEntry> _profileCache = new();
-    private readonly Dictionary<string, CachedGraphEntry> _graphCache = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<(string Path, string Credential), Lazy<Task<OperationOutcome<CachedProfileEntry>>>> _profileRequests = new();
 
     internal TomestoneProgressionService(
@@ -207,25 +201,6 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
         }
 
         var profileProgress = TomestoneProgressParser.ParseProgress(profileRoot, encounterParams);
-        if (!profileProgress.Cleared
-            && encounterParams.ProgressKind == TomestoneProgressKind.PhaseProgress
-            && profileProgress.Phases.Count == 0
-            && TomestoneProgressParser.ExtractProgressionGraphUrl(profileRoot) is { } profileGraphUrl)
-        {
-            var graphOutcome = await FetchGraphCachedAsync(profileGraphUrl, cancellationToken).ConfigureAwait(false);
-            if (!graphOutcome.Succeeded && _client.TryGetRateLimitRemaining(out _))
-            {
-                return OperationOutcome<TomestoneProgressData>.Failure(
-                    transientFailure: true,
-                    graphOutcome.ErrorMessage ?? "Tomestone API rate-limit cooldown is active.");
-            }
-
-            if (graphOutcome.Succeeded && graphOutcome.Value is { Phases.Count: > 0 } graphProgress)
-            {
-                profileProgress = TomestoneProgressParser.MergeProgressData(profileProgress, graphProgress);
-            }
-        }
-
         if (HasUsefulProgress(profileProgress, encounterParams.ProgressKind))
         {
             _debugLog(
@@ -296,25 +271,6 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
         {
             var activityRoot = JToken.Parse(response.Body);
             var progress = TomestoneProgressParser.ParseEncounterActivityProgress(activityRoot, encounterParams);
-            if (!progress.Cleared
-                && encounterParams.ProgressKind == TomestoneProgressKind.PhaseProgress
-                && progress.Phases.Count == 0
-                && TomestoneProgressParser.ExtractProgressionGraphUrl(activityRoot) is { } activityGraphUrl)
-            {
-                var graphOutcome = await FetchGraphCachedAsync(activityGraphUrl, cancellationToken).ConfigureAwait(false);
-                if (!graphOutcome.Succeeded && _client.TryGetRateLimitRemaining(out _))
-                {
-                    return OperationOutcome<TomestoneProgressData>.Failure(
-                        transientFailure: true,
-                        graphOutcome.ErrorMessage ?? "Tomestone API rate-limit cooldown is active.");
-                }
-
-                if (graphOutcome.Succeeded && graphOutcome.Value is { Phases.Count: > 0 } graphProgress)
-                {
-                    progress = TomestoneProgressParser.MergeProgressData(progress, graphProgress);
-                }
-            }
-
             if (!HasUsefulProgress(progress, encounterParams.ProgressKind))
             {
                 LogResponseShapeOnce("activity", zoneId, encounterId, targetDescription, response.Body);
@@ -331,109 +287,6 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
                 transientFailure: false,
                 $"Tomestone progress parse failed: {ex.Message}");
         }
-    }
-
-    private async Task<OperationOutcome<TomestoneProgressData>> FetchGraphCachedAsync(
-        string graphUrl,
-        CancellationToken cancellationToken)
-    {
-        var now = _utcNow();
-        lock (_profileCacheLock)
-        {
-            if (_graphCache.TryGetValue(graphUrl, out var cached) && cached.ExpiresAt > now)
-            {
-                return OperationOutcome<TomestoneProgressData>.Success(cached.Progress);
-            }
-        }
-
-        if (!TryResolveSameOriginSiteUrl(graphUrl, out var resolvedUrl))
-        {
-            _warningLog($"Ignoring invalid or cross-origin Tomestone progressionGraphUrl: {graphUrl}");
-            return OperationOutcome<TomestoneProgressData>.Success(null);
-        }
-
-        var rawOutcome = await _client.GetRawOutcomeAsync(resolvedUrl, cancellationToken).ConfigureAwait(false);
-        if (!rawOutcome.Succeeded)
-        {
-            return OperationOutcome<TomestoneProgressData>.Failure(
-                rawOutcome.TransientFailure,
-                rawOutcome.ErrorMessage);
-        }
-
-        var response = rawOutcome.Value!;
-        if (response.StatusCode is < HttpStatusCode.OK or >= HttpStatusCode.MultipleChoices || response.StatusCode == HttpStatusCode.NoContent)
-        {
-            return OperationOutcome<TomestoneProgressData>.Success(null);
-        }
-
-        try
-        {
-            var graphRoot = JToken.Parse(response.Body);
-            var parsed = TomestoneProgressParser.ParseGraphProgress(graphRoot);
-            lock (_profileCacheLock)
-            {
-                var cacheNow = _utcNow();
-                foreach (var expired in _graphCache.Where(pair => pair.Value.ExpiresAt <= cacheNow).Select(pair => pair.Key).ToArray())
-                {
-                    _graphCache.Remove(expired);
-                }
-
-                if (_graphCache.Count >= 256)
-                {
-                    _graphCache.Remove(_graphCache.MinBy(static pair => pair.Value.ExpiresAt).Key);
-                }
-
-                _graphCache[graphUrl] = new CachedGraphEntry(cacheNow.AddMinutes(5), parsed);
-            }
-
-            return OperationOutcome<TomestoneProgressData>.Success(parsed);
-        }
-        catch (JsonException)
-        {
-            return OperationOutcome<TomestoneProgressData>.Success(null);
-        }
-    }
-
-    private static bool TryResolveSameOriginSiteUrl(string candidate, out string resolved)
-    {
-        resolved = null;
-        if (string.IsNullOrWhiteSpace(candidate))
-        {
-            return false;
-        }
-
-        var trimmed = candidate.Trim();
-        if (trimmed.StartsWith('/'))
-        {
-            if (trimmed.StartsWith("//", StringComparison.Ordinal))
-            {
-                return false;
-            }
-
-            if (Uri.TryCreate(TomestoneSiteOrigin, trimmed, out var relativeResolved))
-            {
-                resolved = relativeResolved.ToString();
-                return true;
-            }
-
-            return false;
-        }
-
-        if (!Uri.TryCreate(trimmed, UriKind.Absolute, out var parsed))
-        {
-            return false;
-        }
-
-        if (string.Equals(parsed.Scheme, TomestoneSiteOrigin.Scheme, StringComparison.OrdinalIgnoreCase)
-            && string.Equals(parsed.Host, TomestoneSiteOrigin.Host, StringComparison.OrdinalIgnoreCase)
-            && parsed.Port == TomestoneSiteOrigin.Port
-            && string.IsNullOrEmpty(parsed.UserInfo))
-        {
-            resolved = parsed.ToString();
-            return true;
-        }
-
-        return false;
     }
 
     private static bool HasUsefulProgress(
@@ -510,11 +363,6 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
                         if (profile["activity"] is { Type: not JTokenType.Null and not JTokenType.Undefined } activity)
                         {
                             trimmedProfile["activity"] = activity;
-                        }
-
-                        if (profile["progressionGraphUrl"] is { Type: not JTokenType.Null and not JTokenType.Undefined } graphUrl)
-                        {
-                            trimmedProfile["progressionGraphUrl"] = graphUrl;
                         }
 
                         parsedRoot = trimmedProfile;

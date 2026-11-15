@@ -28,7 +28,7 @@ public sealed class TomestoneApiClientTests
             new Configuration { TomestoneApiKey = "secret-token" },
             handler);
 
-        var response = await client.GetRawAsync("/test", CancellationToken.None);
+        var response = await client.GetRawAsync("/api/test", CancellationToken.None);
 
         Assert.NotNull(response);
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
@@ -46,7 +46,7 @@ public sealed class TomestoneApiClientTests
         var handler = new RecordingHttpMessageHandler();
         using var client = new TomestoneApiClient(new Configuration { TomestoneApiKey = apiKey }, handler);
 
-        var outcome = await client.GetRawOutcomeAsync("/test", CancellationToken.None);
+        var outcome = await client.GetRawOutcomeAsync("/api/test", CancellationToken.None);
 
         Assert.False(outcome.Succeeded);
         Assert.False(outcome.TransientFailure);
@@ -57,6 +57,10 @@ public sealed class TomestoneApiClientTests
     [Theory]
     [InlineData("https://evil.example/api/leak")]
     [InlineData("http://tomestone.gg/character/1/alpha/graph")]
+    [InlineData("https://tomestone.gg/character/123/alpha/activity/fru/graph")]
+    [InlineData("/character/123/alpha/activity/fru/graph")]
+    [InlineData("../character/1/alpha")]
+    [InlineData("//evil.example/api/leak")]
     [InlineData("not a valid uri ://")]
     public async Task GetRawOutcomeAsync_refuses_off_origin_or_invalid_uri_without_sending_bearer_token(string uri)
     {
@@ -76,7 +80,7 @@ public sealed class TomestoneApiClientTests
     }
 
     [Fact]
-    public async Task GetRawOutcomeAsync_accepts_same_origin_tomestone_uri_and_sends_bearer_token()
+    public async Task GetRawOutcomeAsync_accepts_same_origin_tomestone_api_uri_and_sends_bearer_token()
     {
         var handler = new RecordingHttpMessageHandler
         {
@@ -90,12 +94,12 @@ public sealed class TomestoneApiClientTests
             handler);
 
         var outcome = await client.GetRawOutcomeAsync(
-            "https://tomestone.gg/character/123/alpha/activity/fru/graph",
+            "https://tomestone.gg/api/character/profile/Tonberry/Alpha",
             CancellationToken.None);
 
         Assert.True(outcome.Succeeded);
         var request = Assert.Single(handler.Requests);
-        Assert.Equal("https://tomestone.gg/character/123/alpha/activity/fru/graph", request.RequestUri!.AbsoluteUri);
+        Assert.Equal("https://tomestone.gg/api/character/profile/Tonberry/Alpha", request.RequestUri!.AbsoluteUri);
         Assert.Equal("Bearer", request.Headers.Authorization?.Scheme);
         Assert.Equal("secret-token", request.Headers.Authorization?.Parameter);
     }
@@ -120,24 +124,24 @@ public sealed class TomestoneApiClientTests
             handler,
             credentialStatusChanged: (state, message) => statusTransitions.Add((state, message)));
 
-        var first = await client.GetRawOutcomeAsync("/test", CancellationToken.None);
+        var first = await client.GetRawOutcomeAsync("/api/test", CancellationToken.None);
         Assert.True(first.Succeeded);
         Assert.Equal(HttpStatusCode.Unauthorized, first.Value!.StatusCode);
         Assert.Equal(ApiCredentialValidationState.Rejected, statusTransitions[^1].State);
 
         configuration.TomestoneApiKey = "new-valid-key";
-        var second = await client.GetRawOutcomeAsync("/test", CancellationToken.None);
+        var second = await client.GetRawOutcomeAsync("/api/test", CancellationToken.None);
         Assert.True(second.Succeeded);
         Assert.Equal(HttpStatusCode.OK, second.Value!.StatusCode);
         Assert.Contains(statusTransitions, static item => item.State == ApiCredentialValidationState.NotChecked);
         Assert.Equal(ApiCredentialValidationState.Accepted, statusTransitions[^1].State);
 
         configuration.TomestoneApiKey = "another-rejected-key";
-        await client.GetRawOutcomeAsync("/test", CancellationToken.None);
+        await client.GetRawOutcomeAsync("/api/test", CancellationToken.None);
         Assert.Equal(ApiCredentialValidationState.Rejected, statusTransitions[^1].State);
 
         configuration.TomestoneApiKey = string.Empty;
-        var cleared = await client.GetRawOutcomeAsync("/test", CancellationToken.None);
+        var cleared = await client.GetRawOutcomeAsync("/api/test", CancellationToken.None);
         Assert.False(cleared.Succeeded);
         Assert.Equal(ApiCredentialValidationState.NotChecked, statusTransitions[^1].State);
         Assert.Equal(3, handler.Requests.Count);
@@ -179,13 +183,13 @@ public sealed class TomestoneApiClientTests
             static _ => { },
             static _ => { });
 
-        var firstResponse = await client.GetRawAsync("/characters/Tonberry/Alpha", CancellationToken.None);
+        var firstResponse = await client.GetRawAsync("/api/characters/Tonberry/Alpha", CancellationToken.None);
 
         Assert.Null(firstResponse);
         Assert.True(client.TryGetRateLimitRemaining(out _));
         Assert.Single(handler.Requests);
 
-        var secondResponse = await client.GetRawAsync("/characters/Tonberry/Alpha", CancellationToken.None);
+        var secondResponse = await client.GetRawAsync("/api/characters/Tonberry/Alpha", CancellationToken.None);
 
         Assert.Null(secondResponse);
         Assert.Single(handler.Requests);
@@ -207,7 +211,7 @@ public sealed class TomestoneApiClientTests
             handler,
             credentialStatusChanged: (state, message) => status = (state, message));
 
-        await client.GetRawAsync("/test", CancellationToken.None);
+        await client.GetRawAsync("/api/test", CancellationToken.None);
 
         Assert.NotNull(status);
         Assert.Equal(ApiCredentialValidationState.Rejected, status.Value.State);
@@ -232,7 +236,7 @@ public sealed class TomestoneApiClientTests
             handler,
             credentialStatusChanged: (state, message) => status = (state, message));
 
-        var result = await client.GetRawAsync("/test", CancellationToken.None);
+        var result = await client.GetRawAsync("/api/test", CancellationToken.None);
 
         Assert.NotNull(result);
         Assert.True(result.ActivityHidden);
@@ -251,7 +255,7 @@ public sealed class TomestoneApiClientTests
             new RecordingHttpMessageHandler(),
             credentialStatusChanged: (state, message) => status = (state, message));
 
-        await client.GetRawAsync("/test", CancellationToken.None);
+        await client.GetRawAsync("/api/test", CancellationToken.None);
 
         Assert.NotNull(status);
         Assert.Equal(ApiCredentialValidationState.Accepted, status.Value.State);
@@ -278,14 +282,14 @@ public sealed class TomestoneApiClientTests
             warnings.Add,
             static _ => { });
 
-        var firstResponse = await client.GetRawAsync("/test", CancellationToken.None);
+        var firstResponse = await client.GetRawAsync("/api/test", CancellationToken.None);
 
         Assert.Null(firstResponse);
         Assert.True(client.TryGetRateLimitRemaining(out var remaining));
         Assert.Equal(TimeSpan.FromHours(1), remaining);
         Assert.Equal(nowUtc.AddHours(1), client.RateLimitCooldownUntilUtc);
 
-        var secondResponse = await client.GetRawAsync("/test", CancellationToken.None);
+        var secondResponse = await client.GetRawAsync("/api/test", CancellationToken.None);
 
         Assert.Null(secondResponse);
         Assert.Single(handler.Requests);
@@ -293,13 +297,13 @@ public sealed class TomestoneApiClientTests
 
         nowUtc = nowUtc.AddSeconds(59);
 
-        await client.GetRawAsync("/test", CancellationToken.None);
+        await client.GetRawAsync("/api/test", CancellationToken.None);
 
         Assert.Equal(2, warnings.Count);
 
         nowUtc = nowUtc.AddSeconds(1);
 
-        await client.GetRawAsync("/test", CancellationToken.None);
+        await client.GetRawAsync("/api/test", CancellationToken.None);
 
         Assert.Equal(3, warnings.Count);
         Assert.DoesNotContain(warnings, message => message.Contains("secret-token", StringComparison.Ordinal));
@@ -335,7 +339,7 @@ public sealed class TomestoneApiClientTests
             static _ => { },
             static _ => { });
 
-        var result = await client.GetRawAsync("/test", CancellationToken.None);
+        var result = await client.GetRawAsync("/api/test", CancellationToken.None);
 
         Assert.Null(result);
         Assert.True(client.TryGetRateLimitRemaining(out var remaining));
@@ -367,7 +371,7 @@ public sealed class TomestoneApiClientTests
             static _ => { },
             static _ => { });
 
-        var result = await client.GetRawAsync("/test", CancellationToken.None);
+        var result = await client.GetRawAsync("/api/test", CancellationToken.None);
 
         Assert.Null(result);
         Assert.True(client.TryGetRateLimitRemaining(out var remaining));
@@ -393,7 +397,7 @@ public sealed class TomestoneApiClientTests
             new Configuration { TomestoneApiKey = "secret-token" },
             handler);
 
-        var result = await client.GetRawOutcomeAsync("/test", CancellationToken.None);
+        var result = await client.GetRawOutcomeAsync("/api/test", CancellationToken.None);
 
         Assert.False(result.Succeeded);
         Assert.False(result.TransientFailure);
