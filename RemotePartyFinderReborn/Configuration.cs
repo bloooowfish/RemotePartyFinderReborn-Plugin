@@ -44,6 +44,10 @@ public class Configuration : IPluginConfiguration {
 
     [Newtonsoft.Json.JsonConverter(typeof(DpapiProtectedStringJsonConverter))]
     public string FFLogsClientSecret { get; set; } = string.Empty;
+
+    [Newtonsoft.Json.JsonConverter(typeof(DpapiProtectedStringJsonConverter))]
+    public string VerifiedFFLogsCredentialFingerprint { get; set; } = string.Empty;
+
     public bool EnableFFLogsWorker { get; set; } = true;
     public int FFLogsWorkerBaseDelayMs { get; set; } = 5000;
     public int FFLogsWorkerIdleDelayMs { get; set; } = 10000;
@@ -54,12 +58,6 @@ public class Configuration : IPluginConfiguration {
     [Newtonsoft.Json.JsonConverter(typeof(DpapiProtectedStringJsonConverter))]
     public string TomestoneApiKey { get; set; } = string.Empty;
     public bool EnableTomestoneProgressEnrichment { get; set; } = false;
-    public bool EnableTomestoneWebFallback { get; set; } = true;
-    public bool PreferTomestoneObscura { get; set; } = false;
-    public string TomestoneObscuraCdpUrl { get; set; } = string.Empty;
-
-    [Newtonsoft.Json.JsonConverter(typeof(DpapiProtectedStringJsonConverter))]
-    public string TomestoneObscuraCdpToken { get; set; } = string.Empty;
     public int TomestoneRequestIntervalMs { get; set; } = 750;
     public int TomestoneMaxConcurrency { get; set; } = 1;
 
@@ -95,6 +93,44 @@ public class Configuration : IPluginConfiguration {
 
     internal void ClearPendingSecretMigration() {
         HasPendingSecretMigration = false;
+    }
+
+    [Newtonsoft.Json.JsonIgnore]
+    internal bool HasFFLogsCredentialsConfigured
+        => !string.IsNullOrWhiteSpace(FFLogsClientId) && !string.IsNullOrWhiteSpace(FFLogsClientSecret);
+
+    [Newtonsoft.Json.JsonIgnore]
+    internal bool HasTomestoneApiKeyConfigured
+        => !string.IsNullOrWhiteSpace(TomestoneApiKey);
+
+    internal void ResetUploadBehaviorDefaults() {
+        CircuitBreakerFailureThreshold = 3;
+        CircuitBreakerBreakDurationMinutes = 1;
+        DetailUploadRetryCount = 1;
+        CharaCardResolveRetryCount = 1;
+    }
+
+    internal void ResetFFLogsWorkerTimingDefaults() {
+        FFLogsWorkerBaseDelayMs = 5000;
+        FFLogsWorkerIdleDelayMs = 10000;
+        FFLogsWorkerMaxBackoffDelayMs = 60000;
+        FFLogsWorkerJitterMs = 2000;
+    }
+
+    internal void ResetTomestoneAdvancedDefaults() {
+        TomestoneRequestIntervalMs = 750;
+        TomestoneMaxConcurrency = 1;
+    }
+
+    internal void ResetScannerDefaults() {
+        AutoDetailScanActionIntervalMs = 400;
+        AutoDetailScanDetailTimeoutMs = 3500;
+        AutoDetailScanMinDwellMs = 800;
+        AutoDetailScanPostListingCooldownMs = 300;
+        AutoDetailScanDedupTtlSeconds = 600;
+        AutoDetailScanMaxConsecutiveFailures = 5;
+        AutoDetailScanRetryCount = 1;
+        AutoDetailScanMaxPerRun = 0;
     }
 
     [System.Runtime.Serialization.OnDeserializing]

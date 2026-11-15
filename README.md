@@ -20,13 +20,11 @@ The plugin is configured to send data to a specific server endpoint. Check `Conf
 
 ### Tomestone API
 
-Tomestone official API integration is owned by the plugin. The Tomestone API key is stored locally in plugin configuration and is sent only as an `Authorization: Bearer` token to official `tomestone.gg` API requests.
+Tomestone official API integration is an optional, standalone contributor pipeline owned by the plugin. The Tomestone API key is stored locally in plugin configuration (DPAPI-protected on Windows) and is sent only as an `Authorization: Bearer` token to official `https://tomestone.gg` API requests.
 
-When Tomestone phase progress enrichment is enabled, the plugin submits additive phase progress data to the configured RPF server. The server caches submitted progress and includes it in listing snapshots; it does not proxy official Tomestone API calls.
+When the Tomestone API contributor is enabled and an API key is configured, the plugin independently leases exact-encounter jobs from `/contribute/tomestone/jobs` and submits authoritative progression results to `/contribute/tomestone/results`. Requests never happen unless the plugin is operational, the contributor option is enabled, an API key is present, the key has not been rejected, and no local rate-limit cooldown is active.
 
-Tomestone failures, missing data, 404s, malformed responses, and rate limits do not block FFLogs result upload. Tomestone `429` responses use the plugin-local Tomestone cooldown, separate from FFLogs cooldown behavior.
-
-The Tomestone web/Inertia fallback is only for FFLogs-style percentile fallback data and is unrelated to official API progression enrichment.
+Tomestone failures, missing data, 404s, malformed responses, and `429` cooldowns are completely isolated from the FFLogs contributor pipeline and never block FFLogs result uploads.
 
 ### Recommended Worker Timing Presets
 

@@ -110,9 +110,9 @@ public record UploadUrl(string Url)
         return _detailCapabilities.ShouldDeferDetailRequest(listingId, now);
     }
 
-    internal void RequireProtectedCapabilities()
+    internal void RequireProtectedCapabilities(ProtectedEndpointCapabilityKind kind)
     {
-        _protectedCapabilities.RequireProtectedCapabilities();
+        _protectedCapabilities.RequireProtectedCapabilities(kind);
     }
 
     internal void MarkDetailCapabilitiesRequired()

@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using Newtonsoft.Json.Linq;
 using RemotePartyFinderReborn.Tomestone;
 using Xunit;
 
@@ -815,6 +816,40 @@ public sealed class TomestoneProgressParserTests
 
         Assert.False(progress.Cleared);
         Assert.Single(progress.Phases);
+    }
+
+    [Fact]
+    public void ProgressParser_extracts_and_parses_progression_graph_url_and_nodes()
+    {
+        var activityContent = JObject.Parse("""
+        {
+          "activity": {
+            "progressionGraphUrl": "/character/12345/alpha-omega/activity/futures-rewritten-ultimate/graph",
+            "encounters": [
+              { "canonicalName": "futures-rewritten-ultimate", "progression": { "displayPercent": "12% P1" } }
+            ]
+          }
+        }
+        """);
+
+        var graphUrl = TomestoneProgressParser.ExtractProgressionGraphUrl(activityContent);
+        Assert.Equal("/character/12345/alpha-omega/activity/futures-rewritten-ultimate/graph", graphUrl);
+
+        var graphPayload = JObject.Parse("""
+        {
+          "data": {
+            "graph": [
+              { "phase": { "name": "P1", "number": 1 }, "bestPull": "12%" },
+              { "phase": { "name": "P3", "number": 3 }, "bestPull": "44.2%" }
+            ]
+          }
+        }
+        """);
+
+        var parsed = TomestoneProgressParser.ParseGraphProgress(graphPayload);
+        Assert.Equal(2, parsed.Phases.Count);
+        Assert.Equal("p3", parsed.Phases[1].PhaseKey);
+        Assert.Equal(44.2, parsed.Phases[1].BossPercentage);
     }
 
     private static string ReadFixture(

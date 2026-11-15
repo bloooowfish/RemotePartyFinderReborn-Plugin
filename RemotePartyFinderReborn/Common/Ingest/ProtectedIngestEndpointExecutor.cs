@@ -91,7 +91,7 @@ internal sealed class ProtectedIngestEndpointExecutor
             var isAuthFailure = response.StatusCode is HttpStatusCode.Forbidden or HttpStatusCode.Unauthorized;
             if (isAuthFailure)
             {
-                uploadUrl.RequireProtectedCapabilities();
+                uploadUrl.RequireProtectedCapabilities(capabilityKind);
                 uploadUrl.InvalidateProtectedCapability(capabilityKind);
             }
             else if (response.StatusCode != HttpStatusCode.NotFound)

@@ -20,4 +20,7 @@ internal static class IngestRoutes
     internal static readonly IngestRoute FflogsJobs = new("/contribute/fflogs/jobs");
     internal static readonly IngestRoute FflogsResults = new("/contribute/fflogs/results");
     internal static readonly IngestRoute FflogsLeasesAbandon = new("/contribute/fflogs/leases/abandon");
+    internal static readonly IngestRoute TomestoneJobs = new("/contribute/tomestone/jobs");
+    internal static readonly IngestRoute TomestoneResults = new("/contribute/tomestone/results");
+    internal static readonly IngestRoute TomestoneLeasesAbandon = new("/contribute/tomestone/leases/abandon");
 }

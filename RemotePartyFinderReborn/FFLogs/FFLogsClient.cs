@@ -133,16 +133,37 @@ public class FFLogsClient : IDisposable
         _warningLog($"FFLogs cooldown active. Skipping FFLogs query for about {minutesRemaining} minute(s).");
     }
 
+    internal async Task<OperationOutcome<bool>> VerifyCredentialsAsync(CancellationToken cancellationToken = default)
+    {
+        var outcome = await EnsureTokenAsync(
+            cancellationToken,
+            invalidatedToken: null,
+            forceRefresh: true).ConfigureAwait(false);
+        return outcome.Succeeded
+            ? OperationOutcome<bool>.Success(true)
+            : OperationOutcome<bool>.Failure(outcome.TransientFailure, outcome.ErrorMessage);
+    }
+
+    private bool AreCredentialsUnchanged(string expectedClientId, string expectedClientSecret)
+    {
+        var currentId = _configuration.FFLogsClientId?.Trim() ?? string.Empty;
+        var currentSecret = _configuration.FFLogsClientSecret?.Trim() ?? string.Empty;
+        return string.Equals(currentId, expectedClientId, StringComparison.Ordinal)
+            && string.Equals(currentSecret, expectedClientSecret, StringComparison.Ordinal);
+    }
+
     private async Task<OperationOutcome<string>> EnsureTokenAsync(
         CancellationToken cancellationToken,
-        string invalidatedToken = null)
+        string invalidatedToken = null,
+        bool forceRefresh = false)
     {
         await _tokenLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             var clientId = _configuration.FFLogsClientId?.Trim() ?? string.Empty;
             var clientSecret = _configuration.FFLogsClientSecret?.Trim() ?? string.Empty;
-            if (!string.Equals(_tokenClientId, clientId, StringComparison.Ordinal)
+            if (forceRefresh
+                || !string.Equals(_tokenClientId, clientId, StringComparison.Ordinal)
                 || !string.Equals(_tokenClientSecret, clientSecret, StringComparison.Ordinal))
             {
                 _accessToken = string.Empty;
@@ -182,6 +203,23 @@ public class FFLogsClient : IDisposable
                 request.Content = new FormUrlEncodedContent(form);
 
                 using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+                if (!AreCredentialsUnchanged(clientId, clientSecret))
+                {
+                    if ((int)response.StatusCode == 429)
+                    {
+                        ActivateRateLimitCooldown("oauth token request");
+                    }
+
+                    _accessToken = string.Empty;
+                    _tokenExpiration = DateTime.MinValue;
+                    _tokenClientId = string.Empty;
+                    _tokenClientSecret = string.Empty;
+                    ReportCredentialStatus(
+                        ApiCredentialValidationState.NotChecked,
+                        "Credentials changed; waiting for the next FFLogs request.");
+                    return OperationOutcome<string>.Failure(false, "FFLogs credentials changed during verification.");
+                }
+
                 if (!response.IsSuccessStatusCode)
                 {
                     var transientFailure = IsTransientStatusCode(response.StatusCode);
@@ -226,7 +264,17 @@ public class FFLogsClient : IDisposable
             }
             catch (Exception ex)
             {
-                ReportCredentialStatus(ApiCredentialValidationState.RequestFailed, "Could not reach FFLogs to check the credentials.");
+                if (AreCredentialsUnchanged(clientId, clientSecret))
+                {
+                    ReportCredentialStatus(ApiCredentialValidationState.RequestFailed, "Could not reach FFLogs to check the credentials.");
+                }
+                else
+                {
+                    _accessToken = string.Empty;
+                    _tokenExpiration = DateTime.MinValue;
+                    _tokenClientId = string.Empty;
+                    _tokenClientSecret = string.Empty;
+                }
                 _exceptionLog(ex, "Failed to authenticate with FFLogs.");
                 return OperationOutcome<string>.Failure(true, ex.Message);
             }

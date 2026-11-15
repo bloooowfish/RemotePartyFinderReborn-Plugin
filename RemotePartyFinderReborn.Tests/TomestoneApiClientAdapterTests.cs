@@ -217,7 +217,7 @@ public sealed class TomestoneApiClientAdapterTests
 
         Assert.True(result.Succeeded);
         var log = Assert.Single(debugLogs, entry => entry.Contains("Tomestone profile not found"));
-        Assert.Contains("fflogs zone=73, encounter=105", log);
+        Assert.Contains("zone=73, encounter=105", log);
         Assert.Contains("tomestone expansion=dawntrail, zone=aac-heavyweight-savage, encounter=lindwurm-ii", log);
         Assert.Contains("kind=BossPercentage", log);
     }
@@ -835,6 +835,205 @@ public sealed class TomestoneApiClientAdapterTests
         Assert.Equal("P4 41.13%", Assert.Single(retried.Value!.Phases).DisplayText);
     }
 
+    [Fact]
+    public async Task Service_preserves_root_activity_in_profile_cache_and_serves_savage_siblings_without_extra_http()
+    {
+        var targets = TomestoneEncounterMapping.GetProgressionTargetsForZone(73);
+        Assert.True(targets.Count >= 2);
+        var firstTarget = targets.Single(static t => t.EncounterId == 101);
+        var secondTarget = targets.Single(static t => t.EncounterId == 102);
+
+        var handler = new RecordingTomestoneHttpMessageHandler
+        {
+            OnSendAsync = (request, _) =>
+            {
+                var uri = request.RequestUri!.AbsoluteUri;
+                if (uri.Contains("/profile/", StringComparison.Ordinal))
+                {
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent("""
+                        {
+                          "gear": { "head": "bloated" },
+                          "cosmetics": [1, 2, 3],
+                          "encounters": {
+                            "savage": [
+                              {
+                                "name": "Vamp Fatale",
+                                "canonicalName": "vamp-fatale",
+                                "progression": { "displayPercent": "45.0%" }
+                              }
+                            ]
+                          },
+                          "activity": {
+                            "activities": {
+                              "activities": {
+                                "paginator": {
+                                  "data": [
+                                    {
+                                      "activity": {
+                                        "bestPercent": "18.5%",
+                                        "killsCount": 0,
+                                        "encounter": { "canonical_name": "red-hot-deep-blue" }
+                                      }
+                                    }
+                                  ]
+                                }
+                              }
+                            }
+                          }
+                        }
+                        """),
+                    });
+                }
+
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+            },
+        };
+
+        var config = EnabledConfiguration();
+        using var client = new TomestoneApiClient(config, handler);
+        var service = CreateAdapter(client, config);
+
+        var firstOutcome = await service.FetchProgressionDataAsync(
+            "Savage Raider",
+            "Tonberry",
+            73,
+            firstTarget.EncounterId,
+            CancellationToken.None);
+
+        Assert.True(firstOutcome.Succeeded);
+        Assert.Equal(45.0, firstOutcome.Value!.BossPercentage);
+        Assert.Single(handler.Requests);
+
+        var secondOutcome = await service.FetchProgressionDataAsync(
+            "Savage Raider",
+            "Tonberry",
+            73,
+            secondTarget.EncounterId,
+            CancellationToken.None);
+
+        Assert.True(secondOutcome.Succeeded);
+        Assert.Equal(18.5, secondOutcome.Value!.BossPercentage);
+        Assert.Single(handler.Requests);
+
+        var cachedSiblings = service.TryGetCachedZoneSiblingProgress(
+            "Savage Raider",
+            "Tonberry",
+            73,
+            [firstTarget.EncounterId]);
+        Assert.Contains(secondTarget.EncounterId, cachedSiblings.Keys);
+        Assert.Single(handler.Requests);
+    }
+
+    [Fact]
+    public async Task Service_follows_same_origin_progressionGraphUrl_and_rejects_cross_origin()
+    {
+        var handler = new RecordingTomestoneHttpMessageHandler
+        {
+            OnSendAsync = (request, _) =>
+            {
+                var uri = request.RequestUri!.AbsoluteUri;
+                if (uri.Contains("/profile/", StringComparison.Ordinal))
+                {
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent("""
+                        {
+                          "progressionGraphUrl": "/character/777/alpha/activity/fru/graph",
+                          "encounters": {
+                            "ultimate": [
+                              {
+                                "canonicalName": "futures-rewritten-ultimate",
+                                "progression": { "displayPercent": "10%" }
+                              }
+                            ]
+                          }
+                        }
+                        """),
+                    });
+                }
+
+                if (uri.Equals("https://tomestone.gg/character/777/alpha/activity/fru/graph", StringComparison.Ordinal))
+                {
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent("""
+                        {
+                          "data": {
+                            "graph": [
+                              { "phase": { "name": "P2", "number": 2 }, "bestPull": "42%" }
+                            ]
+                          }
+                        }
+                        """),
+                    });
+                }
+
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound));
+            },
+        };
+
+        var config = EnabledConfiguration();
+        using var client = new TomestoneApiClient(config, handler);
+        var service = CreateAdapter(client, config);
+
+        var sameOriginOutcome = await service.FetchProgressionDataAsync(
+            "Alpha",
+            "Tonberry",
+            65,
+            1079,
+            CancellationToken.None);
+
+        Assert.True(sameOriginOutcome.Succeeded);
+        var phase = Assert.Single(sameOriginOutcome.Value!.Phases);
+        Assert.Equal("p2", phase.PhaseKey);
+        Assert.Equal(42, phase.BossPercentage);
+        Assert.Contains(handler.Requests, static r => r.RequestUri!.AbsoluteUri == "https://tomestone.gg/character/777/alpha/activity/fru/graph");
+
+        var warnings = new List<string>();
+        var evilHandler = new RecordingTomestoneHttpMessageHandler
+        {
+            OnSendAsync = (request, _) =>
+            {
+                if (request.RequestUri!.AbsoluteUri.Contains("/profile/", StringComparison.Ordinal))
+                {
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent("""
+                        {
+                          "progressionGraphUrl": "https://evil.example/steal-bearer",
+                          "encounters": {
+                            "ultimate": [
+                              {
+                                "canonicalName": "futures-rewritten-ultimate",
+                                "progression": { "displayPercent": "10%" }
+                              }
+                            ]
+                          }
+                        }
+                        """),
+                    });
+                }
+
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{}") });
+            },
+        };
+        using var evilClient = new TomestoneApiClient(config, evilHandler);
+        var evilService = CreateAdapter(evilClient, config, warningLog: warnings.Add);
+
+        var crossOriginOutcome = await evilService.FetchProgressionDataAsync(
+            "Beta",
+            "Tonberry",
+            65,
+            1079,
+            CancellationToken.None);
+
+        Assert.True(crossOriginOutcome.Succeeded);
+        Assert.DoesNotContain(evilHandler.Requests, static r => r.RequestUri!.Host.Contains("evil.example", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(warnings, static w => w.Contains("cross-origin", StringComparison.OrdinalIgnoreCase));
+    }
+
     private static Configuration EnabledConfiguration() => new()
     {
         EnableTomestoneProgressEnrichment = true,
@@ -851,13 +1050,13 @@ public sealed class TomestoneApiClientAdapterTests
         """),
     };
 
-    private static FFLogsCollector.TomestoneApiClientAdapter CreateAdapter(
+    private static TomestoneProgressionService CreateAdapter(
         TomestoneApiClient client,
         Configuration configuration,
         Action<string>? debugLog = null,
         Action<string>? warningLog = null)
     {
-        return new FFLogsCollector.TomestoneApiClientAdapter(
+        return new TomestoneProgressionService(
             client,
             configuration,
             debugLog ?? (_ => { }),

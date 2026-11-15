@@ -212,6 +212,45 @@ public sealed class FFLogsClientTests
         Assert.DoesNotContain("second-secret", statuses[1].Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task VerifyCredentialsAsync_forces_fresh_oauth_request_and_reports_outcomes()
+    {
+        var oauthCount = 0;
+        var statuses = new List<(ApiCredentialValidationState State, string Message)>();
+        var handler = new RecordingHttpMessageHandler
+        {
+            OnSendAsync = (request, _) =>
+            {
+                if (request.RequestUri!.AbsoluteUri.Contains("/oauth/token", StringComparison.Ordinal))
+                {
+                    oauthCount++;
+                    return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent("{\"access_token\":\"token\",\"expires_in\":3600}"),
+                    });
+                }
+
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("{\"data\":{}}"),
+                });
+            },
+        };
+        using var client = new FFLogsClient(
+            new Configuration { FFLogsClientId = "client-id", FFLogsClientSecret = "client-secret" },
+            handler,
+            credentialStatusChanged: (state, message) => statuses.Add((state, message)));
+
+        await client.QueryAsync("query { ok }", CancellationToken.None);
+        var verifyOutcome = await client.VerifyCredentialsAsync(CancellationToken.None);
+
+        Assert.True(verifyOutcome.Succeeded);
+        Assert.True(verifyOutcome.Value);
+        Assert.Equal(2, oauthCount);
+        Assert.Equal(2, statuses.Count);
+        Assert.All(statuses, item => Assert.Equal(ApiCredentialValidationState.Accepted, item.State));
+    }
+
     private sealed class RecordingHttpMessageHandler : HttpMessageHandler
     {
         public List<HttpRequestMessage> Requests { get; } = [];

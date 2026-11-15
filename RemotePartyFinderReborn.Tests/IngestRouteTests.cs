@@ -69,6 +69,32 @@ public sealed class IngestRouteTests {
     }
 
     [Fact]
+    public void Tomestone_routes_build_expected_paths_and_signed_requests() {
+        var uploadUrl = new UploadUrl("https://upload.example/");
+        var configuration = new Configuration {
+            IngestClientId = Guid.NewGuid().ToString("N"),
+        };
+
+        Assert.True(IngestEndpointResolver.TryBuildEndpoint(uploadUrl, IngestRoutes.TomestoneJobs, out var jobsEndpoint));
+        Assert.Equal("https://upload.example/contribute/tomestone/jobs", jobsEndpoint.Url);
+        using var jobsRequest = IngestRequestFactory.CreateGetRequest(configuration, jobsEndpoint);
+        Assert.Equal("/contribute/tomestone/jobs", jobsRequest.RequestUri!.AbsolutePath);
+        Assert.True(jobsRequest.Headers.Contains("X-RPF-Signature"));
+
+        Assert.True(IngestEndpointResolver.TryBuildEndpoint(uploadUrl, IngestRoutes.TomestoneResults, out var resultsEndpoint));
+        Assert.Equal("https://upload.example/contribute/tomestone/results", resultsEndpoint.Url);
+        using var resultsRequest = IngestRequestFactory.CreatePostJsonRequest(configuration, resultsEndpoint, "[]");
+        Assert.Equal("/contribute/tomestone/results", resultsRequest.RequestUri!.AbsolutePath);
+        Assert.True(resultsRequest.Headers.Contains("X-RPF-Signature"));
+
+        Assert.True(IngestEndpointResolver.TryBuildEndpoint(uploadUrl, IngestRoutes.TomestoneLeasesAbandon, out var abandonEndpoint));
+        Assert.Equal("https://upload.example/contribute/tomestone/leases/abandon", abandonEndpoint.Url);
+        using var abandonRequest = IngestRequestFactory.CreatePostJsonRequest(configuration, abandonEndpoint, "[]");
+        Assert.Equal("/contribute/tomestone/leases/abandon", abandonRequest.RequestUri!.AbsolutePath);
+        Assert.True(abandonRequest.Headers.Contains("X-RPF-Signature"));
+    }
+
+    [Fact]
     public void Legacy_multiple_url_normalization_still_accepts_contribute_multiple_url() {
         var uploadUrl = new UploadUrl("https://upload.example/contribute/multiple");
 

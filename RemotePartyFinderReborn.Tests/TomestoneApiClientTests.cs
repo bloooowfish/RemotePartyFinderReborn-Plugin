@@ -38,16 +38,157 @@ public sealed class TomestoneApiClientTests
         Assert.Equal("secret-token", request.Headers.Authorization?.Parameter);
     }
 
-    [Fact]
-    public async Task GetRawAsync_does_not_send_authorization_when_api_key_is_blank()
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task GetRawOutcomeAsync_returns_non_transient_failure_and_sends_no_http_when_api_key_is_blank(string apiKey)
     {
         var handler = new RecordingHttpMessageHandler();
-        using var client = new TomestoneApiClient(new Configuration(), handler);
+        using var client = new TomestoneApiClient(new Configuration { TomestoneApiKey = apiKey }, handler);
 
-        await client.GetRawAsync("/test", CancellationToken.None);
+        var outcome = await client.GetRawOutcomeAsync("/test", CancellationToken.None);
 
+        Assert.False(outcome.Succeeded);
+        Assert.False(outcome.TransientFailure);
+        Assert.Equal("Tomestone API key is not configured.", outcome.ErrorMessage);
+        Assert.Empty(handler.Requests);
+    }
+
+    [Theory]
+    [InlineData("https://evil.example/api/leak")]
+    [InlineData("http://tomestone.gg/character/1/alpha/graph")]
+    [InlineData("not a valid uri ://")]
+    public async Task GetRawOutcomeAsync_refuses_off_origin_or_invalid_uri_without_sending_bearer_token(string uri)
+    {
+        var warnings = new List<string>();
+        var handler = new RecordingHttpMessageHandler();
+        using var client = new TomestoneApiClient(
+            new Configuration { TomestoneApiKey = "secret-token" },
+            handler,
+            warningLog: warnings.Add);
+
+        var outcome = await client.GetRawOutcomeAsync(uri, CancellationToken.None);
+
+        Assert.False(outcome.Succeeded);
+        Assert.False(outcome.TransientFailure);
+        Assert.Empty(handler.Requests);
+        Assert.Contains(warnings, static message => message.Contains("off-origin", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task GetRawOutcomeAsync_accepts_same_origin_tomestone_uri_and_sends_bearer_token()
+    {
+        var handler = new RecordingHttpMessageHandler
+        {
+            OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("""{"data":{"graph":[]}}"""),
+            }),
+        };
+        using var client = new TomestoneApiClient(
+            new Configuration { TomestoneApiKey = "secret-token" },
+            handler);
+
+        var outcome = await client.GetRawOutcomeAsync(
+            "https://tomestone.gg/character/123/alpha/activity/fru/graph",
+            CancellationToken.None);
+
+        Assert.True(outcome.Succeeded);
         var request = Assert.Single(handler.Requests);
-        Assert.Null(request.Headers.Authorization);
+        Assert.Equal("https://tomestone.gg/character/123/alpha/activity/fru/graph", request.RequestUri!.AbsoluteUri);
+        Assert.Equal("Bearer", request.Headers.Authorization?.Scheme);
+        Assert.Equal("secret-token", request.Headers.Authorization?.Parameter);
+    }
+
+    [Fact]
+    public async Task GetRawOutcomeAsync_resets_rejected_status_when_api_key_changes_or_clears()
+    {
+        var configuration = new Configuration { TomestoneApiKey = "rejected-key" };
+        var statusTransitions = new List<(ApiCredentialValidationState State, string Message)>();
+        var attempt = 0;
+        var handler = new RecordingHttpMessageHandler
+        {
+            OnSendAsync = (_, _) => Task.FromResult(++attempt switch
+            {
+                1 => new HttpResponseMessage(HttpStatusCode.Unauthorized) { Content = new StringContent("unauthorized") },
+                2 => new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent("{}") },
+                _ => new HttpResponseMessage(HttpStatusCode.Unauthorized) { Content = new StringContent("unauthorized") },
+            }),
+        };
+        using var client = new TomestoneApiClient(
+            configuration,
+            handler,
+            credentialStatusChanged: (state, message) => statusTransitions.Add((state, message)));
+
+        var first = await client.GetRawOutcomeAsync("/test", CancellationToken.None);
+        Assert.True(first.Succeeded);
+        Assert.Equal(HttpStatusCode.Unauthorized, first.Value!.StatusCode);
+        Assert.Equal(ApiCredentialValidationState.Rejected, statusTransitions[^1].State);
+
+        configuration.TomestoneApiKey = "new-valid-key";
+        var second = await client.GetRawOutcomeAsync("/test", CancellationToken.None);
+        Assert.True(second.Succeeded);
+        Assert.Equal(HttpStatusCode.OK, second.Value!.StatusCode);
+        Assert.Contains(statusTransitions, static item => item.State == ApiCredentialValidationState.NotChecked);
+        Assert.Equal(ApiCredentialValidationState.Accepted, statusTransitions[^1].State);
+
+        configuration.TomestoneApiKey = "another-rejected-key";
+        await client.GetRawOutcomeAsync("/test", CancellationToken.None);
+        Assert.Equal(ApiCredentialValidationState.Rejected, statusTransitions[^1].State);
+
+        configuration.TomestoneApiKey = string.Empty;
+        var cleared = await client.GetRawOutcomeAsync("/test", CancellationToken.None);
+        Assert.False(cleared.Succeeded);
+        Assert.Equal(ApiCredentialValidationState.NotChecked, statusTransitions[^1].State);
+        Assert.Equal(3, handler.Requests.Count);
+    }
+
+    [Theory]
+    [InlineData(403, "cf-mitigated", "Just a moment...")]
+    [InlineData(503, "", "<html><title>Attention Required! | Cloudflare</title></html>")]
+    [InlineData(200, "", "<html><script src=\"https://www.google.com/recaptcha/api.js\"></script><div class=\"g-recaptcha\"></div></html>")]
+    [InlineData(200, "", "<html><div class=\"hcaptcha\"></div></html>")]
+    public async Task Official_api_client_aborts_and_enters_cooldown_on_challenge_indicators(
+        int statusCode,
+        string headerName,
+        string body)
+    {
+        var nowUtc = new DateTime(2026, 5, 12, 1, 0, 0, DateTimeKind.Utc);
+        var handler = new RecordingHttpMessageHandler
+        {
+            OnSendAsync = (_, _) =>
+            {
+                var response = new HttpResponseMessage((HttpStatusCode)statusCode)
+                {
+                    Content = new StringContent(body, System.Text.Encoding.UTF8, "text/html"),
+                };
+                if (!string.IsNullOrEmpty(headerName))
+                {
+                    response.Headers.TryAddWithoutValidation(headerName, "challenge");
+                }
+
+                return Task.FromResult(response);
+            },
+        };
+
+        using var client = new TomestoneApiClient(
+            new Configuration { TomestoneApiKey = "secret-token" },
+            handler,
+            () => nowUtc,
+            static _ => { },
+            static _ => { },
+            static _ => { });
+
+        var firstResponse = await client.GetRawAsync("/characters/Tonberry/Alpha", CancellationToken.None);
+
+        Assert.Null(firstResponse);
+        Assert.True(client.TryGetRateLimitRemaining(out _));
+        Assert.Single(handler.Requests);
+
+        var secondResponse = await client.GetRawAsync("/characters/Tonberry/Alpha", CancellationToken.None);
+
+        Assert.Null(secondResponse);
+        Assert.Single(handler.Requests);
     }
 
     [Fact]

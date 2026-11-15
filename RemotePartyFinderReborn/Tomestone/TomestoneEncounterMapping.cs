@@ -9,13 +9,13 @@ public static class TomestoneEncounterMapping
     private static readonly IReadOnlyDictionary<(uint ZoneId, uint EncounterId), TomestoneEncounterParams> UltimateMappings =
         new Dictionary<(uint ZoneId, uint EncounterId), TomestoneEncounterParams>
         {
-            [(59, 1073)] = new("stormblood", "ultimates", "the-unending-coil-of-bahamut-ultimate", TargetCanonicalNames: ["the-unending-coil-of-bahamut-ultimate"], ClearsCategory: "ultimate", ActivityCategory: "ultimates"),
-            [(59, 1074)] = new("stormblood", "ultimates", "the-weapons-refrain-ultimate", TargetCanonicalNames: ["the-weapons-refrain-ultimate"], ClearsCategory: "ultimate", ActivityCategory: "ultimates"),
-            [(59, 1075)] = new("shadowbringers", "ultimates", "the-epic-of-alexander-ultimate", TargetCanonicalNames: ["the-epic-of-alexander-ultimate"], ClearsCategory: "ultimate", ActivityCategory: "ultimates"),
-            [(59, 1076)] = new("endwalker", "ultimates", "dragonsongs-reprise-ultimate", TargetCanonicalNames: ["dragonsongs-reprise-ultimate"], ClearsCategory: "ultimate", ActivityCategory: "ultimates"),
-            [(59, 1077)] = new("endwalker", "ultimates", "the-omega-protocol-ultimate", TargetCanonicalNames: ["the-omega-protocol-ultimate"], ClearsCategory: "ultimate", ActivityCategory: "ultimates"),
-            [(65, 1079)] = new("dawntrail", "ultimates", "futures-rewritten-ultimate", TargetCanonicalNames: ["futures-rewritten-ultimate"], ClearsCategory: "ultimate", ActivityCategory: "ultimates"),
-            [(76, 1085)] = new("dawntrail", "ultimates", "dancing-mad-ultimate", TargetCanonicalNames: ["dancing-mad-ultimate"], ClearsCategory: "ultimate", ActivityCategory: "ultimates"),
+            [(59, 1073)] = new("stormblood", "ultimates", "the-unending-coil-of-bahamut-ultimate", TargetCanonicalNames: ["the-unending-coil-of-bahamut-ultimate"]),
+            [(59, 1074)] = new("stormblood", "ultimates", "the-weapons-refrain-ultimate", TargetCanonicalNames: ["the-weapons-refrain-ultimate"]),
+            [(59, 1075)] = new("shadowbringers", "ultimates", "the-epic-of-alexander-ultimate", TargetCanonicalNames: ["the-epic-of-alexander-ultimate"]),
+            [(59, 1076)] = new("endwalker", "ultimates", "dragonsongs-reprise-ultimate", TargetCanonicalNames: ["dragonsongs-reprise-ultimate"]),
+            [(59, 1077)] = new("endwalker", "ultimates", "the-omega-protocol-ultimate", TargetCanonicalNames: ["the-omega-protocol-ultimate"]),
+            [(65, 1079)] = new("dawntrail", "ultimates", "futures-rewritten-ultimate", TargetCanonicalNames: ["futures-rewritten-ultimate"]),
+            [(76, 1085)] = new("dawntrail", "ultimates", "dancing-mad-ultimate", TargetCanonicalNames: ["dancing-mad-ultimate"]),
         };
 
     private static readonly IReadOnlyDictionary<(uint ZoneId, uint EncounterId), TomestoneEncounterParams> ProgressionMappings =
@@ -30,15 +30,13 @@ public static class TomestoneEncounterMapping
                 [(68, 98)] = new("dawntrail", "aac-cruiserweight-savage", "sugar-riot", TomestoneProgressKind.BossPercentage, ["sugar-riot"]),
                 [(68, 99)] = new("dawntrail", "aac-cruiserweight-savage", "brute-abombinator", TomestoneProgressKind.BossPercentage, ["brute-abombinator"]),
                 [(68, 100)] = new("dawntrail", "aac-cruiserweight-savage", "howling-blade", TomestoneProgressKind.BossPercentage, ["howling-blade"]),
-                [(72, 1084)] = new("dawntrail", "trials-extreme", "enuo", TomestoneProgressKind.BossPercentage, ["enuo", "the-unmaking-extreme"], ClearsCategory: "extreme", ActivityCategory: "trials"),
+                [(72, 1084)] = new("dawntrail", "trials-extreme", "enuo", TomestoneProgressKind.BossPercentage, ["enuo", "the-unmaking-extreme"]),
                 [(66, 2061)] = new(
                     "dawntrail",
                     "chaotic",
                     "the-cloud-of-darkness-chaotic",
                     TomestoneProgressKind.BossPercentage,
-                    ["the-cloud-of-darkness-chaotic", "cloud-of-darkness-chaotic", "the-cloud-of-darkness", "cloud-of-darkness"],
-                    ClearsCategory: "chaotic",
-                    ActivityCategory: "chaotic"),
+                    ["the-cloud-of-darkness-chaotic", "cloud-of-darkness-chaotic", "the-cloud-of-darkness", "cloud-of-darkness"]),
                 [(73, 101)] = new(
                     "dawntrail",
                     "aac-heavyweight-savage",
@@ -153,75 +151,44 @@ public static class TomestoneEncounterMapping
     }
 
     /// <summary>
-    /// Resolves Tomestone progression targets for a FFLogs <see cref="ParseJob"/> (primary and secondary encounter IDs).
+    /// Resolves the Tomestone progression targets for a <see cref="TomestoneJob"/>,
+    /// including a distinct mapped <see cref="TomestoneJob.SecondaryEncounterId"/> for split-boss fights.
     /// </summary>
-    public static IReadOnlyList<(uint ZoneId, uint EncounterId, TomestoneEncounterParams EncounterParams)> ResolveJobTargets(ParseJob job)
+    public static IReadOnlyList<(uint ZoneId, uint EncounterId, TomestoneEncounterParams EncounterParams)> ResolveJobTargets(TomestoneJob job)
     {
         ArgumentNullException.ThrowIfNull(job);
-        var resolved = new List<(uint ZoneId, uint EncounterId, TomestoneEncounterParams EncounterParams)>();
-        var seen = new HashSet<(uint ZoneId, uint EncounterId)>();
-
-        void TryAdd(uint encounterId)
+        if (job.EncounterId == 0)
         {
-            if (encounterId == 0)
-            {
-                return;
-            }
-
-            if (TryGetProgressionTarget(job.ZoneId, encounterId, out var encounterParams))
-            {
-                if (seen.Add((job.ZoneId, encounterId)))
-                {
-                    resolved.Add((job.ZoneId, encounterId, encounterParams));
-                }
-            }
-            else if (TryGetProgressionTargetByEncounterId(encounterId, out var mappedZoneId, out encounterParams))
-            {
-                if (seen.Add((mappedZoneId, encounterId)))
-                {
-                    resolved.Add((mappedZoneId, encounterId, encounterParams));
-                }
-            }
+            return Array.Empty<(uint ZoneId, uint EncounterId, TomestoneEncounterParams EncounterParams)>();
         }
 
-        TryAdd(job.EncounterId);
-        if (job.SecondaryEncounterId.HasValue)
+        var resolved = new List<(uint ZoneId, uint EncounterId, TomestoneEncounterParams EncounterParams)>(2);
+        TryAppendTarget(job.ZoneId, job.EncounterId, resolved);
+
+        if (job.SecondaryEncounterId is { } secondaryEncounterId
+            && secondaryEncounterId != 0
+            && secondaryEncounterId != job.EncounterId)
         {
-            TryAdd(job.SecondaryEncounterId.Value);
+            TryAppendTarget(job.ZoneId, secondaryEncounterId, resolved);
         }
 
         return resolved;
     }
 
-    /// <summary>
-    /// Infers the Tomestone <c>encounterCategory</c> query parameter for a <see cref="ParseJob"/>.
-    /// </summary>
-    public static string InferClearsCategory(ParseJob job)
+    private static void TryAppendTarget(
+        uint zoneId,
+        uint encounterId,
+        List<(uint ZoneId, uint EncounterId, TomestoneEncounterParams EncounterParams)> resolved)
     {
-        if (job is null)
+        if (TryGetProgressionTarget(zoneId, encounterId, out var encounterParams))
         {
-            return "savage";
+            resolved.Add((zoneId, encounterId, encounterParams));
+            return;
         }
 
-        var targets = ResolveJobTargets(job);
-        if (targets.Count > 0)
+        if (TryGetProgressionTargetByEncounterId(encounterId, out var mappedZoneId, out encounterParams))
         {
-            return targets[0].EncounterParams.EffectiveClearsCategory;
+            resolved.Add((mappedZoneId, encounterId, encounterParams));
         }
-
-        foreach (var mapping in ProgressionMappings)
-        {
-            if (mapping.Key.ZoneId == job.ZoneId)
-            {
-                return mapping.Value.EffectiveClearsCategory;
-            }
-        }
-
-        return job.DifficultyId switch
-        {
-            100 => "extreme",
-            101 => "savage",
-            _ => "savage",
-        };
     }
 }

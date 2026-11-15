@@ -39,14 +39,10 @@ public class ParseResult
     public uint ZoneId { get; set; }
     public int DifficultyId { get; set; }
     public Dictionary<int, double> Encounters { get; set; } = new();
-    public Dictionary<int, double> BossPercentages { get; set; } = new();
     public Dictionary<int, int> ClearCounts { get; set; } = new();
-    public Dictionary<int, List<PhaseProgress>> PhaseProgress { get; set; } = new();
-    public List<int> TomestoneQueriedEncounters { get; set; } = new();
     public bool IsHidden { get; set; }
     public bool IsEstimated { get; set; }
     public string MatchedServer { get; set; } = "";
-    public string SourceKind { get; set; } = "";
     public string LeaseToken { get; set; } = "";
 }
 

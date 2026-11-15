@@ -20,6 +20,7 @@ internal sealed class FFLogsBackgroundWorker
     private readonly Action<string> _warningLog;
     private readonly Action<string> _errorLog;
     private readonly Action<string> _debugLog;
+    private readonly Func<bool> _isPluginOperational;
     private UploadUrl _lastSessionUploadUrl;
 
     public FFLogsBackgroundWorker(
@@ -33,7 +34,8 @@ internal sealed class FFLogsBackgroundWorker
         Action<string> infoLog,
         Action<string> warningLog,
         Action<string> errorLog,
-        Action<string> debugLog)
+        Action<string> debugLog,
+        Func<bool> isPluginOperational = null)
     {
         _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
         _apiClient = apiClient ?? throw new ArgumentNullException(nameof(apiClient));
@@ -46,6 +48,7 @@ internal sealed class FFLogsBackgroundWorker
         _warningLog = warningLog ?? throw new ArgumentNullException(nameof(warningLog));
         _errorLog = errorLog ?? throw new ArgumentNullException(nameof(errorLog));
         _debugLog = debugLog ?? throw new ArgumentNullException(nameof(debugLog));
+        _isPluginOperational = isPluginOperational;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -83,6 +86,12 @@ internal sealed class FFLogsBackgroundWorker
     private async Task<int> RunIterationAsync(int consecutiveFailures, CancellationToken cancellationToken)
     {
         var hadTransientFailure = false;
+
+        if (_isPluginOperational != null && !_isPluginOperational())
+        {
+            await _workerPolicy.DelayAsync(_workerPolicy.WorkerBaseDelayMs, cancellationToken);
+            return 0;
+        }
 
         if (!_configuration.EnableFFLogsWorker)
         {

@@ -125,6 +125,10 @@ internal sealed class PartyDetailCollector : IDisposable {
     }
 
     private void OnUpdate(IFramework framework) {
+        if (_plugin is { IsPluginOperational: false }) {
+            return;
+        }
+
         _plugin?.PartyDetailCaptureRuntime.OnFrameworkUpdate();
         Update();
     }
@@ -217,6 +221,13 @@ internal sealed class PartyDetailCollector : IDisposable {
 
     internal DetailUploadRetryTriggerResult TriggerPendingDetailUploadNowWithState() {
         var nowUtc = _utcNow();
+        if (_plugin is { IsPluginOperational: false }) {
+            return new DetailUploadRetryTriggerResult(
+                0,
+                BuildUploadQueueDebugState(nowUtc)
+            );
+        }
+
         var triggered = _pendingDetailQueue.TriggerRetryNow(nowUtc);
 
         if (triggered > 0) {

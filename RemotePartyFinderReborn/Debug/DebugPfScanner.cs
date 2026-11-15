@@ -86,6 +86,10 @@ internal sealed class DebugPfScanner : IDisposable {
     }
 
     internal int CollectCurrentPageSnapshot() {
+        if (!_plugin.IsPluginOperational) {
+            return 0;
+        }
+
         unsafe {
             var agent = AgentLookingForGroup.Instance();
             if (agent == null) {
@@ -112,6 +116,11 @@ internal sealed class DebugPfScanner : IDisposable {
     }
 
     internal bool StartCollectedBatchRun(out string status) {
+        if (!_plugin.IsPluginOperational) {
+            status = "FFLogs API registration is required.";
+            return false;
+        }
+
         var snapshotCount = 0;
         lock (_collectionLock) {
             if (_collectedListings.Count == 0) {
@@ -140,6 +149,10 @@ internal sealed class DebugPfScanner : IDisposable {
     }
 
     internal void StartCurrentPageRun() {
+        if (!_plugin.IsPluginOperational) {
+            return;
+        }
+
         ConfigureCurrentPageRun(
             _plugin.Configuration,
             ResetSession,
@@ -181,6 +194,10 @@ internal sealed class DebugPfScanner : IDisposable {
     }
 
     private void OnListing(IPartyFinderListing listing, IPartyFinderListingEventArgs args) {
+        if (!_plugin.IsPluginOperational) {
+            return;
+        }
+
         if (listing.Id == 0) {
             return;
         }
@@ -219,11 +236,12 @@ internal sealed class DebugPfScanner : IDisposable {
         try {
 #endif
 
-        if (!Enabled) {
+        if (!Enabled || !_plugin.IsPluginOperational) {
             if (_stateMachine.State != DebugPfScanState.Idle
                 || _stateMachine.PendingCount > 0
                 || _stateMachine.ProcessedCount > 0
-                || _stateMachine.ConsecutiveFailures > 0) {
+                || _stateMachine.ConsecutiveFailures > 0
+                || _currentCaptureAttemptId != Guid.Empty) {
                 ResetSession();
             }
 

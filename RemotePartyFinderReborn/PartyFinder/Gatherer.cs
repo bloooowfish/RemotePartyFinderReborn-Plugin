@@ -62,7 +62,18 @@ internal sealed class Gatherer : IDisposable {
         return listing.ClientHighEndDuty;
     }
 
+    internal void ClearPendingBatches() {
+        lock (_batchesLock) {
+            _batches.Clear();
+        }
+    }
+
     private void OnListing(IPartyFinderListing listing, IPartyFinderListingEventArgs args) {
+        if (!_plugin.IsPluginOperational) {
+            ClearPendingBatches();
+            return;
+        }
+
         if (!UploadableListing.IsSourceClientHighEndDuty(listing)) {
             return;
         }
@@ -91,6 +102,11 @@ internal sealed class Gatherer : IDisposable {
     }
 
     private void OnUpdate(IFramework framework) {
+        if (!_plugin.IsPluginOperational) {
+            ClearPendingBatches();
+            return;
+        }
+
         if (_uploadInProgress) {
             return;
         }

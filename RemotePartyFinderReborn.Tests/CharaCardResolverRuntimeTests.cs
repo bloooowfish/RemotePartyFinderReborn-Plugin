@@ -37,6 +37,47 @@ public sealed class CharaCardResolverRuntimeTests {
     }
 
     [Fact]
+    public void Resolver_skips_enqueue_and_pump_when_not_operational() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+        database.UpsertResolvedIdentity(new CharacterIdentitySnapshot(
+            1001UL,
+            "Cached Player",
+            74,
+            "Tonberry",
+            new DateTime(2026, 4, 13, 0, 0, 0, DateTimeKind.Utc)
+        ));
+
+        var operational = false;
+        var uploadCalls = 0;
+        var runtime = new FakeCharaCardResolverRuntime();
+        using var resolver = new CharaCardResolver(
+            database,
+            runtime,
+            worldId => worldId == 79 ? "Omega" : null,
+            () => new DateTime(2026, 4, 13, 1, 0, 0, DateTimeKind.Utc),
+            uploadResolvedIdentitiesAsync: (_, _) => {
+                uploadCalls++;
+                return Task.FromResult(true);
+            },
+            isOperational: () => operational
+        );
+
+        resolver.EnqueueMany([2002UL]);
+        resolver.Pump();
+
+        Assert.Empty(runtime.RequestedContentIds);
+        Assert.Equal(ResolveState.Unknown, resolver.GetResolveState(2002UL));
+        Assert.Equal(0, uploadCalls);
+
+        operational = true;
+        resolver.EnqueueMany([2002UL]);
+        resolver.Pump();
+
+        Assert.Equal([2002UL], runtime.RequestedContentIds);
+    }
+
+    [Fact]
     public void ResolverQueue_marks_response_as_resolved() {
         using var harness = new TempPlayerCacheDatabase();
         using var database = new PlayerLocalDatabase(harness.DatabasePath);

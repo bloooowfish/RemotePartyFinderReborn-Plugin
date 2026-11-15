@@ -55,6 +55,10 @@ internal sealed class PlayerCollector : IDisposable {
     }
 
     internal void TriggerManualUploadNow() {
+        if (!_plugin.IsPluginOperational) {
+            return;
+        }
+
         if (_uploadInProgress) {
             Plugin.Log.Warning($"PlayerCollector: Manual upload requested while upload is already in progress. Pending={PendingCount}");
             return;
@@ -66,6 +70,10 @@ internal sealed class PlayerCollector : IDisposable {
     }
 
     internal int TriggerManualFullResyncUploadNow() {
+        if (!_plugin.IsPluginOperational) {
+            return 0;
+        }
+
         var requeued = _database.MarkAllPlayersDirty();
         Plugin.Log.Information($"PlayerCollector: Manual full player-cache resync requested. Requeued={requeued} Pending={PendingCount}");
         _ = Task.Run(RefreshPendingCount);
@@ -74,6 +82,10 @@ internal sealed class PlayerCollector : IDisposable {
     }
 
     private void OnUpdate(IFramework framework) {
+        if (!_plugin.IsPluginOperational) {
+            return;
+        }
+
         if (_scanTimer.Elapsed < TimeSpan.FromSeconds(ScanIntervalSeconds)) {
             return;
         }

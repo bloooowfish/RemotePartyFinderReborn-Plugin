@@ -18,19 +18,41 @@ public sealed class TomestoneConfigurationTests
         var configuration = new Configuration();
 
         Assert.Equal(string.Empty, configuration.TomestoneApiKey);
+        Assert.False(configuration.HasTomestoneApiKeyConfigured);
         Assert.False(configuration.EnableTomestoneProgressEnrichment);
-        Assert.True(configuration.EnableTomestoneWebFallback);
-        Assert.False(configuration.PreferTomestoneObscura);
-        Assert.Equal(string.Empty, configuration.TomestoneObscuraCdpUrl);
-        Assert.Equal(string.Empty, configuration.TomestoneObscuraCdpToken);
         Assert.Equal(750, configuration.TomestoneRequestIntervalMs);
         Assert.Equal(1, configuration.TomestoneMaxConcurrency);
 
-        var tokenProp = typeof(Configuration).GetProperty(nameof(Configuration.TomestoneObscuraCdpToken));
-        Assert.NotNull(tokenProp);
-        var converterAttr = tokenProp!.GetCustomAttributes<JsonConverterAttribute>().SingleOrDefault();
+        var apiKeyProp = typeof(Configuration).GetProperty(nameof(Configuration.TomestoneApiKey));
+        Assert.NotNull(apiKeyProp);
+        var converterAttr = apiKeyProp!.GetCustomAttributes<JsonConverterAttribute>().SingleOrDefault();
         Assert.NotNull(converterAttr);
         Assert.Equal(typeof(DpapiProtectedStringJsonConverter), converterAttr!.ConverterType);
+    }
+
+    [Theory]
+    [InlineData("", false)]
+    [InlineData("   ", false)]
+    [InlineData("token-123", true)]
+    public void HasTomestoneApiKeyConfigured_checks_non_whitespace_key(string apiKey, bool expected)
+    {
+        var configuration = new Configuration { TomestoneApiKey = apiKey };
+        Assert.Equal(expected, configuration.HasTomestoneApiKeyConfigured);
+    }
+
+    [Fact]
+    public void ResetTomestoneAdvancedDefaults_restores_pacing_defaults()
+    {
+        var configuration = new Configuration
+        {
+            TomestoneRequestIntervalMs = 2500,
+            TomestoneMaxConcurrency = 3,
+        };
+
+        configuration.ResetTomestoneAdvancedDefaults();
+
+        Assert.Equal(750, configuration.TomestoneRequestIntervalMs);
+        Assert.Equal(1, configuration.TomestoneMaxConcurrency);
     }
 
     [Theory]

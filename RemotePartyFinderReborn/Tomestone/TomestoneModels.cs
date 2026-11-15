@@ -33,55 +33,10 @@ public sealed record TomestoneEncounterParams(
     string Category,
     string Encounter,
     TomestoneProgressKind ProgressKind = TomestoneProgressKind.PhaseProgress,
-    IReadOnlyList<string> TargetCanonicalNames = null,
-    string ClearsCategory = null,
-    string ActivityCategory = null)
-{
-    /// <summary>
-    /// Category query parameter used by Tomestone web <c>/clears?encounterCategory=...</c>.
-    /// </summary>
-    public string EffectiveClearsCategory => !string.IsNullOrWhiteSpace(ClearsCategory)
-        ? ClearsCategory
-        : Category switch
-        {
-            "ultimates" => "ultimate",
-            "trials-extreme" => "extreme",
-            "chaotic" => "chaotic",
-            _ => "savage",
-        };
-
-    /// <summary>
-    /// Category query parameter used by Tomestone web <c>/activity?category=...</c>.
-    /// </summary>
-    public string EffectiveActivityCategory => !string.IsNullOrWhiteSpace(ActivityCategory)
-        ? ActivityCategory
-        : Category switch
-        {
-            "ultimates" => "ultimates",
-            "trials-extreme" => "trials",
-            "chaotic" => "chaotic",
-            _ => "raids",
-        };
-}
-
-public sealed record TomestoneClearsRankingsOutcome(
-    IReadOnlyDictionary<int, double> Encounters,
-    IReadOnlyDictionary<int, int> ClearCounts,
-    int RequestedEntryCount,
-    IReadOnlyList<int> SeenEncounters,
-    bool HasRankingsSection)
-{
-    public static TomestoneClearsRankingsOutcome Empty { get; } = new(
-        new Dictionary<int, double>(),
-        new Dictionary<int, int>(),
-        0,
-        [],
-        false);
-}
+    IReadOnlyList<string> TargetCanonicalNames = null);
 
 public enum TomestoneChallengeKind
 {
-    Http403,
     Http429,
     CfMitigatedHeader,
     CloudflareJustAMoment,
@@ -94,14 +49,3 @@ public sealed record TomestoneChallengeInfo(
     TomestoneChallengeKind Kind,
     string Label,
     TimeSpan? RetryAfter = null);
-
-public sealed class TomestoneChallengeException : Exception
-{
-    public TomestoneChallengeException(TomestoneChallengeInfo challenge, string message)
-        : base(message)
-    {
-        Challenge = challenge;
-    }
-
-    public TomestoneChallengeInfo Challenge { get; }
-}

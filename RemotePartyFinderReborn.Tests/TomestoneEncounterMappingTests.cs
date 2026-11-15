@@ -112,4 +112,80 @@ public sealed class TomestoneEncounterMappingTests
         Assert.False(TomestoneEncounterMapping.TryGetProgressionTarget(999, 9999, out var unknown));
         Assert.Null(unknown);
     }
+
+    [Fact]
+    public void ResolveJobTargets_handles_exact_match_encounter_fallback_zero_and_unmapped()
+    {
+        var exactTargets = TomestoneEncounterMapping.ResolveJobTargets(new TomestoneJob
+        {
+            ZoneId = 73,
+            EncounterId = 101,
+        });
+        var exact = Assert.Single(exactTargets);
+        Assert.Equal(73u, exact.ZoneId);
+        Assert.Equal(101u, exact.EncounterId);
+        Assert.Equal("aac-heavyweight-savage", exact.EncounterParams.Category);
+        Assert.Equal("vamp-fatale", exact.EncounterParams.Encounter);
+
+        var zoneFallbackTargets = TomestoneEncounterMapping.ResolveJobTargets(new TomestoneJob
+        {
+            ZoneId = 0,
+            EncounterId = 1079,
+        });
+        var fallback = Assert.Single(zoneFallbackTargets);
+        Assert.Equal(65u, fallback.ZoneId);
+        Assert.Equal(1079u, fallback.EncounterId);
+
+        Assert.Empty(TomestoneEncounterMapping.ResolveJobTargets(new TomestoneJob
+        {
+            ZoneId = 73,
+            EncounterId = 0,
+        }));
+        Assert.Empty(TomestoneEncounterMapping.ResolveJobTargets(new TomestoneJob
+        {
+            ZoneId = 999,
+            EncounterId = 9999,
+        }));
+    }
+
+    [Fact]
+    public void ResolveJobTargets_resolves_split_boss_secondary_encounter_in_order_and_deduplicates()
+    {
+        var splitBossTargets = TomestoneEncounterMapping.ResolveJobTargets(new TomestoneJob
+        {
+            ZoneId = 73,
+            EncounterId = 104,
+            SecondaryEncounterId = 105,
+        });
+        Assert.Equal(2, splitBossTargets.Count);
+        Assert.Equal(104u, splitBossTargets[0].EncounterId);
+        Assert.Equal("lindwurm", splitBossTargets[0].EncounterParams.Encounter);
+        Assert.Equal(105u, splitBossTargets[1].EncounterId);
+        Assert.Equal("lindwurm-ii", splitBossTargets[1].EncounterParams.Encounter);
+
+        var deduplicated = TomestoneEncounterMapping.ResolveJobTargets(new TomestoneJob
+        {
+            ZoneId = 73,
+            EncounterId = 104,
+            SecondaryEncounterId = 104,
+        });
+        Assert.Equal(104u, Assert.Single(deduplicated).EncounterId);
+
+        var primaryWithUnmappedSecondary = TomestoneEncounterMapping.ResolveJobTargets(new TomestoneJob
+        {
+            ZoneId = 73,
+            EncounterId = 104,
+            SecondaryEncounterId = 9999,
+        });
+        Assert.Equal(104u, Assert.Single(primaryWithUnmappedSecondary).EncounterId);
+
+        var fallbackBoth = TomestoneEncounterMapping.ResolveJobTargets(new TomestoneJob
+        {
+            ZoneId = 0,
+            EncounterId = 104,
+            SecondaryEncounterId = 105,
+        });
+        Assert.Equal(2, fallbackBoth.Count);
+        Assert.All(fallbackBoth, t => Assert.Equal(73u, t.ZoneId));
+    }
 }

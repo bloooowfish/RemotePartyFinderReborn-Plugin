@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
 using Dalamud.IoC;
 using Dalamud.Game.Command;
 using Dalamud.Interface.Windowing;
@@ -72,9 +74,18 @@ public class Plugin : IDalamudPlugin {
     private IDisposable PartyDetailGameLogSuppressionRuntime { get; }
     internal DebugPfScanner DebugPfScanner { get; }
     internal ApiCredentialStatusStore ApiCredentialStatus { get; } = new();
+    internal FFLogsActivationGate ActivationGate { get; }
     private FFLogsCollector FFLogsCollector { get; }
     internal TomestoneApiClient TomestoneApiClient { get; }
+    private TomestoneCollector TomestoneCollector { get; }
 
+    internal bool IsPluginOperational => this.ActivationGate.GetSnapshot().IsOperational;
+    internal bool IsTomestoneWorkerEligible
+        => this.IsPluginOperational
+           && this.Configuration.EnableTomestoneProgressEnrichment
+           && this.Configuration.HasTomestoneApiKeyConfigured
+           && this.ApiCredentialStatus.Tomestone.State != ApiCredentialValidationState.Rejected
+           && !this.TomestoneApiClient.TryGetRateLimitRemaining(out _);
     internal int PendingPlayerUploadCount => this.PlayerCollector.PendingCount;
     internal int PendingDetailUploadCount => this.PartyDetailCollector.PendingQueueCount;
     internal DetailUploadQueueDebugState DetailUploadQueueDebugState => this.PartyDetailCollector.GetUploadQueueDebugState();
@@ -82,16 +93,30 @@ public class Plugin : IDalamudPlugin {
     internal DateTime FFLogsRateLimitCooldownUntilUtc => this.FFLogsCollector.RateLimitCooldownUntilUtc;
     internal DateTime TomestoneRateLimitCooldownUntilUtc => this.TomestoneApiClient.RateLimitCooldownUntilUtc;
 
+    private readonly CancellationTokenSource _shutdownCts = new();
     private readonly Stack<Action> _cleanupActions = new();
     private bool _disposed;
 
     public Plugin() {
         try {
             Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
+            var shouldSaveConfiguration = Configuration.HasPendingSecretMigration;
             if (Configuration.HasPendingSecretMigration) {
-                Configuration.Save();
                 Configuration.ClearPendingSecretMigration();
             }
+
+            if (!Configuration.EnableFFLogsWorker) {
+                Configuration.EnableFFLogsWorker = true;
+                shouldSaveConfiguration = true;
+            }
+
+            if (shouldSaveConfiguration) {
+                Configuration.Save();
+            }
+
+            _cleanupActions.Push(() => _shutdownCts.Dispose());
+            this.ActivationGate = new FFLogsActivationGate(Configuration, ApiCredentialStatus, Configuration.Save);
+            _cleanupActions.Push(() => this.ActivationGate.Dispose());
 
             this.Gatherer = new Gatherer(this);
             _cleanupActions.Push(() => this.Gatherer.Dispose());
@@ -113,7 +138,8 @@ public class Plugin : IDalamudPlugin {
                     this.ToastGui,
                     message => Log.Warning(message),
                     message => Log.Debug(message)),
-                gameInteropProvider: this.GameInteropProvider
+                gameInteropProvider: this.GameInteropProvider,
+                isOperational: () => this.IsPluginOperational
             );
             _cleanupActions.Push(() => this.CharaCardResolver.Dispose());
 
@@ -142,8 +168,12 @@ public class Plugin : IDalamudPlugin {
             this.TomestoneApiClient = new TomestoneApiClient(this.Configuration, this.ApiCredentialStatus.ReportTomestone);
             _cleanupActions.Push(() => this.TomestoneApiClient.Dispose());
 
+            this.TomestoneCollector = new TomestoneCollector(this);
+            _cleanupActions.Push(() => this.TomestoneCollector.Dispose());
+
             this.FFLogsCollector = new FFLogsCollector(this);
             _cleanupActions.Push(() => this.FFLogsCollector.Dispose());
+            _cleanupActions.Push(() => _shutdownCts.Cancel());
 
             ValidateGameLogMessageCatalog();
 
@@ -161,6 +191,12 @@ public class Plugin : IDalamudPlugin {
                 HelpMessage = "Open config UI. Args: players-upload, players-resync, details-upload"
             });
             _cleanupActions.Push(() => CommandManager.RemoveHandler("/rpr"));
+
+            if (!Configuration.HasFFLogsCredentialsConfigured) {
+                ConfigWindow.IsOpen = true;
+            } else {
+                _ = VerifyFFLogsCredentialsAsync();
+            }
         } catch {
             RunCleanupActions();
             throw;
@@ -194,21 +230,64 @@ public class Plugin : IDalamudPlugin {
     private void OnCommand(string command, string args) {
         var normalizedArgs = (args ?? string.Empty).Trim().ToLowerInvariant();
         if (normalizedArgs == "players-upload") {
+            if (!IsPluginOperational) {
+                NotifyLockedAndOpenSettings();
+                return;
+            }
+
             TriggerPlayerUploadNow();
             return;
         }
 
         if (normalizedArgs == "players-resync") {
+            if (!IsPluginOperational) {
+                NotifyLockedAndOpenSettings();
+                return;
+            }
+
             _ = TriggerPlayerFullResyncUploadNow();
             return;
         }
 
         if (normalizedArgs == "details-upload") {
+            if (!IsPluginOperational) {
+                NotifyLockedAndOpenSettings();
+                return;
+            }
+
             _ = TriggerPendingDetailUploadNow();
             return;
         }
 
         ToggleConfigUI();
+    }
+
+    private void NotifyLockedAndOpenSettings() {
+        ChatGui.PrintError("[Remote Party Finder Reborn] Plugin is locked. Register valid FFLogs v2 API credentials first (/rpr).");
+        ConfigWindow.IsOpen = true;
+    }
+
+    internal async Task<OperationOutcome<bool>> VerifyFFLogsCredentialsAsync(CancellationToken cancellationToken = default) {
+        if (_disposed) {
+            return OperationOutcome<bool>.Failure(false, "Plugin is shutting down.");
+        }
+
+        CancellationTokenSource linkedCts;
+        try {
+            linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdownCts.Token);
+        } catch (ObjectDisposedException) {
+            return OperationOutcome<bool>.Failure(false, "Plugin is shutting down.");
+        }
+
+        using (linkedCts) {
+            try {
+                return await ActivationGate.VerifyAsync(
+                    ct => FFLogsCollector.VerifyCredentialsAsync(ct),
+                    linkedCts.Token).ConfigureAwait(false);
+            } catch (OperationCanceledException) when (_shutdownCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested) {
+                return OperationOutcome<bool>.Failure(false, "Plugin is shutting down.");
+            }
+        }
     }
 
     internal void TriggerPlayerUploadNow() {
@@ -267,7 +346,8 @@ public class Plugin : IDalamudPlugin {
                                  captureState,
                                  plugin.GameInteropProvider,
                                  warningSink,
-                                 ScannerHeadlessBackendKind.NativeSuppression
+                                 ScannerHeadlessBackendKind.NativeSuppression,
+                                 isCaptureEnabled: plugin is null ? null : () => plugin.IsPluginOperational
                              );
         var collector = collectorFactory?.Invoke(captureState)
                         ?? new PartyDetailCollector(

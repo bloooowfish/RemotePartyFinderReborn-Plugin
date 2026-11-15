@@ -39,6 +39,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     private readonly PartyDetailCaptureState _state;
     private readonly object _gate = new();
     private readonly ScannerHeadlessBackendKind _scannerHeadlessBackendKind;
+    private readonly Func<bool> _isCaptureEnabled;
     private readonly PartyDetailRequestCoordinator _requestCoordinator;
     private IDisposable? _hookScope;
     private long _postRequestPopulationGeneration;
@@ -51,10 +52,12 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
     internal PartyDetailCaptureRuntime(
         PartyDetailCaptureState state,
-        ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled
+        ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled,
+        Func<bool>? isCaptureEnabled = null
     ) {
         _state = state ?? throw new ArgumentNullException(nameof(state));
         _scannerHeadlessBackendKind = scannerHeadlessBackendKind;
+        _isCaptureEnabled = isCaptureEnabled ?? (static () => true);
         _requestCoordinator = new PartyDetailRequestCoordinator(scannerHeadlessBackendKind);
     }
 
@@ -62,16 +65,18 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         PartyDetailCaptureState state,
         IGameInteropProvider interopProvider,
         Action<string>? warningSink = null,
-        ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled
-    ) : this(state, new DalamudPartyDetailCaptureHookFactory(interopProvider), warningSink, scannerHeadlessBackendKind) {
+        ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled,
+        Func<bool>? isCaptureEnabled = null
+    ) : this(state, new DalamudPartyDetailCaptureHookFactory(interopProvider), warningSink, scannerHeadlessBackendKind, isCaptureEnabled) {
     }
 
     private PartyDetailCaptureRuntime(
         PartyDetailCaptureState state,
         IPartyDetailCaptureHookFactory hookFactory,
         Action<string>? warningSink = null,
-        ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled
-    ) : this(state, scannerHeadlessBackendKind) {
+        ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled,
+        Func<bool>? isCaptureEnabled = null
+    ) : this(state, scannerHeadlessBackendKind, isCaptureEnabled) {
         ArgumentNullException.ThrowIfNull(hookFactory);
 
         try {
@@ -89,18 +94,20 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
     internal static PartyDetailCaptureRuntime CreateForTesting(
         PartyDetailCaptureState state,
-        ScannerHeadlessBackendKind scannerHeadlessBackendKind
+        ScannerHeadlessBackendKind scannerHeadlessBackendKind,
+        Func<bool>? isCaptureEnabled = null
     ) {
-        return new PartyDetailCaptureRuntime(state, scannerHeadlessBackendKind);
+        return new PartyDetailCaptureRuntime(state, scannerHeadlessBackendKind, isCaptureEnabled);
     }
 
     internal static PartyDetailCaptureRuntime CreateForTesting(
         PartyDetailCaptureState state,
         IPartyDetailCaptureHookFactory hookFactory,
         Action<string>? warningSink = null,
-        ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled
+        ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled,
+        Func<bool>? isCaptureEnabled = null
     ) {
-        return new PartyDetailCaptureRuntime(state, hookFactory, warningSink, scannerHeadlessBackendKind);
+        return new PartyDetailCaptureRuntime(state, hookFactory, warningSink, scannerHeadlessBackendKind, isCaptureEnabled);
     }
 
     internal static IDisposable CreateHookScope<TPrimaryHook, TSecondaryHook>(
@@ -229,6 +236,10 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     }
 
     internal bool ShouldSuppressScannerGameLog(uint logMessageId) {
+        if (!_isCaptureEnabled()) {
+            return false;
+        }
+
         return _requestCoordinator.ShouldSuppressScannerGameLog(_state, logMessageId);
     }
 
@@ -271,6 +282,10 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     }
 
     private bool OpenListingDetour(nint agent, ulong listingId) {
+        if (!_isCaptureEnabled()) {
+            return true;
+        }
+
         try {
             EnsureRequestCycleForIntercept(listingId, 0UL);
         } catch (Exception ex) {
@@ -281,6 +296,10 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     }
 
     private bool OpenListingByContentIdDetour(nint agent, ulong contentId) {
+        if (!_isCaptureEnabled()) {
+            return true;
+        }
+
         try {
             EnsureRequestCycleForIntercept(0UL, contentId);
         } catch (Exception ex) {
@@ -293,6 +312,10 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     private void PopulateListingDataDetour(nint agent, nint listingData) {
         _ = agent;
         _ = listingData;
+        if (!_isCaptureEnabled()) {
+            return;
+        }
+
         try {
             RaisePostRequestPopulationSignal();
         } catch (Exception ex) {
@@ -317,6 +340,10 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         _ = unk;
         _ = addonRowId;
         _ = openFlags;
+        if (!_isCaptureEnabled()) {
+            return true;
+        }
+
         try {
             var suppress = _requestCoordinator.ShouldSuppressScannerPfDetailOpen(_state, addonId);
             EnsureManualCycleForDetailOpen(addonId, suppress);
@@ -373,7 +400,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     }
 
     private void ObserveFrameworkTick(UploadablePartyDetail? snapshot, PartyDetailDebugSnapshot? debugSnapshot) {
-        if (!_state.HasActiveRequest) {
+        if (!_isCaptureEnabled() || !_state.HasActiveRequest) {
             return;
         }
 
@@ -393,6 +420,10 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     private void OnFrameworkUpdate(
         Func<(UploadablePartyDetail? Snapshot, PartyDetailDebugSnapshot? DebugSnapshot)> snapshotFactory
     ) {
+        if (!_isCaptureEnabled()) {
+            return;
+        }
+
         // Snapshot construction reads native agent state and allocates several
         // per-member collections. Skip it unless this request is currently
         // eligible to accept a post-population snapshot.

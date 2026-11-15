@@ -2,15 +2,13 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
-using System.Net;
 using System.Text;
-using System.Text.RegularExpressions;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
 namespace RemotePartyFinderReborn.Tomestone;
 
-public static partial class TomestoneProgressParser
+public static class TomestoneProgressParser
 {
     private static readonly string[] PercentFields =
     [
@@ -1440,158 +1438,6 @@ public static partial class TomestoneProgressParser
 
         return null;
     }
-
-    public static string ExtractDataPageJsonFromHtml(string html)
-    {
-        if (string.IsNullOrWhiteSpace(html))
-        {
-            return null;
-        }
-
-        foreach (Match divMatch in AppDivTagRegex().Matches(html))
-        {
-            var tag = divMatch.Value;
-            if (!AppIdAttributeRegex().IsMatch(tag))
-            {
-                continue;
-            }
-
-            var dataPageMatch = DataPageAttributeRegex().Match(tag);
-            if (!dataPageMatch.Success)
-            {
-                continue;
-            }
-
-            var rawValue = dataPageMatch.Groups["dq"].Success
-                ? dataPageMatch.Groups["dq"].Value
-                : dataPageMatch.Groups["sq"].Value;
-            var decoded = WebUtility.HtmlDecode(rawValue)?.Trim();
-            if (!string.IsNullOrEmpty(decoded) && decoded.StartsWith('{'))
-            {
-                return decoded;
-            }
-        }
-
-        return null;
-    }
-
-    public static bool LooksLikeUnhydratedSpaShell(string html)
-    {
-        if (string.IsNullOrWhiteSpace(html))
-        {
-            return false;
-        }
-
-        if (TomestoneChallengeDetector.DetectTextChallenge(html) is not null)
-        {
-            return false;
-        }
-
-        var looksLikeHtml = html.Contains("<html", StringComparison.OrdinalIgnoreCase)
-            || html.Contains("<!doctype", StringComparison.OrdinalIgnoreCase);
-        return looksLikeHtml && ExtractDataPageJsonFromHtml(html) is null;
-    }
-
-    public static string ExtractInertiaVersion(string input)
-    {
-        if (string.IsNullOrWhiteSpace(input))
-        {
-            return null;
-        }
-
-        var dataPageJson = ExtractDataPageJsonFromHtml(input);
-        if (!string.IsNullOrEmpty(dataPageJson))
-        {
-            try
-            {
-                var token = JToken.Parse(dataPageJson);
-                if (token["version"]?.Value<string>() is { Length: > 0 } dataPageVersion)
-                {
-                    return dataPageVersion;
-                }
-            }
-            catch (JsonException)
-            {
-            }
-        }
-
-        var trimmed = input.TrimStart();
-        if (trimmed.StartsWith('{'))
-        {
-            try
-            {
-                var token = JToken.Parse(trimmed);
-                if (token["version"]?.Value<string>() is { Length: > 0 } jsonVersion)
-                {
-                    return jsonVersion;
-                }
-            }
-            catch (JsonException)
-            {
-            }
-        }
-
-        var match = JsonVersionRegex().Match(input);
-        if (match.Success && match.Groups[1].Value.Length > 0)
-        {
-            return match.Groups[1].Value;
-        }
-
-        var encodedMatch = HtmlEncodedVersionRegex().Match(input);
-        return encodedMatch.Success && encodedMatch.Groups[1].Value.Length > 0
-            ? encodedMatch.Groups[1].Value
-            : null;
-    }
-
-    public static JToken UnwrapCharacterPageContent(string payloadJson)
-    {
-        if (string.IsNullOrWhiteSpace(payloadJson))
-        {
-            throw new JsonReaderException("Empty Tomestone JSON payload.");
-        }
-
-        return UnwrapCharacterPageContent(JToken.Parse(payloadJson));
-    }
-
-    public static JToken UnwrapCharacterPageContent(JToken parsed)
-    {
-        if (parsed is null)
-        {
-            return new JObject();
-        }
-
-        if (parsed["props"]?["characterPageContent"] is { Type: not JTokenType.Null and not JTokenType.Undefined } pageContent)
-        {
-            return pageContent;
-        }
-
-        if (parsed is JObject obj && (obj.ContainsKey("encounters") || obj.ContainsKey("activity")))
-        {
-            return parsed;
-        }
-
-        if (parsed["data"] is { Type: not JTokenType.Null and not JTokenType.Undefined } dataContent)
-        {
-            return dataContent;
-        }
-
-        return parsed;
-    }
-
-    [GeneratedRegex(@"<div\b[^>]*>", RegexOptions.IgnoreCase | RegexOptions.Singleline)]
-    private static partial Regex AppDivTagRegex();
-
-    [GeneratedRegex(@"\bid\s*=\s*(?:""app""|'app'|app(?:\s|>))", RegexOptions.IgnoreCase | RegexOptions.Singleline)]
-    private static partial Regex AppIdAttributeRegex();
-
-    [GeneratedRegex(@"\bdata-page\s*=\s*(?:""(?<dq>[^""]*)""|'(?<sq>[^']*)')", RegexOptions.IgnoreCase | RegexOptions.Singleline)]
-    private static partial Regex DataPageAttributeRegex();
-
-    [GeneratedRegex(@"""version""\s*:\s*""([^""]+)""", RegexOptions.Singleline)]
-    private static partial Regex JsonVersionRegex();
-
-    [GeneratedRegex(@"&quot;version&quot;\s*:\s*&quot;([^&]+)&quot;", RegexOptions.Singleline)]
-    private static partial Regex HtmlEncodedVersionRegex();
 
     private sealed record ParsedPhase(
         string PhaseKey,

@@ -137,7 +137,7 @@ public sealed class FFLogsJobLeaseClientTests
         var seams = FFLogsCollector.CreateSeams(sender, new StubFFLogsApiClient(), timeProvider);
         var leaseClient = new FFLogsJobLeaseClient(seams);
         var uploadUrl = new UploadUrl("https://secure.example/");
-        uploadUrl.RequireProtectedCapabilities();
+        uploadUrl.RequireProtectedCapabilities(ProtectedEndpointCapabilityKind.FflogsJobs);
         var configuration = new Configuration
         {
             IngestClientId = Guid.NewGuid().ToString("N"),

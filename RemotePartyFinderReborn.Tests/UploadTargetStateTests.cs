@@ -59,6 +59,53 @@ public sealed class UploadTargetStateTests {
     }
 
     [Fact]
+    public void Capability_families_are_isolated_between_fflogs_and_tomestone() {
+        var now = new DateTimeOffset(2026, 5, 10, 0, 20, 0, TimeSpan.Zero);
+        var uploadUrl = new UploadUrl("https://upload.example");
+        uploadUrl.ApplyIngestCapabilities(
+            new ProtectedEndpointCapabilities {
+                FflogsJobs = new ProtectedEndpointCapabilityGrant {
+                    Token = "fflogs-jobs",
+                    ExpiresAt = now.AddMinutes(5).ToUnixTimeSeconds(),
+                },
+                FflogsResults = new ProtectedEndpointCapabilityGrant {
+                    Token = "fflogs-results",
+                    ExpiresAt = now.AddMinutes(5).ToUnixTimeSeconds(),
+                },
+                FflogsLeasesAbandon = new ProtectedEndpointCapabilityGrant {
+                    Token = "fflogs-abandon",
+                    ExpiresAt = now.AddMinutes(5).ToUnixTimeSeconds(),
+                },
+            },
+            null,
+            now);
+
+        Assert.False(uploadUrl.ShouldDeferProtectedRequest(ProtectedEndpointCapabilityKind.TomestoneJobs, now));
+        Assert.False(uploadUrl.ShouldDeferProtectedRequest(ProtectedEndpointCapabilityKind.TomestoneResults, now));
+        Assert.False(uploadUrl.ShouldDeferProtectedRequest(ProtectedEndpointCapabilityKind.TomestoneLeasesAbandon, now));
+
+        uploadUrl.RequireProtectedCapabilities(ProtectedEndpointCapabilityKind.TomestoneJobs);
+        Assert.True(uploadUrl.ShouldDeferProtectedRequest(ProtectedEndpointCapabilityKind.TomestoneJobs, now));
+        Assert.False(uploadUrl.ShouldDeferProtectedRequest(ProtectedEndpointCapabilityKind.FflogsJobs, now));
+
+        var tomestoneOnlyUrl = new UploadUrl("https://tomestone-only.example");
+        tomestoneOnlyUrl.ApplyIngestCapabilities(
+            new ProtectedEndpointCapabilities {
+                TomestoneJobs = new ProtectedEndpointCapabilityGrant {
+                    Token = "ts-jobs",
+                    ExpiresAt = now.AddMinutes(5).ToUnixTimeSeconds(),
+                },
+            },
+            null,
+            now);
+
+        Assert.False(tomestoneOnlyUrl.ShouldDeferProtectedRequest(ProtectedEndpointCapabilityKind.FflogsJobs, now));
+        Assert.True(tomestoneOnlyUrl.ShouldDeferProtectedRequest(ProtectedEndpointCapabilityKind.TomestoneResults, now));
+        Assert.True(tomestoneOnlyUrl.TryGetProtectedCapability(ProtectedEndpointCapabilityKind.TomestoneJobs, out var tsToken, now));
+        Assert.Equal("ts-jobs", tsToken);
+    }
+
+    [Fact]
     public void Detail_capability_expires_and_defers_after_prune() {
         var now = new DateTimeOffset(2026, 5, 10, 0, 30, 0, TimeSpan.Zero);
         var uploadUrl = new UploadUrl("https://upload.example");

@@ -10,6 +10,9 @@ internal enum ProtectedEndpointCapabilityKind
     FflogsJobs,
     FflogsResults,
     FflogsLeasesAbandon,
+    TomestoneJobs,
+    TomestoneResults,
+    TomestoneLeasesAbandon,
 }
 
 [Serializable]
@@ -27,6 +30,9 @@ internal sealed class ProtectedEndpointCapabilities
     public ProtectedEndpointCapabilityGrant FflogsJobs { get; set; } = new();
     public ProtectedEndpointCapabilityGrant FflogsResults { get; set; } = new();
     public ProtectedEndpointCapabilityGrant FflogsLeasesAbandon { get; set; } = new();
+    public ProtectedEndpointCapabilityGrant TomestoneJobs { get; set; } = new();
+    public ProtectedEndpointCapabilityGrant TomestoneResults { get; set; } = new();
+    public ProtectedEndpointCapabilityGrant TomestoneLeasesAbandon { get; set; } = new();
 }
 
 [Serializable]

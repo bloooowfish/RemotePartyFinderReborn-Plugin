@@ -389,6 +389,58 @@ public sealed class FFLogsBackgroundWorkerTests
         Assert.Equal(DateTime.MinValue, apiClient.RateLimitCooldownUntilUtc);
     }
 
+    [Fact]
+    public async Task Background_worker_skips_lease_polling_when_plugin_is_not_operational()
+    {
+        var configuration = new Configuration
+        {
+            EnableFFLogsWorker = true,
+            FFLogsClientId = "client-id",
+            FFLogsClientSecret = "client-secret",
+            IngestClientId = Guid.NewGuid().ToString("N"),
+            FFLogsWorkerBaseDelayMs = 4200,
+            FFLogsWorkerJitterMs = 0,
+            UploadUrls = ImmutableList.Create(new UploadUrl("http://127.0.0.1:8000")),
+        };
+        var timeProvider = new ManualFFLogsTimeProvider
+        {
+            UtcNow = new DateTime(2026, 4, 15, 8, 0, 0, DateTimeKind.Utc),
+        };
+        var seams = FFLogsCollector.CreateSeams(
+            new StubFFLogsIngestHttpSender(),
+            new StubFFLogsApiClient(),
+            timeProvider);
+        var delays = new List<int>();
+        var workerPolicy = new FFLogsWorkerPolicy(
+            configuration,
+            _ => { },
+            timeProvider,
+            (delayMs, _) =>
+            {
+                delays.Add(delayMs);
+                throw new TaskCanceledException();
+            });
+        var leaseClient = new CountingJobLeaseClient(seams);
+        var worker = new FFLogsBackgroundWorker(
+            configuration,
+            seams.ApiClient,
+            workerPolicy,
+            leaseClient,
+            new FFLogsBatchProcessor(seams),
+            new FFLogsResultSubmitter(seams, new FFLogsSubmitBuffer()),
+            new FFLogsLeaseAbandoner(seams),
+            static _ => { },
+            static _ => { },
+            static _ => { },
+            static _ => { },
+            isPluginOperational: static () => false);
+
+        await worker.RunAsync(CancellationToken.None);
+
+        Assert.Equal([4200], delays);
+        Assert.Equal(0, leaseClient.AcquireCalls);
+    }
+
     private static ParseJob CreateJob()
         => new()
         {
@@ -422,5 +474,20 @@ public sealed class FFLogsBackgroundWorkerTests
             Action<string>? warningLog = null,
             Action<string>? debugLog = null)
             => throw new InvalidOperationException("boom");
+    }
+
+    private sealed class CountingJobLeaseClient(FFLogsCollectorSeams seams) : FFLogsJobLeaseClient(seams)
+    {
+        public int AcquireCalls { get; private set; }
+
+        public override Task<FFLogsJobLeaseAttempt> TryAcquireSessionAsync(
+            Configuration configuration,
+            CancellationToken cancellationToken,
+            Action<string>? warningLog = null,
+            Action<string>? debugLog = null)
+        {
+            AcquireCalls++;
+            return Task.FromResult(new FFLogsJobLeaseAttempt(null, false));
+        }
     }
 }

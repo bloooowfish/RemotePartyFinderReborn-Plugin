@@ -119,7 +119,7 @@ public sealed class ProtectedIngestEndpointExecutorTests {
         var now = new DateTime(2026, 5, 10, 3, 0, 0, DateTimeKind.Utc);
         var sender = new StubFFLogsIngestHttpSender();
         var uploadUrl = new UploadUrl("https://secure.example/");
-        uploadUrl.RequireProtectedCapabilities();
+        uploadUrl.RequireProtectedCapabilities(ProtectedEndpointCapabilityKind.FflogsJobs);
         var executor = new ProtectedIngestEndpointExecutor(sender, () => now);
 
         var result = await executor.ExecuteAsync(
@@ -163,6 +163,34 @@ public sealed class ProtectedIngestEndpointExecutorTests {
         Assert.True(result.TransientFailure);
         Assert.Equal(0, uploadUrl.FailureCount);
         Assert.Equal(DateTime.MinValue, uploadUrl.LastFailureTime);
+    }
+
+    [Fact]
+    public async Task Protected_executor_403_on_tomestone_route_requires_tomestone_capabilities_without_blocking_fflogs() {
+        var now = new DateTime(2026, 5, 10, 5, 0, 0, DateTimeKind.Utc);
+        var sender = new StubFFLogsIngestHttpSender {
+            OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Forbidden) {
+                Content = new StringContent("forbidden"),
+            }),
+        };
+        var uploadUrl = new UploadUrl("https://secure.example/");
+        var executor = new ProtectedIngestEndpointExecutor(sender, () => now);
+
+        var result = await executor.ExecuteAsync(
+            CreateConfiguration(uploadUrl),
+            uploadUrl,
+            IngestRoutes.TomestoneJobs,
+            ProtectedEndpointCapabilityKind.TomestoneJobs,
+            HttpMethod.Get,
+            jsonBody: null,
+            recordUploadAttempt: true,
+            CancellationToken.None);
+
+        Assert.False(result.Success);
+        Assert.True(result.AuthFailure);
+        Assert.True(uploadUrl.ShouldDeferProtectedRequest(ProtectedEndpointCapabilityKind.TomestoneJobs, new DateTimeOffset(now)));
+        Assert.True(uploadUrl.ShouldDeferProtectedRequest(ProtectedEndpointCapabilityKind.TomestoneResults, new DateTimeOffset(now)));
+        Assert.False(uploadUrl.ShouldDeferProtectedRequest(ProtectedEndpointCapabilityKind.FflogsJobs, new DateTimeOffset(now)));
     }
 
     private static Configuration CreateConfiguration(UploadUrl uploadUrl) {

@@ -9,12 +9,10 @@ namespace RemotePartyFinderReborn;
 internal sealed class FFLogsBatchProcessor
 {
     private readonly FFLogsCollectorSeams _seams;
-    private readonly TomestoneProgressEnricher _tomestoneProgressEnricher;
 
     public FFLogsBatchProcessor(FFLogsCollectorSeams seams)
     {
         _seams = seams ?? throw new ArgumentNullException(nameof(seams));
-        _tomestoneProgressEnricher = new TomestoneProgressEnricher(_seams);
     }
 
     public async Task<FFLogsBatchProcessResult> ProcessLeaseSessionAsync(
@@ -39,17 +37,6 @@ internal sealed class FFLogsBatchProcessor
 
             if (_seams.ApiClient.TryGetRateLimitRemaining(out cooldownRemaining))
             {
-                var tomestoneOnlyResults = new Dictionary<ulong, ParseResult>();
-                await _tomestoneProgressEnricher.EnrichClearsFallbackAsync(
-                    jobs,
-                    tomestoneOnlyResults,
-                    cancellationToken).ConfigureAwait(false);
-                await _tomestoneProgressEnricher.EnrichProgressAsync(
-                    jobs,
-                    tomestoneOnlyResults,
-                    zoneId,
-                    cancellationToken).ConfigureAwait(false);
-                results.AddRange(tomestoneOnlyResults.Values);
                 hitRateLimitCooldown = true;
                 break;
             }
@@ -64,17 +51,6 @@ internal sealed class FFLogsBatchProcessor
 
             if (!fetchedOutcome.Succeeded)
             {
-                var tomestoneOnlyResults = new Dictionary<ulong, ParseResult>();
-                await _tomestoneProgressEnricher.EnrichClearsFallbackAsync(
-                    jobs,
-                    tomestoneOnlyResults,
-                    cancellationToken).ConfigureAwait(false);
-                await _tomestoneProgressEnricher.EnrichProgressAsync(
-                    jobs,
-                    tomestoneOnlyResults,
-                    zoneId,
-                    cancellationToken).ConfigureAwait(false);
-                results.AddRange(tomestoneOnlyResults.Values);
                 hadTransientFailure |= fetchedOutcome.TransientFailure;
                 hitRateLimitCooldown = TryCaptureCooldown(out cooldownRemaining);
                 break;
@@ -84,17 +60,6 @@ internal sealed class FFLogsBatchProcessor
 
             var candidateMatch = candidateMatcher.MatchFetchedCandidates(fetchedByKey);
             var resultsByContentId = candidateMatch.ResultsByContentId;
-
-            await _tomestoneProgressEnricher.EnrichClearsFallbackAsync(
-                jobs,
-                resultsByContentId,
-                cancellationToken).ConfigureAwait(false);
-
-            await _tomestoneProgressEnricher.EnrichProgressAsync(
-                jobs,
-                resultsByContentId,
-                zoneId,
-                cancellationToken).ConfigureAwait(false);
 
             if (_seams.ApiClient.TryGetRateLimitRemaining(out cooldownRemaining))
             {

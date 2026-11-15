@@ -21,6 +21,8 @@ public sealed class TomestoneApiClient : IDisposable
     private readonly Action<string> _debugLog;
     private readonly Action<ApiCredentialValidationState, string> _credentialStatusChanged;
     private readonly RateLimitCooldownState _rateLimitCooldown = new();
+    private readonly object _credentialGate = new();
+    private string _lastRejectedApiKey;
 
     public TomestoneApiClient(Configuration configuration)
         : this(configuration, null)
@@ -100,6 +102,49 @@ public sealed class TomestoneApiClient : IDisposable
         string path,
         CancellationToken cancellationToken)
     {
+        var apiKey = _configuration.TomestoneApiKey?.Trim() ?? string.Empty;
+        if (string.IsNullOrEmpty(apiKey))
+        {
+            var clearRejected = false;
+            lock (_credentialGate)
+            {
+                if (_lastRejectedApiKey != null)
+                {
+                    _lastRejectedApiKey = null;
+                    clearRejected = true;
+                }
+            }
+
+            if (clearRejected)
+            {
+                ReportCredentialStatus(
+                    ApiCredentialValidationState.NotChecked,
+                    "Tomestone API key was cleared.");
+            }
+
+            return OperationOutcome<TomestoneRawResponse>.Failure(
+                transientFailure: false,
+                "Tomestone API key is not configured.");
+        }
+
+        var resetChangedKeyStatus = false;
+        lock (_credentialGate)
+        {
+            if (_lastRejectedApiKey != null
+                && !string.Equals(_lastRejectedApiKey, apiKey, StringComparison.Ordinal))
+            {
+                _lastRejectedApiKey = null;
+                resetChangedKeyStatus = true;
+            }
+        }
+
+        if (resetChangedKeyStatus)
+        {
+            ReportCredentialStatus(
+                ApiCredentialValidationState.NotChecked,
+                "API key changed; checking Tomestone request.");
+        }
+
         if (TryGetRateLimitRemaining(out var cooldownRemaining))
         {
             LogCooldownSkipIfNeeded(cooldownRemaining);
@@ -108,8 +153,15 @@ public sealed class TomestoneApiClient : IDisposable
                 "Tomestone API rate-limit cooldown is active.");
         }
 
-        var requestUri = ResolveUri(path);
-        using var request = CreateAuthenticatedGet(requestUri);
+        if (!TryResolveSameOriginUri(path, out var requestUri))
+        {
+            _warningLog($"Refused Tomestone API request to off-origin or invalid URI '{path}'.");
+            return OperationOutcome<TomestoneRawResponse>.Failure(
+                transientFailure: false,
+                "Refused Tomestone request to an untrusted off-origin URL.");
+        }
+
+        using var request = CreateAuthenticatedGet(requestUri, apiKey);
 
         try
         {
@@ -191,6 +243,17 @@ public sealed class TomestoneApiClient : IDisposable
                         : response.StatusCode == HttpStatusCode.NotFound
                             ? "Tomestone returned no matching record (HTTP 404); API key validity was not confirmed."
                             : $"Tomestone request failed (HTTP {statusCode}); API key validity was not confirmed.";
+                lock (_credentialGate)
+                {
+                    if (credentialState == ApiCredentialValidationState.Rejected)
+                    {
+                        _lastRejectedApiKey = apiKey;
+                    }
+                    else if (credentialState == ApiCredentialValidationState.Accepted)
+                    {
+                        _lastRejectedApiKey = null;
+                    }
+                }
                 ReportCredentialStatus(credentialState, credentialMessage);
                 if (!activityHidden)
                 {
@@ -200,12 +263,13 @@ public sealed class TomestoneApiClient : IDisposable
             }
             else
             {
-                var configuredApiKey = !string.IsNullOrWhiteSpace(_configuration.TomestoneApiKey);
+                lock (_credentialGate)
+                {
+                    _lastRejectedApiKey = null;
+                }
                 ReportCredentialStatus(
-                    configuredApiKey ? ApiCredentialValidationState.Accepted : ApiCredentialValidationState.NotChecked,
-                    configuredApiKey
-                        ? $"Tomestone accepted the request (HTTP {(int)response.StatusCode})."
-                        : "Tomestone request succeeded without an API key; key validity was not checked.");
+                    ApiCredentialValidationState.Accepted,
+                    $"Tomestone accepted the request (HTTP {(int)response.StatusCode}).");
             }
 
             return OperationOutcome<TomestoneRawResponse>.Success(new TomestoneRawResponse
@@ -273,11 +337,15 @@ public sealed class TomestoneApiClient : IDisposable
         _warningLog($"Tomestone cooldown active. Skipping Tomestone API request for about {minutesRemaining} minute(s).");
     }
 
-    private HttpRequestMessage CreateAuthenticatedGet(Uri requestUri)
+    private static HttpRequestMessage CreateAuthenticatedGet(Uri requestUri, string apiKey)
     {
+        if (!IsSameOriginTomestoneUri(requestUri))
+        {
+            throw new InvalidOperationException("Refused to attach Tomestone API credentials to an off-origin URI.");
+        }
+
         var request = new HttpRequestMessage(HttpMethod.Get, requestUri);
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-        var apiKey = _configuration.TomestoneApiKey?.Trim();
         if (!string.IsNullOrEmpty(apiKey))
         {
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
@@ -286,14 +354,51 @@ public sealed class TomestoneApiClient : IDisposable
         return request;
     }
 
-    private static Uri ResolveUri(string path)
+    private static bool TryResolveSameOriginUri(string path, out Uri requestUri)
     {
-        if (Uri.TryCreate(path, UriKind.Absolute, out var absoluteUri))
+        if (string.IsNullOrWhiteSpace(path))
         {
-            return absoluteUri;
+            requestUri = null;
+            return false;
         }
 
-        var normalizedPath = string.IsNullOrWhiteSpace(path) ? string.Empty : path.TrimStart('/');
-        return new Uri(DefaultBaseUri, normalizedPath);
+        if (Uri.TryCreate(path, UriKind.Absolute, out var absoluteUri))
+        {
+            if (IsSameOriginTomestoneUri(absoluteUri))
+            {
+                requestUri = absoluteUri;
+                return true;
+            }
+
+            requestUri = null;
+            return false;
+        }
+
+        if (path.Contains("://", StringComparison.Ordinal))
+        {
+            requestUri = null;
+            return false;
+        }
+
+        var normalizedPath = path.TrimStart('/');
+        if (!Uri.TryCreate(DefaultBaseUri, normalizedPath, out var combined)
+            || !IsSameOriginTomestoneUri(combined))
+        {
+            requestUri = null;
+            return false;
+        }
+
+        requestUri = combined;
+        return true;
+    }
+
+    private static bool IsSameOriginTomestoneUri(Uri uri)
+    {
+        return uri != null
+            && uri.IsAbsoluteUri
+            && string.Equals(uri.Scheme, DefaultBaseUri.Scheme, StringComparison.OrdinalIgnoreCase)
+            && string.Equals(uri.Host, DefaultBaseUri.Host, StringComparison.OrdinalIgnoreCase)
+            && uri.Port == DefaultBaseUri.Port
+            && string.IsNullOrEmpty(uri.UserInfo);
     }
 }

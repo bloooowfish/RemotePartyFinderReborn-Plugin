@@ -126,6 +126,7 @@ internal sealed class CharaCardResolver : IDisposable {
     private readonly TimeSpan _requestTimeout;
     private readonly Action<string>? _debugSink;
     private readonly Action<string>? _warningSink;
+    private readonly Func<bool> _isOperational;
     private readonly IdentityUploadPump? _identityUploadPump;
     private readonly HttpClient _identityUploadHttpClient;
     private readonly bool _ownsIdentityUploadHttpClient;
@@ -141,7 +142,8 @@ internal sealed class CharaCardResolver : IDisposable {
         Action<string>? warningSink,
         Configuration? configuration,
         ISelectOkDialogSuppressionRuntime? selectOkDialogSuppressionRuntime,
-        IGameInteropProvider? gameInteropProvider
+        IGameInteropProvider? gameInteropProvider,
+        Func<bool>? isOperational = null
     ) : this(
         database,
         runtime: CreateDalamudRuntime(gameInteropProvider, warningSink, debugSink),
@@ -155,7 +157,8 @@ internal sealed class CharaCardResolver : IDisposable {
         configuration: configuration,
         uploadResolvedIdentitiesAsync: null,
         identityUploadHttpClient: null,
-        selectOkDialogSuppressionRuntime: selectOkDialogSuppressionRuntime
+        selectOkDialogSuppressionRuntime: selectOkDialogSuppressionRuntime,
+        isOperational: isOperational
     ) {
     }
 
@@ -172,11 +175,13 @@ internal sealed class CharaCardResolver : IDisposable {
         Configuration? configuration = null,
         Func<IReadOnlyList<CharacterIdentityUploadPayload>, CancellationToken, Task<bool>>? uploadResolvedIdentitiesAsync = null,
         HttpClient? identityUploadHttpClient = null,
-        ISelectOkDialogSuppressionRuntime? selectOkDialogSuppressionRuntime = null
+        ISelectOkDialogSuppressionRuntime? selectOkDialogSuppressionRuntime = null,
+        Func<bool>? isOperational = null
     ) {
         _database = database ?? throw new ArgumentNullException(nameof(database));
         _debugSink = debugSink;
         _warningSink = warningSink;
+        _isOperational = isOperational ?? (static () => true);
         _runtime = runtime ?? throw new ArgumentNullException(nameof(runtime));
         _selectOkDialogSuppressionRuntime = selectOkDialogSuppressionRuntime;
         _worldNameResolver = worldNameResolver ?? ResolveWorldName;
@@ -239,7 +244,7 @@ internal sealed class CharaCardResolver : IDisposable {
     internal void EnqueueMany(IEnumerable<ulong> contentIds) {
         ArgumentNullException.ThrowIfNull(contentIds);
 
-        if (_disposed || !IsEnabled) {
+        if (_disposed || !IsEnabled || !_isOperational()) {
             return;
         }
 
@@ -281,7 +286,7 @@ internal sealed class CharaCardResolver : IDisposable {
         var pumpAllocatedBefore = DebugPerformanceDiagnostics.AllocatedBytes();
         try {
 #endif
-        if (_disposed) {
+        if (_disposed || !_isOperational()) {
             return;
         }
 

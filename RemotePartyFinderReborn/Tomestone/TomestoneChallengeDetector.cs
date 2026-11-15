@@ -7,8 +7,8 @@ using System.Net.Http.Headers;
 namespace RemotePartyFinderReborn.Tomestone;
 
 /// <summary>
-/// Shared detector for HTTP rate-limits, anti-bot challenges (403/429/Cloudflare/CAPTCHA),
-/// and Retry-After cooldown durations across Tier 1, Tier 2, and Tier 3 Tomestone clients.
+/// Shared detector for HTTP rate-limits, anti-bot challenges (429/Cloudflare/CAPTCHA),
+/// and Retry-After cooldown durations for the official Tomestone API client.
 /// </summary>
 internal static class TomestoneChallengeDetector
 {
@@ -26,6 +26,7 @@ internal static class TomestoneChallengeDetector
         ("h-captcha", TomestoneChallengeKind.HCaptcha, "h-captcha"),
         ("cf-mitigated", TomestoneChallengeKind.CfMitigatedHeader, "cf-mitigated"),
         ("just a moment...", TomestoneChallengeKind.CloudflareJustAMoment, "Just a moment..."),
+        ("attention required! | cloudflare", TomestoneChallengeKind.CloudflareJustAMoment, "Attention Required! | Cloudflare"),
     ];
 
     internal static TomestoneChallengeInfo DetectTextChallenge(string text, TimeSpan? retryAfter = null)
@@ -44,42 +45,6 @@ internal static class TomestoneChallengeDetector
         }
 
         return null;
-    }
-
-    internal static TomestoneChallengeInfo DetectWebHttpChallenge(
-        HttpStatusCode statusCode,
-        HttpResponseHeaders headers,
-        string body,
-        DateTime utcNow)
-    {
-        var hasRetryAfter = TryParseRetryAfter(headers, utcNow, out var parsedRetryAfter);
-        TimeSpan? retryAfter = hasRetryAfter ? parsedRetryAfter : null;
-
-        if (HasNonEmptyHeader(headers, "cf-mitigated"))
-        {
-            return new TomestoneChallengeInfo(
-                TomestoneChallengeKind.CfMitigatedHeader,
-                "header:cf-mitigated",
-                retryAfter);
-        }
-
-        if (DetectTextChallenge(body, retryAfter) is { } textChallenge)
-        {
-            return textChallenge;
-        }
-
-        return statusCode switch
-        {
-            HttpStatusCode.TooManyRequests => new TomestoneChallengeInfo(
-                TomestoneChallengeKind.Http429,
-                "HTTP 429",
-                retryAfter),
-            HttpStatusCode.Forbidden => new TomestoneChallengeInfo(
-                TomestoneChallengeKind.Http403,
-                "HTTP 403",
-                retryAfter),
-            _ => null,
-        };
     }
 
     internal static TomestoneChallengeInfo DetectApiNonSuccessChallenge(
