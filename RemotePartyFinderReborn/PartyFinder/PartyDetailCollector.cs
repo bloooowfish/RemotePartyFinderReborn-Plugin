@@ -229,6 +229,10 @@ internal sealed class PartyDetailCollector : IDisposable {
 
         _pendingDetailQueue.PruneExpiredManualEntries(nowUtc, TimeSpan.FromMinutes(1));
         _captureState.PruneExpiredManualRequests();
+        if (!HasAnyAttemptableTarget(nowUtc)) {
+            return;
+        }
+
         var maxConcurrency = PartyDetailUploadPolicy.NormalizeDetailUploadConcurrency(_configuration?.DetailUploadMaxConcurrency ?? 1);
         var batchSize = PartyDetailUploadPolicy.NormalizeDetailUploadBatchSize(_configuration?.DetailUploadBatchSize ?? 1);
         while (_shutdownSignaled == 0 && Volatile.Read(ref _activeUploadWorkers) < maxConcurrency) {
@@ -357,10 +361,7 @@ internal sealed class PartyDetailCollector : IDisposable {
         switch (uploadOutcome.Result) {
             case DetailUploadResult.Applied:
                 _pendingDetailQueue.RemoveIfUnchanged(pending);
-                var successAt = _utcNow();
-                Interlocked.Exchange(ref _lastSuccessfulUploadAtUtcTicks, successAt.Ticks);
-                _lastSuccessfulUploadListingId = pending.Detail.ListingId;
-                Interlocked.Increment(ref _lastSuccessfulUploadAckVersion);
+                RecordSuccessfulUpload(pending.Detail.ListingId);
                 break;
 
             case DetailUploadResult.TerminalRejected:
@@ -371,17 +372,28 @@ internal sealed class PartyDetailCollector : IDisposable {
 
             case DetailUploadResult.ListingMissing:
             case DetailUploadResult.Deferred:
-                ScheduleDeferredBackoff(pending, uploadOutcome.Result);
+                ScheduleDeferredBackoff(pending, uploadOutcome);
+                break;
+
+            case DetailUploadResult.CircuitBlocked:
+                ScheduleCircuitBlockedBackoff(pending, uploadOutcome);
                 break;
 
             default:
-                if (DropManualBestEffortDetail(pending, uploadOutcome.Result)) {
+                if (DropManualBestEffortDetail(pending, uploadOutcome)) {
                     break;
                 }
 
-                ScheduleRetry(pending, uploadOutcome.RetryAfterSeconds);
+                ScheduleRetry(pending, uploadOutcome);
                 break;
         }
+    }
+
+    private void RecordSuccessfulUpload(uint listingId) {
+        var successAt = _utcNow();
+        Interlocked.Exchange(ref _lastSuccessfulUploadAtUtcTicks, successAt.Ticks);
+        _lastSuccessfulUploadListingId = listingId;
+        Interlocked.Increment(ref _lastSuccessfulUploadAckVersion);
     }
 
     private void RecordTerminalUpload(uint listingId) {
@@ -391,17 +403,25 @@ internal sealed class PartyDetailCollector : IDisposable {
         Interlocked.Increment(ref _lastTerminalUploadAckVersion);
     }
 
-    private bool DropManualBestEffortDetail(PendingDetailEntry pending, DetailUploadResult result) {
+    private bool DropManualBestEffortDetail(PendingDetailEntry pending, DetailUploadOutcome uploadOutcome) {
         if (pending.Owner != PartyDetailRequestOwner.Manual) {
             return false;
         }
 
         _pendingDetailQueue.RemoveIfUnchanged(pending);
-        LogDebug($"PartyDetailCollector: dropping manual detail payload listing={pending.Detail.ListingId} after {result}; manual captures are best-effort and are not kept in the retry queue.");
+        if (pending.HasAppliedTarget || uploadOutcome.HasAppliedTarget) {
+            RecordSuccessfulUpload(pending.Detail.ListingId);
+        }
+
+        LogDebug($"PartyDetailCollector: dropping manual detail payload listing={pending.Detail.ListingId} after {uploadOutcome.Result}; manual captures are best-effort and are not kept in the retry queue.");
         return true;
     }
 
     private void ScheduleRetry(PendingDetailEntry pending, int? retryAfterSeconds) {
+        ScheduleRetry(pending, new DetailUploadOutcome(DetailUploadResult.RetryableFailure, retryAfterSeconds));
+    }
+
+    private void ScheduleRetry(PendingDetailEntry pending, DetailUploadOutcome uploadOutcome) {
         var configuration = _configuration ?? throw new InvalidOperationException("Retry scheduling requires collector configuration.");
         if (!_pendingDetailQueue.TryGet(pending.Detail.ListingId, out var current)) {
             return;
@@ -411,20 +431,24 @@ internal sealed class PartyDetailCollector : IDisposable {
             return;
         }
 
+        var merged = MergeOutcomeProgress(current, uploadOutcome);
         var configuredRetryCount = PartyDetailUploadPolicy.NormalizeRetryCount(configuration.DetailUploadRetryCount);
         if (PartyDetailUploadPolicy.ShouldDropPendingDetail(current.AttemptCount, configuredRetryCount)) {
             _pendingDetailQueue.RemoveIfUnchanged(pending);
+            if (merged.HasAppliedTarget) {
+                RecordSuccessfulUpload(pending.Detail.ListingId);
+            }
             LogWarning($"PartyDetailCollector: dropping detail payload listing={pending.Detail.ListingId} after {current.AttemptCount} retries");
             return;
         }
 
         var nextAttemptCount = current.AttemptCount + 1;
-        var updated = current with {
+        var updated = merged with {
             AttemptCount = nextAttemptCount,
             NextAttemptAtUtc = PartyDetailUploadPolicy.ComputeNextAttemptAtUtc(
                 _utcNow(),
                 nextAttemptCount,
-                retryAfterSeconds,
+                uploadOutcome.RetryAfterSeconds,
                 _nextJitterMs
             ),
         };
@@ -432,7 +456,7 @@ internal sealed class PartyDetailCollector : IDisposable {
         _pendingDetailQueue.TryUpdate(current, updated);
     }
 
-    private void ScheduleDeferredBackoff(PendingDetailEntry pending, DetailUploadResult result) {
+    private void ScheduleDeferredBackoff(PendingDetailEntry pending, DetailUploadOutcome uploadOutcome) {
         if (!_pendingDetailQueue.TryGet(pending.Detail.ListingId, out var current)) {
             return;
         }
@@ -441,20 +465,23 @@ internal sealed class PartyDetailCollector : IDisposable {
             return;
         }
 
+        var merged = MergeOutcomeProgress(current, uploadOutcome);
         var configuredRetryCount = _configuration?.DetailUploadRetryCount ?? 0;
         if (PartyDetailUploadPolicy.ShouldDropDeferredPendingDetail(current.DeferredCount, configuredRetryCount)) {
             _pendingDetailQueue.RemoveIfUnchanged(pending);
-            if (result == DetailUploadResult.ListingMissing) {
+            if (merged.HasAppliedTarget) {
+                RecordSuccessfulUpload(pending.Detail.ListingId);
+            } else if (uploadOutcome.Result == DetailUploadResult.ListingMissing) {
                 RecordTerminalUpload(pending.Detail.ListingId);
                 LogDebug($"PartyDetailCollector: listing {pending.Detail.ListingId} missing on server after {current.DeferredCount} deferral(s); dropping queued detail payload.");
             } else {
-                LogWarning($"PartyDetailCollector: dropping detail payload listing={pending.Detail.ListingId} after {current.DeferredCount} deferrals ({result})");
+                LogWarning($"PartyDetailCollector: dropping detail payload listing={pending.Detail.ListingId} after {current.DeferredCount} deferrals ({uploadOutcome.Result})");
             }
             return;
         }
 
         var nextDeferredCount = current.DeferredCount + 1;
-        var updated = current with {
+        var updated = merged with {
             DeferredCount = nextDeferredCount,
             NextAttemptAtUtc = PartyDetailUploadPolicy.ComputeDeferredNextAttemptAtUtc(
                 _utcNow(),
@@ -464,6 +491,88 @@ internal sealed class PartyDetailCollector : IDisposable {
         };
 
         _pendingDetailQueue.TryUpdate(current, updated);
+    }
+
+    private void ScheduleCircuitBlockedBackoff(PendingDetailEntry pending, DetailUploadOutcome uploadOutcome) {
+        if (!_pendingDetailQueue.TryGet(pending.Detail.ListingId, out var current)) {
+            return;
+        }
+
+        if (current.Fingerprint != pending.Fingerprint) {
+            return;
+        }
+
+        var merged = MergeOutcomeProgress(current, uploadOutcome);
+        var nowUtc = _utcNow();
+        var minRemaining = GetMinRemainingBreakDuration(merged, nowUtc);
+        var updated = merged with {
+            NextAttemptAtUtc = PartyDetailUploadPolicy.ComputeCircuitBlockedNextAttemptAtUtc(
+                nowUtc,
+                minRemaining,
+                _nextJitterMs
+            ),
+        };
+
+        _pendingDetailQueue.TryUpdate(current, updated);
+    }
+
+    private static PendingDetailEntry MergeOutcomeProgress(PendingDetailEntry current, DetailUploadOutcome uploadOutcome) {
+        var resolvedIds = current.ResolvedTargetIds;
+        if (uploadOutcome.ResolvedTargetIds is { Count: > 0 } newlyResolved) {
+            resolvedIds = current.SafeResolvedTargetIds.Union(newlyResolved);
+        }
+
+        var hasAppliedTarget = current.HasAppliedTarget || uploadOutcome.HasAppliedTarget;
+        if (ReferenceEquals(resolvedIds, current.ResolvedTargetIds) && hasAppliedTarget == current.HasAppliedTarget) {
+            return current;
+        }
+
+        return current with {
+            ResolvedTargetIds = resolvedIds,
+            HasAppliedTarget = hasAppliedTarget,
+        };
+    }
+
+    private TimeSpan? GetMinRemainingBreakDuration(PendingDetailEntry entry, DateTime nowUtc) {
+        if (_configuration is null) {
+            return null;
+        }
+
+        TimeSpan? minRemaining = null;
+        foreach (var target in _configuration.GetUploadUrlsSnapshot()) {
+            if (!target.IsEnabled || entry.IsTargetResolved(target.Id)) {
+                continue;
+            }
+
+            if (!IngestEndpointResolver.IsValidUploadUrl(target.Url, out _)) {
+                continue;
+            }
+
+            var remaining = UploadAttemptRecorder.GetCircuitStatus(target, _configuration, nowUtc).RemainingBreakDuration;
+            if (!minRemaining.HasValue || remaining < minRemaining.Value) {
+                minRemaining = remaining;
+            }
+        }
+
+        return minRemaining;
+    }
+
+    private bool HasAnyAttemptableTarget(DateTime nowUtc) {
+        if (_configuration is null) {
+            return true;
+        }
+
+        foreach (var target in _configuration.GetUploadUrlsSnapshot()) {
+            if (!target.IsEnabled || !IngestEndpointResolver.IsValidUploadUrl(target.Url, out _)) {
+                continue;
+            }
+
+            if (!UploadAttemptRecorder.PeekIsCircuitOpen(target, _configuration, nowUtc)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     internal void EnqueuePendingDetailForTesting(
@@ -547,6 +656,10 @@ internal sealed class PartyDetailCollector : IDisposable {
             var hasAvailableTarget = false;
             var hasCapabilityEligibleTarget = false;
             foreach (var target in enabledTargets) {
+                if (pending.IsTargetResolved(target.Id)) {
+                    continue;
+                }
+
                 if (UploadAttemptRecorder.PeekIsCircuitOpen(target, _configuration, nowUtc)) {
                     continue;
                 }

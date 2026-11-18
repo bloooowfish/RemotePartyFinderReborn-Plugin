@@ -828,46 +828,48 @@ internal sealed class CharaCardResolver : IDisposable {
         var anySuccess = false;
 
         foreach (var uploadTarget in configuration.UploadUrls.Where(static candidate => candidate.IsEnabled)) {
-            if (UploadAttemptRecorder.IsCircuitOpen(uploadTarget, configuration, DateTime.UtcNow)) {
-                continue;
-            }
-
             if (!IngestEndpointResolver.TryBuildEndpoint(uploadTarget, IngestRoutes.CharacterIdentity, out var endpoint)) {
                 continue;
             }
 
-            try {
-                using var request = IngestRequestFactory.CreatePostJsonRequest(
-                    configuration,
-                    endpoint,
-                    jsonPayload
-                );
-                using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                attemptCts.CancelAfter(attemptTimeout);
-                using var response = await httpClient.SendAsync(request, attemptCts.Token).ConfigureAwait(false);
+            if (!UploadAttemptRecorder.TryBeginAttempt(uploadTarget, configuration, DateTime.UtcNow, out var attemptLease)) {
+                continue;
+            }
 
-                if (response.IsSuccessStatusCode) {
-                    anySuccess = true;
-                    UploadAttemptRecorder.RecordSuccess(uploadTarget);
-                    continue;
-                }
+            using (attemptLease) {
+                try {
+                    using var request = IngestRequestFactory.CreatePostJsonRequest(
+                        configuration,
+                        endpoint,
+                        jsonPayload
+                    );
+                    using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    attemptCts.CancelAfter(attemptTimeout);
+                    using var response = await httpClient.SendAsync(request, attemptCts.Token).ConfigureAwait(false);
 
-                UploadAttemptRecorder.RecordFailure(uploadTarget, DateTime.UtcNow);
-
-                if ((int)response.StatusCode == 429) {
-                        var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
-                        if (retryAfter.HasValue) {
-                            warningSink?.Invoke($"CharaCardResolver: rate limited by {endpoint.Url}, retry_after={retryAfter.Value}s");
-                        }
+                    if (response.IsSuccessStatusCode) {
+                        anySuccess = true;
+                        attemptLease.RecordSuccess();
+                        continue;
                     }
-            } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
-                throw;
-            } catch (OperationCanceledException) {
-                UploadAttemptRecorder.RecordFailure(uploadTarget, DateTime.UtcNow);
-                warningSink?.Invoke($"CharaCardResolver: identity upload timed out for {endpoint.Url} after {attemptTimeout.TotalMilliseconds:0}ms.");
-            } catch (Exception exception) {
-                UploadAttemptRecorder.RecordFailure(uploadTarget, DateTime.UtcNow);
-                warningSink?.Invoke($"CharaCardResolver: identity upload error to {endpoint.Url}. {exception.Message}");
+
+                    attemptLease.RecordFailure(DateTime.UtcNow);
+
+                    if ((int)response.StatusCode == 429) {
+                            var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
+                            if (retryAfter.HasValue) {
+                                warningSink?.Invoke($"CharaCardResolver: rate limited by {endpoint.Url}, retry_after={retryAfter.Value}s");
+                            }
+                        }
+                } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
+                    throw;
+                } catch (OperationCanceledException) {
+                    attemptLease.RecordFailure(DateTime.UtcNow);
+                    warningSink?.Invoke($"CharaCardResolver: identity upload timed out for {endpoint.Url} after {attemptTimeout.TotalMilliseconds:0}ms.");
+                } catch (Exception exception) {
+                    attemptLease.RecordFailure(DateTime.UtcNow);
+                    warningSink?.Invoke($"CharaCardResolver: identity upload error to {endpoint.Url}. {exception.Message}");
+                }
             }
         }
 

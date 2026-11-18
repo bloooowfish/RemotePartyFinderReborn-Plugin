@@ -117,30 +117,6 @@ internal sealed class CollectedListingBuffer {
         }
     }
 
-    internal int RemoveCompletedSnapshot(IReadOnlyCollection<DebugPfListingCandidate> snapshot) {
-        lock (_lock) {
-            var removed = 0;
-            foreach (var scanned in snapshot) {
-                if (!_collectedListings.TryGetValue(scanned.ListingId, out var latest)) {
-                    continue;
-                }
-
-                var scannedLastSeen = scanned.LastSeenAtUtc ?? scanned.SeenAtUtc;
-                var latestLastSeen = latest.LastSeenAtUtc ?? latest.SeenAtUtc;
-                if (latestLastSeen != scannedLastSeen) {
-                    continue;
-                }
-
-                if (_collectedListings.Remove(scanned.ListingId)) {
-                    removed++;
-                }
-            }
-
-            ResetBatchStateIfEmptyLocked();
-            return removed;
-        }
-    }
-
     internal int ClearAll() {
         lock (_lock) {
             var removed = _collectedListings.Count;
@@ -201,9 +177,19 @@ internal sealed class DebugPfScanner : IDisposable {
     private static readonly TimeSpan MaxGathererFlushWait = TimeSpan.FromMilliseconds(1500);
 
     private readonly Plugin _plugin;
+    private readonly Configuration _configuration;
     private readonly PartyDetailCollector _detailCollector;
     private readonly PartyDetailCaptureRuntime _detailCaptureRuntime;
     private readonly Gatherer _gatherer;
+    private readonly Func<DateTime> _utcNow;
+    private readonly Func<bool> _isPluginOperational;
+    private readonly Func<bool> _isLookingForGroupOpen;
+    private readonly Func<DebugPfDetailSnapshot> _getCurrentDetailSnapshot;
+    private readonly Func<DebugPfListingCandidate, bool> _openListingInGame;
+    private readonly Action _triggerGathererImmediateUpload;
+    private readonly Func<bool> _hasGathererPendingUploadWork;
+    private readonly Func<uint, DateTime, bool> _wasListingUploadedAfter;
+    private readonly Action<string> _debugLog;
 
     private readonly CollectedListingBuffer _collectedBuffer = new();
     private DebugPfListingCandidate[] _collectedRunSnapshot = Array.Empty<DebugPfListingCandidate>();
@@ -224,19 +210,57 @@ internal sealed class DebugPfScanner : IDisposable {
         PartyDetailCaptureRuntime detailCaptureRuntime,
         Gatherer gatherer
     ) {
-        _plugin = plugin;
-        _detailCollector = detailCollector;
-        _detailCaptureRuntime = detailCaptureRuntime;
-        _gatherer = gatherer;
+        _plugin = plugin ?? throw new ArgumentNullException(nameof(plugin));
+        _configuration = plugin.Configuration;
+        _detailCollector = detailCollector ?? throw new ArgumentNullException(nameof(detailCollector));
+        _detailCaptureRuntime = detailCaptureRuntime ?? throw new ArgumentNullException(nameof(detailCaptureRuntime));
+        _gatherer = gatherer ?? throw new ArgumentNullException(nameof(gatherer));
+        _utcNow = static () => DateTime.UtcNow;
+        _isPluginOperational = () => _plugin.IsPluginOperational;
+        _isLookingForGroupOpen = () => _plugin.GameGui.GetAddonByName("LookingForGroup", 1) != 0;
+        _getCurrentDetailSnapshot = GetCurrentDetailSnapshotFromGame;
+        _openListingInGame = OpenListingInGame;
+        _triggerGathererImmediateUpload = () => _gatherer.TriggerImmediateUpload();
+        _hasGathererPendingUploadWork = () => _gatherer.HasPendingUploadWork;
+        _wasListingUploadedAfter = (uploadId, seenAtUtc) => _gatherer.WasListingUploadedAfter(uploadId, seenAtUtc);
+        _debugLog = static message => Plugin.Log?.Debug(message);
 
         _plugin.PartyFinderGui.ReceiveListing += OnListing;
         _plugin.Framework.Update += OnUpdate;
     }
 
-    private int ConfiguredActionIntervalMs => Configuration.NormalizeScanActionIntervalMs(_plugin.Configuration.AutoDetailScanActionIntervalMs);
-    private int ConfiguredPostCooldownMs => Configuration.NormalizeScanPostCooldownMs(_plugin.Configuration.AutoDetailScanPostListingCooldownMs);
-    private int ConfiguredDetailTimeoutMs => Configuration.NormalizeScanDetailTimeoutMs(_plugin.Configuration.AutoDetailScanDetailTimeoutMs);
-    private int ConfiguredRetryCount => Configuration.NormalizeScanRetryCount(_plugin.Configuration.AutoDetailScanRetryCount);
+    internal DebugPfScanner(
+        Configuration configuration,
+        PartyDetailCollector detailCollector,
+        PartyDetailCaptureRuntime detailCaptureRuntime,
+        Func<DateTime> utcNow,
+        Func<bool> isPluginOperational,
+        Func<bool> isLookingForGroupOpen,
+        Func<DebugPfDetailSnapshot> getCurrentDetailSnapshot,
+        Func<DebugPfListingCandidate, bool> openListingInGame,
+        Action triggerGathererImmediateUpload = null,
+        Func<bool> hasGathererPendingUploadWork = null,
+        Func<uint, DateTime, bool> wasListingUploadedAfter = null,
+        Action<string> debugLog = null
+    ) {
+        _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
+        _detailCollector = detailCollector ?? throw new ArgumentNullException(nameof(detailCollector));
+        _detailCaptureRuntime = detailCaptureRuntime ?? throw new ArgumentNullException(nameof(detailCaptureRuntime));
+        _utcNow = utcNow ?? throw new ArgumentNullException(nameof(utcNow));
+        _isPluginOperational = isPluginOperational ?? throw new ArgumentNullException(nameof(isPluginOperational));
+        _isLookingForGroupOpen = isLookingForGroupOpen ?? throw new ArgumentNullException(nameof(isLookingForGroupOpen));
+        _getCurrentDetailSnapshot = getCurrentDetailSnapshot ?? throw new ArgumentNullException(nameof(getCurrentDetailSnapshot));
+        _openListingInGame = openListingInGame ?? throw new ArgumentNullException(nameof(openListingInGame));
+        _triggerGathererImmediateUpload = triggerGathererImmediateUpload ?? (static () => { });
+        _hasGathererPendingUploadWork = hasGathererPendingUploadWork ?? (static () => false);
+        _wasListingUploadedAfter = wasListingUploadedAfter ?? (static (_, _) => true);
+        _debugLog = debugLog ?? (static _ => { });
+    }
+
+    private int ConfiguredActionIntervalMs => Configuration.NormalizeScanActionIntervalMs(_configuration.AutoDetailScanActionIntervalMs);
+    private int ConfiguredPostCooldownMs => Configuration.NormalizeScanPostCooldownMs(_configuration.AutoDetailScanPostListingCooldownMs);
+    private int ConfiguredDetailTimeoutMs => Configuration.NormalizeScanDetailTimeoutMs(_configuration.AutoDetailScanDetailTimeoutMs);
+    private int ConfiguredRetryCount => Configuration.NormalizeScanRetryCount(_configuration.AutoDetailScanRetryCount);
 
     internal bool IsRunning => _isRunning;
     internal bool IsPartyFinderOpen => IsLookingForGroupOpen();
@@ -248,7 +272,7 @@ internal sealed class DebugPfScanner : IDisposable {
 
     internal int CollectedListingCount {
         get {
-            _collectedBuffer.Prune(DateTime.UtcNow);
+            _collectedBuffer.Prune(_utcNow());
             return _collectedBuffer.Count;
         }
     }
@@ -259,7 +283,7 @@ internal sealed class DebugPfScanner : IDisposable {
     internal ulong LastAttemptListingId => _stateMachine.LastAttemptListingId;
 
     internal bool StartScan(out string status) {
-        if (!_plugin.IsPluginOperational) {
+        if (!_isPluginOperational()) {
             status = "FFLogs API registration is required.";
             return false;
         }
@@ -269,7 +293,7 @@ internal sealed class DebugPfScanner : IDisposable {
             return false;
         }
 
-        var nowUtc = DateTime.UtcNow;
+        var nowUtc = _utcNow();
         var snapshot = _collectedBuffer.TakeOrderedSnapshot(nowUtc);
         if (snapshot.Length == 0) {
             status = "No collected high-end PF listings ready. Open or browse PF pages first.";
@@ -286,7 +310,7 @@ internal sealed class DebugPfScanner : IDisposable {
 #if DEBUG
         _runStartedAtTimestamp = DebugPerformanceDiagnostics.Begin();
 #endif
-        _gatherer.TriggerImmediateUpload();
+        _triggerGathererImmediateUpload();
         _awaitGathererFlushDeadlineUtc = nowUtc + MaxGathererFlushWait;
         _stateMachine.StartSyncQueue();
 
@@ -320,8 +344,10 @@ internal sealed class DebugPfScanner : IDisposable {
     }
 
     public void Dispose() {
-        _plugin.Framework.Update -= OnUpdate;
-        _plugin.PartyFinderGui.ReceiveListing -= OnListing;
+        if (_plugin is not null) {
+            _plugin.Framework.Update -= OnUpdate;
+            _plugin.PartyFinderGui.ReceiveListing -= OnListing;
+        }
     }
 
     internal void ResetSession() {
@@ -329,16 +355,32 @@ internal sealed class DebugPfScanner : IDisposable {
         ResetCaptureAttempt();
     }
 
-    private void OnListing(IPartyFinderListing listing, IPartyFinderListingEventArgs args) {
-        if (!_plugin.IsPluginOperational || listing.Id == 0 || !UploadableListing.IsSourceClientHighEndDuty(listing)) {
+    internal void TestReceiveHighEndListing(ulong listingId, ulong contentId, int batchNumber = 1) {
+        if (!_isPluginOperational() || listingId == 0) {
             return;
         }
 
-        _collectedBuffer.UpsertFromListing(listing.Id, listing.ContentId, args.BatchNumber, DateTime.UtcNow);
+        _collectedBuffer.UpsertFromListing(listingId, contentId, batchNumber, _utcNow());
+    }
+
+    internal void TestUpdate() {
+        ProcessUpdateTick();
+    }
+
+    private void OnListing(IPartyFinderListing listing, IPartyFinderListingEventArgs args) {
+        if (!_isPluginOperational() || listing.Id == 0 || !UploadableListing.IsSourceClientHighEndDuty(listing)) {
+            return;
+        }
+
+        _collectedBuffer.UpsertFromListing(listing.Id, listing.ContentId, args.BatchNumber, _utcNow());
     }
 
     private void OnUpdate(IFramework framework) {
-        if (!_isRunning || !_plugin.IsPluginOperational) {
+        ProcessUpdateTick();
+    }
+
+    private void ProcessUpdateTick() {
+        if (!_isRunning || !_isPluginOperational()) {
             if (_isRunning
                 || _stateMachine.State != DebugPfScanState.Idle
                 || _stateMachine.PendingCount > 0
@@ -359,15 +401,16 @@ internal sealed class DebugPfScanner : IDisposable {
             return;
         }
 
+        var nowUtc = _utcNow();
         if (_stateMachine.State == DebugPfScanState.SyncQueue
-            && _gatherer.HasPendingUploadWork
-            && DateTime.UtcNow < _awaitGathererFlushDeadlineUtc
+            && _hasGathererPendingUploadWork()
+            && nowUtc < _awaitGathererFlushDeadlineUtc
             && !AreSnapshotListingsUploaded()) {
             return;
         }
 
         if (ReachedFailureLimit(_stateMachine.ConsecutiveFailures, DebugPfScanStateMachine.DefaultMaxConsecutiveFailures)) {
-            CompleteRun("max_consecutive_failures", clearCompletedSnapshot: false);
+            CompleteRun("max_consecutive_failures");
             return;
         }
 
@@ -383,14 +426,14 @@ internal sealed class DebugPfScanner : IDisposable {
                     continue;
 
                 case DebugPfScanState.SyncQueue:
-                    if (_gatherer.HasPendingUploadWork
-                        && DateTime.UtcNow < _awaitGathererFlushDeadlineUtc
+                    if (_hasGathererPendingUploadWork()
+                        && _utcNow() < _awaitGathererFlushDeadlineUtc
                         && !AreSnapshotListingsUploaded()) {
                         break;
                     }
 
                     if (ReachedFailureLimit(_stateMachine.ConsecutiveFailures, DebugPfScanStateMachine.DefaultMaxConsecutiveFailures)) {
-                        CompleteRun("max_consecutive_failures", clearCompletedSnapshot: false);
+                        CompleteRun("max_consecutive_failures");
                         break;
                     }
 
@@ -422,7 +465,7 @@ internal sealed class DebugPfScanner : IDisposable {
                     break;
 
                 case DebugPfScanState.Cooldown:
-                    _stateMachine.AdvanceCooldown(DateTime.UtcNow);
+                    _stateMachine.AdvanceCooldown(_utcNow());
                     if (_stateMachine.State == DebugPfScanState.Cooldown) {
                         break;
                     }
@@ -451,9 +494,9 @@ internal sealed class DebugPfScanner : IDisposable {
             snapshot = _collectedRunSnapshot;
         }
 
-        var completionReason = _stateMachine.SyncQueue(DateTime.UtcNow, snapshot);
+        var completionReason = _stateMachine.SyncQueue(_utcNow(), snapshot);
         if (completionReason is not null) {
-            CompleteRun(completionReason, clearCompletedSnapshot: completionReason == "collected_batch_complete");
+            CompleteRun(completionReason);
         }
     }
 
@@ -464,7 +507,7 @@ internal sealed class DebugPfScanner : IDisposable {
             return;
         }
 
-        var nowUtc = DateTime.UtcNow;
+        var nowUtc = _utcNow();
         if (!_stateMachine.IsActionReady(nowUtc)) {
             return;
         }
@@ -490,28 +533,32 @@ internal sealed class DebugPfScanner : IDisposable {
         }
     }
 
-    private unsafe bool TryOpenTarget(DebugPfListingCandidate target) {
-        var agent = AgentLookingForGroup.Instance();
-        if (agent == null) {
-            return false;
-        }
-
+    private bool TryOpenTarget(DebugPfListingCandidate target) {
         ArmCaptureRequest(target);
         _detailCaptureRuntime.BeginScannerOpenAttempt(_currentCaptureAttemptId);
         try {
-            if (agent->OpenListing(target.ListingId)) {
-                return true;
-            }
-
-            return target.ContentId != 0 && agent->OpenListingByContentId(target.ContentId);
+            return _openListingInGame(target);
         } finally {
             _detailCaptureRuntime.EndScannerOpenAttempt(_currentCaptureAttemptId);
         }
     }
 
+    private static unsafe bool OpenListingInGame(DebugPfListingCandidate target) {
+        var agent = AgentLookingForGroup.Instance();
+        if (agent == null) {
+            return false;
+        }
+
+        if (agent->OpenListing(target.ListingId)) {
+            return true;
+        }
+
+        return target.ContentId != 0 && agent->OpenListingByContentId(target.ContentId);
+    }
+
     private void WaitDetailReady() {
         var beforeAttempt = CaptureAttemptLogState();
-        var nowUtc = DateTime.UtcNow;
+        var nowUtc = _utcNow();
         var postCooldownMs = ConfiguredPostCooldownMs;
         var configuredRetries = ConfiguredRetryCount;
 
@@ -564,7 +611,7 @@ internal sealed class DebugPfScanner : IDisposable {
                                  target.ListingId,
                                  target.ContentId
                              );
-        _stateMachine.HandleCollectedState(DateTime.UtcNow, hasConsumedAck, ConfiguredPostCooldownMs);
+        _stateMachine.HandleCollectedState(_utcNow(), hasConsumedAck, ConfiguredPostCooldownMs);
         LogAttemptIfChanged(beforeAttempt);
     }
 
@@ -579,7 +626,7 @@ internal sealed class DebugPfScanner : IDisposable {
                 continue;
             }
 
-            if (!_gatherer.WasListingUploadedAfter(uploadId, candidate.SeenAtUtc)) {
+            if (!_wasListingUploadedAfter(uploadId, candidate.SeenAtUtc)) {
                 return false;
             }
         }
@@ -595,23 +642,14 @@ internal sealed class DebugPfScanner : IDisposable {
         }
     }
 
-    private void CompleteRun(string reason, bool clearCompletedSnapshot) {
+    private void CompleteRun(string reason) {
 #if DEBUG
         if (_runStartedAtTimestamp != 0) {
             DebugPerformanceDiagnostics.RecordDuration(DebugPerformancePath.DebugScannerCompletedRun, _runStartedAtTimestamp, _stateMachine.ProcessedCount);
             _runStartedAtTimestamp = 0;
         }
 #endif
-        Plugin.Log.Debug($"DebugPfScanner: complete reason={reason} processed={_stateMachine.ProcessedCount} failures={_stateMachine.ConsecutiveFailures}");
-        if (clearCompletedSnapshot) {
-            DebugPfListingCandidate[] snapshot;
-            lock (_snapshotLock) {
-                snapshot = _collectedRunSnapshot;
-            }
-
-            var removed = _collectedBuffer.RemoveCompletedSnapshot(snapshot);
-            Plugin.Log.Debug($"DebugPfScanner: cleared remaining completed snapshot entries ({removed}).");
-        }
+        _debugLog($"DebugPfScanner: complete reason={reason} processed={_stateMachine.ProcessedCount} failures={_stateMachine.ConsecutiveFailures}");
 
         _isRunning = false;
         _awaitGathererFlushDeadlineUtc = DateTime.MinValue;
@@ -620,10 +658,14 @@ internal sealed class DebugPfScanner : IDisposable {
     }
 
     private bool IsLookingForGroupOpen() {
-        return _plugin.GameGui.GetAddonByName("LookingForGroup", 1) != 0;
+        return _isLookingForGroupOpen();
     }
 
-    private unsafe DebugPfDetailSnapshot GetCurrentDetailSnapshot() {
+    private DebugPfDetailSnapshot GetCurrentDetailSnapshot() {
+        return _getCurrentDetailSnapshot();
+    }
+
+    private unsafe DebugPfDetailSnapshot GetCurrentDetailSnapshotFromGame() {
         if (_plugin.GameGui.GetAddonByName("LookingForGroupDetail", 1) == 0) {
             return default;
         }
@@ -735,7 +777,7 @@ internal sealed class DebugPfScanner : IDisposable {
         }
 
         if (after.Success && after.TerminalOutcome == PartyDetailScannerAttemptOutcome.Succeeded) {
-            _collectedBuffer.MarkSucceeded(after.ListingId, DateTime.UtcNow);
+            _collectedBuffer.MarkSucceeded(after.ListingId, _utcNow());
         } else if (after.TerminalOutcome == PartyDetailScannerAttemptOutcome.Unavailable) {
             _collectedBuffer.RemoveListing(after.ListingId);
         }
@@ -751,7 +793,7 @@ internal sealed class DebugPfScanner : IDisposable {
             }
         }
 
-        Plugin.Log.Debug($"DebugPfScanner: listing={after.ListingId} success={after.Success} reason={after.Reason}");
+        _debugLog($"DebugPfScanner: listing={after.ListingId} success={after.Success} reason={after.Reason}");
     }
 
     private void ArmCaptureRequest(DebugPfListingCandidate target) {

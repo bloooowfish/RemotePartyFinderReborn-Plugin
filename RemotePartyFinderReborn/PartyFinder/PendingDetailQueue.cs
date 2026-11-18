@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Linq;
 
 #nullable enable
@@ -165,5 +166,13 @@ internal sealed record PendingDetailEntry(
     DateTime QueuedAtUtc,
     int AttemptCount,
     DateTime NextAttemptAtUtc,
-    int DeferredCount = 0
-);
+    int DeferredCount = 0,
+    ImmutableHashSet<Guid>? ResolvedTargetIds = null,
+    bool HasAppliedTarget = false
+) {
+    internal ImmutableHashSet<Guid> SafeResolvedTargetIds
+        => ResolvedTargetIds ?? ImmutableHashSet<Guid>.Empty;
+
+    internal bool IsTargetResolved(Guid targetId)
+        => ResolvedTargetIds?.Contains(targetId) ?? false;
+}

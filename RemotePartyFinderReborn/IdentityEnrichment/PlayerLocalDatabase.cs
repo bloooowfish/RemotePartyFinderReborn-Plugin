@@ -75,9 +75,48 @@ internal sealed class PlayerLocalDatabase : IDisposable {
 
     public int PendingCount {
         get {
+            bool shouldQueryOverflow;
+            int inMemoryDirtyCount;
             lock (_stateLock) {
                 ThrowIfDisposedLocked();
-                return _dirtyPlayerCount;
+                inMemoryDirtyCount = _dirtyPlayerCount;
+                shouldQueryOverflow = _playersMayBeIncomplete;
+            }
+
+            if (!shouldQueryOverflow) {
+                return inMemoryDirtyCount;
+            }
+
+            lock (_dbLock) {
+                if (_disposed) {
+                    throw new ObjectDisposedException(nameof(PlayerLocalDatabase));
+                }
+
+                HashSet<ulong> excludedIds;
+                int totalDirty;
+                lock (_stateLock) {
+                    ThrowIfDisposedLocked();
+                    if (!_playersMayBeIncomplete) {
+                        return _dirtyPlayerCount;
+                    }
+
+                    totalDirty = _dirtyPlayerCount + CountEvictedPendingDirtyPlayersLocked();
+                    excludedIds = BuildPlayerSqliteExcludedIdsLocked();
+                }
+
+                using var connection = OpenConnection();
+                using var command = connection.CreateCommand();
+                command.CommandText = "SELECT content_id FROM players WHERE dirty = 1;";
+
+                using var reader = command.ExecuteReader();
+                while (reader.Read()) {
+                    var contentId = (ulong)reader.GetInt64(0);
+                    if (!excludedIds.Contains(contentId)) {
+                        totalDirty++;
+                    }
+                }
+
+                return totalDirty;
             }
         }
     }
@@ -149,59 +188,134 @@ internal sealed class PlayerLocalDatabase : IDisposable {
 
     public List<UploadablePlayer> TakePendingBatch(int maxBatchSize = MaxBatchSize) {
         var clampedLimit = Math.Clamp(maxBatchSize, 1, MaxBatchSize);
-        List<UploadablePlayer> batch;
+        List<PendingPlayerCandidate> inMemoryDirty;
         bool shouldQueryOverflow;
         lock (_stateLock) {
             ThrowIfDisposedLocked();
 
-            batch = _players.Values
-                .Where(static entry => entry.Dirty)
-                .OrderByDescending(static entry => entry.LastSeenUtc)
-                .Take(clampedLimit)
-                .Select(static entry => ClonePlayer(entry.Player))
-                .ToList();
-            shouldQueryOverflow = _playersMayBeIncomplete && batch.Count < clampedLimit;
+            inMemoryDirty = CollectInMemoryDirtyPlayerCandidatesLocked();
+            shouldQueryOverflow = _playersMayBeIncomplete;
         }
 
         if (!shouldQueryOverflow) {
-            return batch;
+            return SelectTopDirtyPlayers(inMemoryDirty, clampedLimit);
         }
 
-        var existingIds = batch.Select(static p => p.ContentId).ToHashSet();
         lock (_dbLock) {
             if (_disposed) {
                 throw new ObjectDisposedException(nameof(PlayerLocalDatabase));
             }
 
+            HashSet<ulong> excludedIds;
+            List<PendingPlayerCandidate> candidates;
+            lock (_stateLock) {
+                ThrowIfDisposedLocked();
+                if (!_playersMayBeIncomplete) {
+                    return SelectTopDirtyPlayers(CollectInMemoryDirtyPlayerCandidatesLocked(), clampedLimit);
+                }
+
+                candidates = SelectTopDirtyCandidates(CollectInMemoryDirtyPlayerCandidatesLocked(), clampedLimit);
+                excludedIds = BuildPlayerSqliteExcludedIdsLocked();
+            }
+
+            var sqliteAdded = 0;
             using var connection = OpenConnection();
             using var command = connection.CreateCommand();
             command.CommandText = """
-                SELECT content_id, name, home_world, current_world, account_id
+                SELECT content_id, name, home_world, current_world, account_id, last_seen_utc
                 FROM players
                 WHERE dirty = 1
-                ORDER BY last_seen_utc DESC
-                LIMIT @limit;
+                ORDER BY last_seen_utc DESC;
                 """;
-            command.Parameters.AddWithValue("@limit", clampedLimit + existingIds.Count);
 
             using var reader = command.ExecuteReader();
-            while (reader.Read() && batch.Count < clampedLimit) {
+            while (reader.Read() && sqliteAdded < clampedLimit) {
                 var contentId = (ulong)reader.GetInt64(0);
-                if (!existingIds.Add(contentId)) {
+                if (!excludedIds.Add(contentId)) {
                     continue;
                 }
 
-                batch.Add(new UploadablePlayer {
-                    ContentId = contentId,
-                    Name = reader.GetString(1),
-                    HomeWorld = Convert.ToUInt16(reader.GetInt64(2)),
-                    CurrentWorld = Convert.ToUInt16(reader.GetInt64(3)),
-                    AccountId = unchecked((ulong)reader.GetInt64(4)),
-                });
+                candidates.Add(new PendingPlayerCandidate(
+                    new UploadablePlayer {
+                        ContentId = contentId,
+                        Name = reader.GetString(1),
+                        HomeWorld = Convert.ToUInt16(reader.GetInt64(2)),
+                        CurrentWorld = Convert.ToUInt16(reader.GetInt64(3)),
+                        AccountId = unchecked((ulong)reader.GetInt64(4)),
+                    },
+                    ParseTimestamp(reader.GetString(5))
+                ));
+                sqliteAdded++;
+            }
+
+            return SelectTopDirtyPlayers(candidates, clampedLimit);
+        }
+    }
+
+    private List<PendingPlayerCandidate> CollectInMemoryDirtyPlayerCandidatesLocked() {
+        var candidates = new List<PendingPlayerCandidate>(_dirtyPlayerCount);
+        foreach (var entry in _players.Values) {
+            if (entry.Dirty) {
+                candidates.Add(new PendingPlayerCandidate(ClonePlayer(entry.Player), entry.LastSeenUtc));
             }
         }
 
-        return batch;
+        foreach (var (contentId, entry) in _pendingPlayerMutations) {
+            if (entry.Dirty && !_players.ContainsKey(contentId)) {
+                candidates.Add(new PendingPlayerCandidate(ClonePlayer(entry.Player), entry.LastSeenUtc));
+            }
+        }
+
+        return candidates;
+    }
+
+    private int CountEvictedPendingDirtyPlayersLocked() {
+        var count = 0;
+        foreach (var (contentId, entry) in _pendingPlayerMutations) {
+            if (entry.Dirty && !_players.ContainsKey(contentId)) {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private HashSet<ulong> BuildPlayerSqliteExcludedIdsLocked() {
+        var excludedIds = new HashSet<ulong>(_players.Count + _pendingPlayerMutations.Count + _pendingPlayerMarkUploadedOnly.Count);
+        foreach (var contentId in _players.Keys) {
+            excludedIds.Add(contentId);
+        }
+        foreach (var contentId in _pendingPlayerMutations.Keys) {
+            excludedIds.Add(contentId);
+        }
+        foreach (var contentId in _pendingPlayerMarkUploadedOnly.Keys) {
+            excludedIds.Add(contentId);
+        }
+
+        return excludedIds;
+    }
+
+    private static List<PendingPlayerCandidate> SelectTopDirtyCandidates(
+        IEnumerable<PendingPlayerCandidate> candidates,
+        int limit
+    ) {
+        return candidates
+            .OrderByDescending(static candidate => candidate.LastSeenUtc)
+            .ThenBy(static candidate => candidate.Player.ContentId)
+            .Take(limit)
+            .ToList();
+    }
+
+    private static List<UploadablePlayer> SelectTopDirtyPlayers(
+        IEnumerable<PendingPlayerCandidate> candidates,
+        int limit
+    ) {
+        return candidates
+            .OrderByDescending(static candidate => candidate.LastSeenUtc)
+            .ThenBy(static candidate => candidate.Player.ContentId)
+            .Take(limit)
+            .Select(static candidate => candidate.Player)
+            .ToList();
     }
 
     public void MarkBatchUploaded(IEnumerable<UploadablePlayer> uploadedPlayers) {
@@ -1351,6 +1465,13 @@ internal sealed class PlayerLocalDatabase : IDisposable {
         _absentIdentities.Add(contentId);
     }
 
+    internal void EvictPlayerFromMemoryForTesting(ulong contentId) {
+        lock (_stateLock) {
+            ThrowIfDisposedLocked();
+            RemovePlayerCacheLocked(contentId);
+        }
+    }
+
     internal void EvictIdentityFromMemoryForTesting(ulong contentId) {
         lock (_stateLock) {
             ThrowIfDisposedLocked();
@@ -1591,6 +1712,11 @@ internal sealed class PlayerLocalDatabase : IDisposable {
         command.Parameters.AddWithValue("@limit", MaxCachedPartialIdentities);
         command.ExecuteNonQuery();
     }
+
+    private readonly record struct PendingPlayerCandidate(
+        UploadablePlayer Player,
+        DateTime LastSeenUtc
+    );
 
     private sealed record CachedPlayerEntry(
         UploadablePlayer Player,

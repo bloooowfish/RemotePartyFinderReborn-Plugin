@@ -105,7 +105,7 @@ internal static class IngestEndpointResolver
         var message = $"RemotePartyFinderReborn: skipped upload target '{uploadUrl.Url}': {error}";
         if (warningLog is null)
         {
-            Plugin.Log.Warning(message);
+            Plugin.Log?.Warning(message);
             return;
         }
 

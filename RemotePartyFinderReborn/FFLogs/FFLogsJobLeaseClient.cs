@@ -47,137 +47,105 @@ internal class FFLogsJobLeaseClient
         warningLog ??= static _ => { };
         debugLog ??= static _ => { };
 
-        var uploadUrl = SelectUploadUrl(configuration, warningLog);
-        if (uploadUrl == null)
+        if (!ProtectedIngestEndpointExecutor.TryBuildWorkerHeaders(
+                _workerRegionProvider,
+                ProcessorKindHeader,
+                ProcessorKindValue,
+                JobModeHeader,
+                JobModeValue,
+                WorkerRegionHeader,
+                "FFLogsCollector",
+                debugLog,
+                out var extraHeaders))
         {
             return new FFLogsJobLeaseAttempt(null, false);
         }
 
-        if (!TryBuildWorkerHeaders(_workerRegionProvider, debugLog, out var extraHeaders))
+        if (!ProtectedIngestEndpointExecutor.TrySelectTargetForProtectedAttempt(
+                configuration,
+                ProtectedEndpointCapabilityKind.FflogsJobs,
+                _seams.TimeProvider.UtcNow,
+                warningLog,
+                out var uploadUrl,
+                out var attemptLease,
+                out var capabilityDeferred)
+            || uploadUrl == null)
         {
             return new FFLogsJobLeaseAttempt(null, false);
         }
 
-        var emptySession = new FFLogsLeaseSession(uploadUrl, []);
-        var result = await _protectedExecutor.ExecuteAsync(
-            configuration,
-            uploadUrl,
-            IngestRoutes.FflogsJobs,
-            ProtectedEndpointCapabilityKind.FflogsJobs,
-            HttpMethod.Get,
-            jsonBody: null,
-            recordUploadAttempt: true,
-            cancellationToken,
-            extraHeaders).ConfigureAwait(false);
-
-        if (result.SkipReason == ProtectedIngestSkipReason.EndpointUnavailable)
-        {
-            return new FFLogsJobLeaseAttempt(null, false);
-        }
-
-        if (result.SkipReason == ProtectedIngestSkipReason.CapabilityDeferred)
+        if (capabilityDeferred)
         {
             return new FFLogsJobLeaseAttempt(
                 new FFLogsLeaseSession(uploadUrl, [], useBaseDelayWhenNoWork: true),
                 false);
         }
 
-        if (result.Success)
+        using (attemptLease)
         {
-            try
+            var emptySession = new FFLogsLeaseSession(uploadUrl, []);
+            var result = await _protectedExecutor.ExecuteAsync(
+                configuration,
+                uploadUrl,
+                IngestRoutes.FflogsJobs,
+                ProtectedEndpointCapabilityKind.FflogsJobs,
+                HttpMethod.Get,
+                jsonBody: null,
+                recordUploadAttempt: true,
+                cancellationToken,
+                extraHeaders,
+                attemptLease).ConfigureAwait(false);
+
+            if (result.SkipReason is ProtectedIngestSkipReason.EndpointUnavailable or ProtectedIngestSkipReason.CircuitOpen)
             {
-                var jobs = JsonConvert.DeserializeObject<List<ParseJob>>(result.Body) ?? [];
+                return new FFLogsJobLeaseAttempt(null, false);
+            }
+
+            if (result.SkipReason == ProtectedIngestSkipReason.CapabilityDeferred)
+            {
                 return new FFLogsJobLeaseAttempt(
-                    new FFLogsLeaseSession(uploadUrl, jobs),
+                    new FFLogsLeaseSession(uploadUrl, [], useBaseDelayWhenNoWork: true),
                     false);
             }
-            catch (JsonException ex)
+
+            if (result.Success)
             {
-                warningLog($"FFLogsCollector: failed to deserialize leased jobs: {ex.Message}");
-                return new FFLogsJobLeaseAttempt(emptySession, true);
+                try
+                {
+                    var jobs = JsonConvert.DeserializeObject<List<ParseJob>>(result.Body) ?? [];
+                    return new FFLogsJobLeaseAttempt(
+                        new FFLogsLeaseSession(uploadUrl, jobs),
+                        false);
+                }
+                catch (JsonException ex)
+                {
+                    warningLog($"FFLogsCollector: failed to deserialize leased jobs: {ex.Message}");
+                    return new FFLogsJobLeaseAttempt(emptySession, true);
+                }
             }
-        }
 
-        if (result.StatusCode == HttpStatusCode.NotFound)
-        {
-            return new FFLogsJobLeaseAttempt(emptySession, false);
-        }
+            if (result.StatusCode == HttpStatusCode.NotFound)
+            {
+                return new FFLogsJobLeaseAttempt(emptySession, false);
+            }
 
-        if (result.RetryAfterSeconds.HasValue)
-        {
-            warningLog($"FFLogsCollector: jobs endpoint rate limited, retry_after={result.RetryAfterSeconds.Value}s");
-        }
+            if (result.RetryAfterSeconds.HasValue)
+            {
+                warningLog($"FFLogsCollector: jobs endpoint rate limited, retry_after={result.RetryAfterSeconds.Value}s");
+            }
 
-        if (!result.StatusCode.HasValue)
-        {
-            debugLog($"Error requesting work: {result.FailureBody}");
-        }
+            if (!result.StatusCode.HasValue)
+            {
+                debugLog($"Error requesting work: {result.FailureBody}");
+            }
 
-        return new FFLogsJobLeaseAttempt(emptySession, result.TransientFailure);
+            return new FFLogsJobLeaseAttempt(emptySession, result.TransientFailure);
+        }
     }
 
     internal UploadUrl SelectAvailableUploadUrl(Configuration configuration, Action<string> warningLog)
-        => SelectUploadUrl(configuration, warningLog);
-
-    private static bool TryBuildWorkerHeaders(
-        IFFLogsWorkerRegionProvider workerRegionProvider,
-        Action<string> debugLog,
-        out IReadOnlyDictionary<string, string> extraHeaders)
-    {
-        var headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-        {
-            [ProcessorKindHeader] = ProcessorKindValue,
-            [JobModeHeader] = JobModeValue,
-        };
-
-        if (workerRegionProvider == null)
-        {
-            extraHeaders = headers;
-            return true;
-        }
-
-        if (workerRegionProvider is IFFLogsWorkerRegionSnapshotState { HasObservedSnapshot: false })
-        {
-            extraHeaders = null;
-            return false;
-        }
-
-        if (!workerRegionProvider.TryGetWorkerRegion(out var region))
-        {
-            debugLog("FFLogsCollector: worker region unavailable; skipping regional jobs poll.");
-            extraHeaders = null;
-            return false;
-        }
-
-        if (string.IsNullOrWhiteSpace(region))
-        {
-            debugLog("FFLogsCollector: worker region was blank; skipping regional jobs poll.");
-            extraHeaders = null;
-            return false;
-        }
-
-        headers[WorkerRegionHeader] = region.Trim();
-        extraHeaders = headers;
-        return true;
-    }
-
-    private UploadUrl SelectUploadUrl(Configuration configuration, Action<string> warningLog)
-    {
-        foreach (var candidate in configuration.GetUploadUrlsSnapshot().Where(static uploadUrl => uploadUrl.IsEnabled))
-        {
-            if (UploadAttemptRecorder.IsCircuitOpen(candidate, configuration, _seams.TimeProvider.UtcNow))
-            {
-                continue;
-            }
-
-            if (!IngestEndpointResolver.IsValidUploadUrl(candidate, warningLog))
-            {
-                continue;
-            }
-
-            return candidate;
-        }
-
-        return null;
-    }
+        => ProtectedIngestEndpointExecutor.SelectAvailableUploadUrl(
+            configuration,
+            _seams.TimeProvider.UtcNow,
+            warningLog ?? (static _ => { }));
 }

@@ -293,37 +293,40 @@ internal sealed class Gatherer : IDisposable {
                 break;
             }
 
-            if (UploadAttemptRecorder.IsCircuitOpen(uploadUrl, _plugin.Configuration, DateTime.UtcNow)) {
-                continue;
-            }
-
             if (!IngestEndpointResolver.TryBuildEndpoint(uploadUrl, IngestRoutes.ListingsMultiple, out var endpoint)) {
                 continue;
             }
-            var attempt = await TryUploadAsync(endpoint, jsonPayload, cancellationToken);
 
-            if (attempt.Canceled) {
-                break;
+            if (!UploadAttemptRecorder.TryBeginAttempt(uploadUrl, _plugin.Configuration, DateTime.UtcNow, out var attemptLease)) {
+                continue;
             }
 
-            if (attempt.Success) {
-                anySuccess = true;
-                UploadAttemptRecorder.RecordSuccess(uploadUrl);
-                IngestResponseParser.CaptureMultipleResponse(uploadUrl, attempt.ResponseBody);
-            } else {
-                UploadAttemptRecorder.RecordFailure(uploadUrl, DateTime.UtcNow);
+            using (attemptLease) {
+                var attempt = await TryUploadAsync(endpoint, jsonPayload, cancellationToken);
 
-                if (!string.IsNullOrEmpty(attempt.ErrorMessage)) {
-                    Plugin.Log.Error($"Gatherer upload error to {endpoint.Url}: {attempt.ErrorMessage}");
+                if (attempt.Canceled) {
+                    break;
                 }
 
-                if (attempt.RetryAfterSeconds.HasValue) {
-                    Plugin.Log.Warning($"Gatherer: rate limited by {endpoint.Url}, retry_after={attempt.RetryAfterSeconds.Value}s");
+                if (attempt.Success) {
+                    anySuccess = true;
+                    attemptLease.RecordSuccess();
+                    IngestResponseParser.CaptureMultipleResponse(uploadUrl, attempt.ResponseBody);
+                } else {
+                    attemptLease.RecordFailure(DateTime.UtcNow);
+
+                    if (!string.IsNullOrEmpty(attempt.ErrorMessage)) {
+                        Plugin.Log.Error($"Gatherer upload error to {endpoint.Url}: {attempt.ErrorMessage}");
+                    }
+
+                    if (attempt.RetryAfterSeconds.HasValue) {
+                        Plugin.Log.Warning($"Gatherer: rate limited by {endpoint.Url}, retry_after={attempt.RetryAfterSeconds.Value}s");
+                    }
                 }
+
+                var statusForLog = attempt.StatusCode?.ToString() ?? "Exception";
+                Plugin.Log.Debug($"Gatherer: {endpoint.Url}: {statusForLog} ({listingCount} listings)");
             }
-
-            var statusForLog = attempt.StatusCode?.ToString() ?? "Exception";
-            Plugin.Log.Debug($"Gatherer: {endpoint.Url}: {statusForLog} ({listingCount} listings)");
         }
 
         return anySuccess;

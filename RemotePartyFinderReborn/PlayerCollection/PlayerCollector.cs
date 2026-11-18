@@ -244,42 +244,45 @@ internal sealed class PlayerCollector : IDisposable {
                         break;
                     }
 
-                    if (UploadAttemptRecorder.IsCircuitOpen(uploadTarget, _plugin.Configuration, DateTime.UtcNow)) {
-                        continue;
-                    }
-
                     if (!IngestEndpointResolver.TryBuildEndpoint(uploadTarget, IngestRoutes.Players, out var endpoint)) {
                         continue;
                     }
-                    try {
-                        using var request = IngestRequestFactory.CreatePostJsonRequest(
-                            _plugin.Configuration,
-                            endpoint,
-                            jsonPayload
-                        );
-                        using var response = await _httpClient.SendAsync(request, cancellationToken);
-                        var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
 
-                        if (response.IsSuccessStatusCode) {
-                            anySuccess = true;
-                            UploadAttemptRecorder.RecordSuccess(uploadTarget);
-                            IngestResponseParser.CapturePlayersResponse(uploadTarget, responseBody);
-                        } else {
-                            UploadAttemptRecorder.RecordFailure(uploadTarget, DateTime.UtcNow);
-                            if ((int)response.StatusCode == 429) {
-                                var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
-                                if (retryAfter.HasValue) {
-                                    Plugin.Log.Warning($"PlayerCollector: server rate limited {endpoint.Url}, retry_after={retryAfter.Value}s");
+                    if (!UploadAttemptRecorder.TryBeginAttempt(uploadTarget, _plugin.Configuration, DateTime.UtcNow, out var attemptLease)) {
+                        continue;
+                    }
+
+                    using (attemptLease) {
+                        try {
+                            using var request = IngestRequestFactory.CreatePostJsonRequest(
+                                _plugin.Configuration,
+                                endpoint,
+                                jsonPayload
+                            );
+                            using var response = await _httpClient.SendAsync(request, cancellationToken);
+                            var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
+
+                            if (response.IsSuccessStatusCode) {
+                                anySuccess = true;
+                                attemptLease.RecordSuccess();
+                                IngestResponseParser.CapturePlayersResponse(uploadTarget, responseBody);
+                            } else {
+                                attemptLease.RecordFailure(DateTime.UtcNow);
+                                if ((int)response.StatusCode == 429) {
+                                    var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
+                                    if (retryAfter.HasValue) {
+                                        Plugin.Log.Warning($"PlayerCollector: server rate limited {endpoint.Url}, retry_after={retryAfter.Value}s");
+                                    }
                                 }
                             }
-                        }
 
-                        Plugin.Log.Debug($"PlayerCollector: {endpoint.Url}: {response.StatusCode} ({batch.Count} players)");
-                    } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
-                        break;
-                    } catch (Exception exception) {
-                        UploadAttemptRecorder.RecordFailure(uploadTarget, DateTime.UtcNow);
-                        Plugin.Log.Error($"PlayerCollector upload error to {endpoint.Url}: {exception.Message}");
+                            Plugin.Log.Debug($"PlayerCollector: {endpoint.Url}: {response.StatusCode} ({batch.Count} players)");
+                        } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
+                            break;
+                        } catch (Exception exception) {
+                            attemptLease.RecordFailure(DateTime.UtcNow);
+                            Plugin.Log.Error($"PlayerCollector upload error to {endpoint.Url}: {exception.Message}");
+                        }
                     }
                 }
 

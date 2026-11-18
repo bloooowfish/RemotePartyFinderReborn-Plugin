@@ -364,7 +364,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         }
 
         var expectedAgent = AgentLookingForGroup.Instance();
-        if (expectedAgent != null && (AgentLookingForGroup*)agent != expectedAgent) {
+        if (expectedAgent == null || (AgentLookingForGroup*)agent != expectedAgent) {
             return;
         }
 

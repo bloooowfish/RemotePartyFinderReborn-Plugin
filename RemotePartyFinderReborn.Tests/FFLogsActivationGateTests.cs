@@ -305,6 +305,85 @@ public sealed class FFLogsActivationGateTests {
     }
 
     [Fact]
+    public async Task FFLogsActivationGate_BeginShutdown_and_WaitForPendingVerifications_prevents_ObjectDisposedException_during_teardown() {
+        var tokenRequestStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseDelayedResponse = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var handler = new ShutdownBlockingHttpMessageHandler(async (request, cancellationToken) => {
+            tokenRequestStarted.TrySetResult();
+            await Task.Delay(TimeSpan.FromSeconds(10), cancellationToken);
+            return new HttpResponseMessage(HttpStatusCode.Unauthorized);
+        });
+        var configuration = new Configuration {
+            FFLogsClientId = "fflogs-client-id",
+            FFLogsClientSecret = "fflogs-client-secret",
+        };
+        var statusStore = new ApiCredentialStatusStore();
+        using var gate = new FFLogsActivationGate(configuration, statusStore, () => { });
+        using var client = new FFLogsClient(
+            configuration,
+            handler,
+            () => DateTime.UtcNow,
+            _ => { },
+            _ => { },
+            _ => { },
+            (_, _) => { },
+            gate.OnFFLogsCredentialStatusReported);
+
+        var verifyTask = gate.VerifyAsync(ct => client.VerifyCredentialsAsync(ct));
+        await tokenRequestStarted.Task;
+
+        // Shutdown signals BeginShutdown() and waits cleanly for the active verification task before Dispose().
+        gate.BeginShutdown();
+        gate.WaitForPendingVerifications(TimeSpan.FromSeconds(2));
+        Assert.True(verifyTask.IsCompleted);
+        var cancelOutcome = await verifyTask;
+        Assert.False(cancelOutcome.Succeeded);
+
+        client.Dispose();
+        gate.Dispose();
+
+        // Also verify slow/non-cooperative handler unwinding AFTER Dispose() does not throw ObjectDisposedException.
+        var slowStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var slowHandler = new ShutdownBlockingHttpMessageHandler(async (request, _) => {
+            slowStarted.TrySetResult();
+            await releaseDelayedResponse.Task;
+            return new HttpResponseMessage(HttpStatusCode.OK) {
+                Content = new StringContent("""{"access_token":"tok","expires_in":3600}"""),
+            };
+        });
+        var slowGate = new FFLogsActivationGate(configuration, statusStore, () => { });
+        var slowClient = new FFLogsClient(
+            configuration,
+            slowHandler,
+            () => DateTime.UtcNow,
+            _ => { },
+            _ => { },
+            _ => { },
+            (_, _) => { },
+            slowGate.OnFFLogsCredentialStatusReported);
+
+        var slowVerifyTask = slowGate.VerifyAsync(ct => slowClient.VerifyCredentialsAsync(ct));
+        await slowStarted.Task;
+
+        slowGate.BeginShutdown();
+        slowGate.WaitForPendingVerifications(TimeSpan.FromMilliseconds(20));
+        Assert.False(slowVerifyTask.IsCompleted);
+
+        slowClient.Dispose();
+        slowGate.Dispose();
+
+        releaseDelayedResponse.TrySetResult();
+        await slowVerifyTask;
+    }
+
+    private sealed class ShutdownBlockingHttpMessageHandler(
+        Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> handler
+    ) : HttpMessageHandler {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            => handler(request, cancellationToken);
+    }
+
+    [Fact]
     public void PartyDetailCaptureRuntime_when_capture_disabled_performs_zero_captures_and_never_suppresses_addon_open() {
         var state = new PartyDetailCaptureState();
         var hookFactory = new CapturingHookFactory();

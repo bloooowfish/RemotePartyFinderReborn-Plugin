@@ -81,14 +81,42 @@ public record UploadUrl(string Url)
         }
     }
 
+    internal bool TryBeginAttempt(
+        int failureThreshold,
+        int breakDurationMinutes,
+        DateTime utcNow,
+        out long halfOpenProbeToken,
+        TimeSpan? halfOpenProbeTimeout = null)
+    {
+        return _circuitState.TryBeginAttempt(
+            failureThreshold,
+            breakDurationMinutes,
+            utcNow,
+            out halfOpenProbeToken,
+            halfOpenProbeTimeout);
+    }
+
+    internal void ReleaseHalfOpenProbe(long halfOpenProbeToken)
+    {
+        _circuitState.ReleaseHalfOpenProbe(halfOpenProbeToken);
+    }
+
     internal bool IsCircuitOpen(int failureThreshold, int breakDurationMinutes, DateTime utcNow)
     {
         return _circuitState.IsCircuitOpen(failureThreshold, breakDurationMinutes, utcNow);
     }
 
-    internal bool PeekIsCircuitOpen(int failureThreshold, int breakDurationMinutes, DateTime utcNow)
+    internal bool PeekIsCircuitOpen(
+        int failureThreshold,
+        int breakDurationMinutes,
+        DateTime utcNow,
+        TimeSpan? halfOpenProbeTimeout = null)
     {
-        return _circuitState.PeekIsCircuitOpen(failureThreshold, breakDurationMinutes, utcNow);
+        return _circuitState.PeekIsCircuitOpen(
+            failureThreshold,
+            breakDurationMinutes,
+            utcNow,
+            halfOpenProbeTimeout);
     }
 
     internal void ApplyIngestCapabilities(

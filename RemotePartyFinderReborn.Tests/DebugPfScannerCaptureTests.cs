@@ -160,6 +160,89 @@ public sealed class DebugPfScannerCaptureTests {
         Assert.Single(captured);
     }
 
+    [Fact]
+    public void DebugPfScanner_CompleteRun_keeps_open_failed_and_timed_out_listings_in_collected_buffer_for_retry() {
+        var now = new DateTime(2026, 5, 10, 12, 0, 0, DateTimeKind.Utc);
+        var configuration = new Configuration {
+            IngestClientId = Guid.NewGuid().ToString("N"),
+            UploadUrls = System.Collections.Immutable.ImmutableList.Create(new UploadUrl("https://upload.example")),
+        };
+        var captureState = new PartyDetailCaptureState();
+        using var httpClient = new HttpClient(new NoopHttpMessageHandler());
+        var collector = new PartyDetailCollector(captureState, configuration, httpClient, () => now, static (_, _) => 0);
+        var runtime = PartyDetailCaptureRuntime.CreateForTesting(captureState, ScannerHeadlessBackendKind.Disabled, () => true);
+
+        var openSucceededFor = new HashSet<ulong> { 101UL, 103UL };
+        var detailVisibleFor = new HashSet<ulong> { 101UL };
+        ulong openedListingId = 0;
+
+        var scanner = new DebugPfScanner(
+            configuration,
+            collector,
+            runtime,
+            () => now,
+            () => true,
+            () => true,
+            () => {
+                if (openedListingId != 0 && detailVisibleFor.Contains(openedListingId)) {
+                    var snap = CreateSnapshot((uint)openedListingId, 1000UL + openedListingId);
+                    runtime.TestObservePopulationEvent();
+                    runtime.TestFrameworkTick(snap);
+                    return new DebugPfDetailSnapshot(openedListingId, 1000UL + openedListingId, 1, 8);
+                }
+
+                return default;
+            },
+            candidate => {
+                if (openSucceededFor.Contains(candidate.ListingId)) {
+                    openedListingId = candidate.ListingId;
+                    runtime.TestInterceptOpenListing(candidate.ListingId, candidate.ContentId);
+                    return true;
+                }
+
+                return false;
+            },
+            triggerGathererImmediateUpload: () => { },
+            hasGathererPendingUploadWork: () => false);
+
+        scanner.TestReceiveHighEndListing(101UL, 1101UL);
+        scanner.TestReceiveHighEndListing(102UL, 1102UL);
+        scanner.TestReceiveHighEndListing(103UL, 1103UL);
+        Assert.Equal(3, scanner.CollectedListingCount);
+
+        Assert.True(scanner.StartScan(out _));
+        for (var i = 0; i < 400 && scanner.IsRunning; i++) {
+            now = now.AddSeconds(1);
+            scanner.TestUpdate();
+            collector.Update();
+        }
+
+        Assert.False(scanner.IsRunning);
+        // Listing 101 succeeded and was removed incrementally; 102 (OpenFailed) and 103 (TimedOut) stay collected.
+        Assert.Equal(2, scanner.CollectedListingCount);
+
+        // Fix transient failure conditions and retry collected listings on the next scan pass.
+        openSucceededFor.Add(102UL);
+        detailVisibleFor.Add(102UL);
+        detailVisibleFor.Add(103UL);
+        openedListingId = 0;
+
+        Assert.True(scanner.StartScan(out _));
+        for (var i = 0; i < 400 && scanner.IsRunning; i++) {
+            now = now.AddSeconds(1);
+            scanner.TestUpdate();
+            collector.Update();
+        }
+
+        Assert.False(scanner.IsRunning);
+        Assert.Equal(0, scanner.CollectedListingCount);
+    }
+
+    private sealed class NoopHttpMessageHandler : HttpMessageHandler {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            => Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK));
+    }
+
     private static UploadablePartyDetail CreateSnapshot(uint listingId, ulong leaderContentId) {
         return new UploadablePartyDetail {
             ListingId = listingId,

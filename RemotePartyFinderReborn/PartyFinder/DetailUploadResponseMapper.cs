@@ -196,7 +196,9 @@ internal sealed record ContributeDetailBatchItemResponse {
 internal readonly record struct DetailUploadOutcome(
     DetailUploadResult Result,
     int? RetryAfterSeconds = null,
-    string? Message = null
+    string? Message = null,
+    IReadOnlyCollection<Guid>? ResolvedTargetIds = null,
+    bool HasAppliedTarget = false
 );
 
 internal enum DetailUploadResult {
@@ -205,4 +207,5 @@ internal enum DetailUploadResult {
     TerminalRejected,
     Deferred,
     RetryableFailure,
+    CircuitBlocked,
 }

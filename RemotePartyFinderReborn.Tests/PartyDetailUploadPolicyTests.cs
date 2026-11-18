@@ -798,6 +798,81 @@ public sealed class PartyDetailUploadPolicyTests {
         Assert.Equal(2, handler.StartedCount);
     }
 
+    [Fact]
+    public async Task Open_circuit_does_not_drop_queued_details_within_break_window_and_delivers_on_half_open_probe() {
+        var startNow = new DateTime(2026, 5, 10, 10, 30, 0, DateTimeKind.Utc);
+        var now = startNow;
+        var uploadUrl = new UploadUrl("https://upload.example");
+        var configuration = new Configuration {
+            CircuitBreakerFailureThreshold = 1,
+            CircuitBreakerBreakDurationMinutes = 1,
+            DetailUploadBatchSize = 10,
+            DetailUploadRetryCount = 1,
+            DetailUploadTimeoutMs = 1000,
+            IngestClientId = Guid.NewGuid().ToString("N"),
+            UploadUrls = ImmutableList.Create(uploadUrl),
+        };
+        UploadAttemptRecorder.RecordFailure(uploadUrl, startNow);
+
+        var handler = new StubHttpMessageHandler();
+        handler.Enqueue(async (request, cancellationToken) => {
+            var body = await request.Content!.ReadAsStringAsync(cancellationToken);
+            var ids = JArray.Parse(body).Select(item => item.Value<uint>("listing_id")).ToArray();
+            var results = new JArray(ids.Select(id => new JObject {
+                ["listing_id"] = id,
+                ["status"] = "ok",
+                ["matched_count"] = 1,
+                ["modified_count"] = 1,
+            }));
+            var payload = new JObject {
+                ["status"] = "ok",
+                ["requested"] = ids.Length,
+                ["accepted"] = ids.Length,
+                ["applied"] = ids.Length,
+                ["missing"] = 0,
+                ["failed"] = 0,
+                ["results"] = results,
+            };
+            return new HttpResponseMessage(HttpStatusCode.OK) {
+                Content = new StringContent(payload.ToString()),
+            };
+        });
+        using var httpClient = new HttpClient(handler);
+        var collector = new PartyDetailCollector(
+            new PartyDetailCaptureState(),
+            configuration,
+            httpClient,
+            () => now,
+            static (_, _) => 0
+        );
+
+        collector.EnqueuePendingDetailForTesting(CreateDetail(9001U), startNow, PartyDetailRequestOwner.Manual);
+        collector.EnqueuePendingDetailForTesting(CreateDetail(9002U), startNow, PartyDetailRequestOwner.Scanner);
+
+        // Repeatedly process while circuit is open (<60s); neither item may burn attempts/deferrals or be dropped.
+        for (var elapsedSeconds = 0; elapsedSeconds <= 45; elapsedSeconds += 15) {
+            now = startNow.AddSeconds(elapsedSeconds);
+            await collector.ProcessNextDueUploadForTestingAsync();
+            var manualState = collector.GetPendingDetailForTesting(9001U);
+            var scannerState = collector.GetPendingDetailForTesting(9002U);
+            Assert.NotNull(manualState);
+            Assert.NotNull(scannerState);
+            Assert.Equal(0, manualState!.Value.AttemptCount);
+            Assert.Equal(0, manualState.Value.DeferredCount);
+            Assert.Equal(0, scannerState!.Value.AttemptCount);
+            Assert.Equal(0, scannerState.Value.DeferredCount);
+            Assert.True(manualState.Value.NextAttemptAtUtc > now);
+        }
+
+        // Advance to exact 60s circuit expiry -> Half-Open probe runs and delivers both items.
+        now = startNow.AddMinutes(1);
+        await collector.ProcessNextDueUploadForTestingAsync();
+
+        Assert.Equal(0, collector.PendingQueueCount);
+        Assert.Equal(1, handler.StartedCount);
+        Assert.Equal(2, collector.LastSuccessfulUploadAckVersion);
+    }
+
     private static PartyDetailCollector CreateCollector(
         HttpClient httpClient,
         Func<DateTime> utcNow,

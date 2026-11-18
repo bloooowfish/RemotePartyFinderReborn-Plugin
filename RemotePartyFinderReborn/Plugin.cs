@@ -97,7 +97,7 @@ public class Plugin : IDalamudPlugin {
     private readonly CancellationTokenSource _shutdownCts = new();
     private readonly List<Action> _shutdownSignalActions = [];
     private readonly Stack<Action> _cleanupActions = new();
-    private bool _disposed;
+    private int _disposed;
 
     public Plugin() {
         try {
@@ -119,6 +119,7 @@ public class Plugin : IDalamudPlugin {
             _cleanupActions.Push(() => _shutdownCts.Dispose());
             _shutdownSignalActions.Add(() => _shutdownCts.Cancel());
             this.ActivationGate = new FFLogsActivationGate(Configuration, ApiCredentialStatus, Configuration.Save);
+            _shutdownSignalActions.Add(() => this.ActivationGate.BeginShutdown());
             _cleanupActions.Push(() => this.ActivationGate.Dispose());
 
             this.Gatherer = new Gatherer(this);
@@ -219,11 +220,10 @@ public class Plugin : IDalamudPlugin {
     }
 
     public void Dispose() {
-        if (_disposed) {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) {
             return;
         }
 
-        _disposed = true;
         RunCleanupActions();
     }
 
@@ -237,6 +237,16 @@ public class Plugin : IDalamudPlugin {
                 } catch {
                     // Ignore logging failures during teardown.
                 }
+            }
+        }
+
+        try {
+            this.ActivationGate?.WaitForPendingVerifications(TimeSpan.FromSeconds(2));
+        } catch (Exception ex) {
+            try {
+                Log?.Error(ex, "Plugin: failed waiting for FFLogs credential verification shutdown.");
+            } catch {
+                // Ignore logging failures during teardown.
             }
         }
 
@@ -295,7 +305,7 @@ public class Plugin : IDalamudPlugin {
     }
 
     internal async Task<OperationOutcome<bool>> VerifyFFLogsCredentialsAsync(CancellationToken cancellationToken = default) {
-        if (_disposed) {
+        if (Volatile.Read(ref _disposed) != 0) {
             return OperationOutcome<bool>.Failure(false, "Plugin is shutting down.");
         }
 
@@ -314,6 +324,8 @@ public class Plugin : IDalamudPlugin {
                     ct => FFLogsCollector.VerifyCredentialsAsync(ct),
                     linkedCts.Token).ConfigureAwait(false);
             } catch (OperationCanceledException) when (shutdownToken.IsCancellationRequested && !cancellationToken.IsCancellationRequested) {
+                return OperationOutcome<bool>.Failure(false, "Plugin is shutting down.");
+            } catch (ObjectDisposedException) when (Volatile.Read(ref _disposed) != 0) {
                 return OperationOutcome<bool>.Failure(false, "Plugin is shutting down.");
             }
         }

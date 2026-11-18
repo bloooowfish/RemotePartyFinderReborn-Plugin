@@ -434,6 +434,63 @@ public sealed class Phase3AHardeningTests {
     }
 
     [Fact]
+    public void UploadAttemptLease_releases_half_open_probe_on_dispose_without_outcome_and_recovers_after_stale_timeout() {
+        var uploadUrl = new UploadUrl("https://lease.example");
+        var config = new Configuration {
+            CircuitBreakerFailureThreshold = 1,
+            CircuitBreakerBreakDurationMinutes = 1,
+        };
+        var start = new DateTime(2026, 4, 1, 10, 0, 0, DateTimeKind.Utc);
+        UploadAttemptRecorder.RecordFailure(uploadUrl, start);
+
+        var probeStart = start.AddMinutes(1);
+        Assert.False(UploadAttemptRecorder.PeekIsCircuitOpen(uploadUrl, config, probeStart));
+        Assert.True(UploadAttemptRecorder.TryBeginAttempt(uploadUrl, config, probeStart, out var lease));
+        Assert.NotNull(lease);
+        Assert.True(lease.ClaimedHalfOpenProbe);
+
+        // Concurrent caller sees Half-Open slot occupied via both PeekIsCircuitOpen and TryBeginAttempt.
+        Assert.True(UploadAttemptRecorder.PeekIsCircuitOpen(uploadUrl, config, probeStart));
+        Assert.False(UploadAttemptRecorder.TryBeginAttempt(uploadUrl, config, probeStart, out var concurrentLease));
+        Assert.Null(concurrentLease);
+
+        // Disposing unsettled lease releases the Half-Open probe cleanly for the next caller.
+        lease.Dispose();
+        Assert.False(UploadAttemptRecorder.PeekIsCircuitOpen(uploadUrl, config, probeStart.AddSeconds(1)));
+        Assert.True(UploadAttemptRecorder.TryBeginAttempt(
+            uploadUrl,
+            config,
+            probeStart.AddSeconds(1),
+            out var leakedLease,
+            halfOpenProbeTimeout: TimeSpan.FromSeconds(10)));
+        Assert.NotNull(leakedLease);
+        Assert.True(leakedLease.ClaimedHalfOpenProbe);
+
+        // If a probe never completes/disposes, stale timeout clears the stuck probe slot.
+        Assert.True(UploadAttemptRecorder.TryBeginAttempt(
+            uploadUrl,
+            config,
+            probeStart.AddSeconds(11),
+            out var recoveredLease,
+            halfOpenProbeTimeout: TimeSpan.FromSeconds(10)));
+        Assert.NotNull(recoveredLease);
+        Assert.True(recoveredLease.ClaimedHalfOpenProbe);
+
+        // Disposing the stale leaked lease afterwards must NOT clear the newly acquired probe slot.
+        leakedLease.Dispose();
+        Assert.True(UploadAttemptRecorder.PeekIsCircuitOpen(
+            uploadUrl,
+            config,
+            probeStart.AddSeconds(12),
+            halfOpenProbeTimeout: TimeSpan.FromSeconds(10)));
+
+        recoveredLease.RecordSuccess();
+        recoveredLease.Dispose();
+        Assert.False(UploadAttemptRecorder.PeekIsCircuitOpen(uploadUrl, config, probeStart.AddSeconds(12)));
+        Assert.Equal(0, uploadUrl.FailureCount);
+    }
+
+    [Fact]
     public void PlayerLocalDatabase_caches_hits_negatively_caches_absent_falls_back_for_pending_preserves_partial_and_flushes_dirty() {
         var tempDir = Path.Combine(Path.GetTempPath(), "RemotePartyFinderReborn.Tests", Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(tempDir);
@@ -555,6 +612,58 @@ public sealed class Phase3AHardeningTests {
                 },
             ]);
             Assert.False(db.HasPendingCleanPruneForTesting());
+        } finally {
+            SqliteConnection.ClearAllPools();
+            if (Directory.Exists(tempDir)) {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public void PlayerLocalDatabase_TakePendingBatch_skips_in_memory_clean_rows_and_tracks_sqlite_dirty_overflow_until_drained() {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"rpfr-db-overflow-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try {
+            var dbPath = Path.Combine(tempDir, "players.db");
+            using var db = new PlayerLocalDatabase(dbPath);
+            static UploadablePlayer MakePlayer(ulong id) => new() {
+                ContentId = id,
+                Name = $"Player{id}",
+                HomeWorld = 77,
+                CurrentWorld = 77,
+            };
+
+            // Seed 6 players and flush to SQLite so dirty = 1 is persisted.
+            db.UpsertObservedPlayers(Enumerable.Range(1001, 6).Select(i => MakePlayer((ulong)i)));
+            db.Flush();
+            Assert.Equal(6, db.PendingCount);
+
+            // Mark top 4 players (1003..1006) clean in-memory WITHOUT flushing (simulating the 200ms coalesce window),
+            // and evict 1001 and 1002 from memory so _playersMayBeIncomplete == true and _dirtyPlayerCount == 0.
+            db.MarkBatchUploaded(new[] { 1003UL, 1004UL, 1005UL, 1006UL }.Select(MakePlayer));
+            db.EvictPlayerFromMemoryForTesting(1001UL);
+            db.EvictPlayerFromMemoryForTesting(1002UL);
+
+            // PendingCount must reflect SQLite dirty overflow rows (1001, 1002) even when _dirtyPlayerCount == 0!
+            Assert.Equal(2, db.PendingCount);
+
+            // TakePendingBatch(limit: 2) must NOT be choked by 1003..1006 in SQLite (which still have dirty = 1 until flush)
+            // and must still return overflow rows 1001 and 1002.
+            var batch = db.TakePendingBatch(2);
+            var batchIds = batch.Select(x => x.ContentId).OrderBy(x => x).ToArray();
+            Assert.Equal(new[] { 1001UL, 1002UL }, batchIds);
+
+            // Mark evicted overflow rows uploaded BEFORE flushing -> _pendingPlayerMarkUploadedOnly must exclude them
+            // from both PendingCount and TakePendingBatch immediately.
+            db.MarkBatchUploaded(new[] { 1001UL, 1002UL }.Select(MakePlayer));
+            Assert.Equal(0, db.PendingCount);
+            Assert.Empty(db.TakePendingBatch(10));
+
+            // After flushing, SQLite dirty = 0 across all rows as well.
+            db.Flush();
+            Assert.Equal(0, db.PendingCount);
+            Assert.Empty(db.TakePendingBatch(10));
         } finally {
             SqliteConnection.ClearAllPools();
             if (Directory.Exists(tempDir)) {

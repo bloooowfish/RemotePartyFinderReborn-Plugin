@@ -478,6 +478,8 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
             _ => false,
         });
 
+    internal int PendingProfileRequestCountForTesting => _profileRequests.Count;
+
     private async Task<CachedProfileFetchResult> FetchProfileAsync(
         string path,
         CancellationToken cancellationToken)
@@ -494,118 +496,123 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
             }
         }
 
-        var request = _profileRequests.GetOrAdd(key, _ => new Lazy<Task<CachedProfileFetchResult>>(
-            () => FetchAndCacheProfileAsync(key, cancellationToken)));
-        try
+        var request = _profileRequests.GetOrAdd(key, k =>
         {
-            return await request.Value.WaitAsync(cancellationToken).ConfigureAwait(false);
-        }
-        finally
-        {
-            if (request.IsValueCreated && request.Value.IsCompleted)
-            {
-                _profileRequests.TryRemove(new KeyValuePair<(string Path, string Credential), Lazy<Task<CachedProfileFetchResult>>>(key, request));
-            }
-        }
+            Lazy<Task<CachedProfileFetchResult>> entry = null;
+            entry = new Lazy<Task<CachedProfileFetchResult>>(
+                () => FetchAndCacheProfileAsync(k, entry, cancellationToken));
+            return entry;
+        });
+
+        return await request.Value.WaitAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<CachedProfileFetchResult> FetchAndCacheProfileAsync(
         (string Path, string Credential) key,
+        Lazy<Task<CachedProfileFetchResult>> self,
         CancellationToken cancellationToken)
     {
-        var now = _utcNow();
-        lock (_profileCacheLock)
+        try
         {
-            if (_profileCache.TryGetValue(key, out var cached) && cached.ExpiresAt > now)
-            {
-                return new CachedProfileFetchResult(
-                    OperationOutcome<CachedProfileEntry>.Success(cached),
-                    PerformedHttpRequest: false);
-            }
-        }
-
-        var outcome = await _client.GetRawOutcomeAsync(key.Path, cancellationToken).ConfigureAwait(false);
-        if (!outcome.Succeeded || outcome.Value is not { } response)
-        {
-            return new CachedProfileFetchResult(
-                OperationOutcome<CachedProfileEntry>.Failure(
-                    outcome.TransientFailure,
-                    outcome.ErrorMessage),
-                PerformedHttpRequest: true);
-        }
-
-        JToken parsedRoot = null;
-        if (response.ActivityHidden
-            || response.StatusCode == HttpStatusCode.NotFound
-            || response.StatusCode is >= HttpStatusCode.OK and < HttpStatusCode.MultipleChoices)
-        {
-            if (!response.ActivityHidden
-                && response.StatusCode is >= HttpStatusCode.OK and < HttpStatusCode.MultipleChoices
-                && response.StatusCode != HttpStatusCode.NoContent)
-            {
-                try
-                {
-                    var root = JToken.Parse(response.Body);
-                    // Keep encounter and activity data; drop large cosmetic/gear payloads.
-                    if (root is JObject profile && profile["encounters"] is { } encounters)
-                    {
-                        var trimmedProfile = new JObject
-                        {
-                            ["encounters"] = encounters,
-                        };
-                        if (profile["activity"] is { Type: not JTokenType.Null and not JTokenType.Undefined } activity)
-                        {
-                            trimmedProfile["activity"] = activity;
-                        }
-
-                        parsedRoot = trimmedProfile;
-                        response = new TomestoneRawResponse
-                        {
-                            StatusCode = response.StatusCode,
-                            Body = trimmedProfile.ToString(),
-                        };
-                    }
-                    else
-                    {
-                        parsedRoot = root;
-                    }
-                }
-                catch (JsonException ex)
-                {
-                    return new CachedProfileFetchResult(
-                        OperationOutcome<CachedProfileEntry>.Failure(
-                            transientFailure: false,
-                            $"Tomestone profile parse failed: {ex.Message}"),
-                        PerformedHttpRequest: true);
-                }
-            }
-
-            var cacheNow = _utcNow();
-            var entry = new CachedProfileEntry(cacheNow.AddMinutes(5), response, parsedRoot);
+            var now = _utcNow();
             lock (_profileCacheLock)
             {
-                foreach (var expired in _profileCache.Where(pair => pair.Value.ExpiresAt <= cacheNow).Select(pair => pair.Key).ToArray())
+                if (_profileCache.TryGetValue(key, out var cached) && cached.ExpiresAt > now)
                 {
-                    _profileCache.Remove(expired);
+                    return new CachedProfileFetchResult(
+                        OperationOutcome<CachedProfileEntry>.Success(cached),
+                        PerformedHttpRequest: false);
                 }
-
-                if (_profileCache.Count >= 128)
-                {
-                    _profileCache.Remove(_profileCache.MinBy(static pair => pair.Value.ExpiresAt).Key);
-                }
-
-                _profileCache[key] = entry;
             }
 
+            var outcome = await _client.GetRawOutcomeAsync(key.Path, cancellationToken).ConfigureAwait(false);
+            if (!outcome.Succeeded || outcome.Value is not { } response)
+            {
+                return new CachedProfileFetchResult(
+                    OperationOutcome<CachedProfileEntry>.Failure(
+                        outcome.TransientFailure,
+                        outcome.ErrorMessage),
+                    PerformedHttpRequest: true);
+            }
+
+            JToken parsedRoot = null;
+            if (response.ActivityHidden
+                || response.StatusCode == HttpStatusCode.NotFound
+                || response.StatusCode is >= HttpStatusCode.OK and < HttpStatusCode.MultipleChoices)
+            {
+                if (!response.ActivityHidden
+                    && response.StatusCode is >= HttpStatusCode.OK and < HttpStatusCode.MultipleChoices
+                    && response.StatusCode != HttpStatusCode.NoContent)
+                {
+                    try
+                    {
+                        var root = JToken.Parse(response.Body);
+                        // Keep encounter and activity data; drop large cosmetic/gear payloads.
+                        if (root is JObject profile && profile["encounters"] is { } encounters)
+                        {
+                            var trimmedProfile = new JObject
+                            {
+                                ["encounters"] = encounters,
+                            };
+                            if (profile["activity"] is { Type: not JTokenType.Null and not JTokenType.Undefined } activity)
+                            {
+                                trimmedProfile["activity"] = activity;
+                            }
+
+                            parsedRoot = trimmedProfile;
+                            response = new TomestoneRawResponse
+                            {
+                                StatusCode = response.StatusCode,
+                                Body = trimmedProfile.ToString(),
+                            };
+                        }
+                        else
+                        {
+                            parsedRoot = root;
+                        }
+                    }
+                    catch (JsonException ex)
+                    {
+                        return new CachedProfileFetchResult(
+                            OperationOutcome<CachedProfileEntry>.Failure(
+                                transientFailure: false,
+                                $"Tomestone profile parse failed: {ex.Message}"),
+                            PerformedHttpRequest: true);
+                    }
+                }
+
+                var cacheNow = _utcNow();
+                var entry = new CachedProfileEntry(cacheNow.AddMinutes(5), response, parsedRoot);
+                lock (_profileCacheLock)
+                {
+                    foreach (var expired in _profileCache.Where(pair => pair.Value.ExpiresAt <= cacheNow).Select(pair => pair.Key).ToArray())
+                    {
+                        _profileCache.Remove(expired);
+                    }
+
+                    if (_profileCache.Count >= 128)
+                    {
+                        _profileCache.Remove(_profileCache.MinBy(static pair => pair.Value.ExpiresAt).Key);
+                    }
+
+                    _profileCache[key] = entry;
+                }
+
+                return new CachedProfileFetchResult(
+                    OperationOutcome<CachedProfileEntry>.Success(entry),
+                    PerformedHttpRequest: true);
+            }
+
+            var nonCachedEntry = new CachedProfileEntry(DateTime.MinValue, response, null);
             return new CachedProfileFetchResult(
-                OperationOutcome<CachedProfileEntry>.Success(entry),
+                OperationOutcome<CachedProfileEntry>.Success(nonCachedEntry),
                 PerformedHttpRequest: true);
         }
-
-        var nonCachedEntry = new CachedProfileEntry(DateTime.MinValue, response, null);
-        return new CachedProfileFetchResult(
-            OperationOutcome<CachedProfileEntry>.Success(nonCachedEntry),
-            PerformedHttpRequest: true);
+        finally
+        {
+            _profileRequests.TryRemove(
+                new KeyValuePair<(string Path, string Credential), Lazy<Task<CachedProfileFetchResult>>>(key, self));
+        }
     }
 
     private void LogResponseShapeOnce(

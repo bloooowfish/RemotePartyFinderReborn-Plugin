@@ -537,7 +537,7 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
         }
 
         var expectedAgent = AgentCharaCard.Instance();
-        if (expectedAgent != null && thisPtr != expectedAgent) {
+        if (expectedAgent == null || thisPtr != expectedAgent) {
             return _selectOkStateTransitionHook is { } mismatchedHook
                 ? mismatchedHook.Original(thisPtr, returnValue, values, valueCount, eventKind)
                 : returnValue;
@@ -582,7 +582,7 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
         }
 
         var expectedAgent = AgentCharaCard.Instance();
-        if (expectedAgent != null && thisPtr != expectedAgent) {
+        if (expectedAgent == null || thisPtr != expectedAgent) {
             return _createSelectOkDialogHook?.Original(thisPtr, messageId, variant) ?? 0;
         }
 

@@ -42,6 +42,23 @@ internal static class PartyDetailUploadPolicy {
         return nowUtc.AddMilliseconds(ComputeRetryDelayMs(Math.Max(1, deferCount) + 1, nextJitterMs));
     }
 
+    internal static DateTime ComputeCircuitBlockedNextAttemptAtUtc(
+        DateTime nowUtc,
+        TimeSpan? minRemainingBreakDuration,
+        Func<int, int, int> nextJitterMs
+    ) {
+        TimeSpan baseDelay;
+        if (minRemainingBreakDuration is { } remaining) {
+            baseDelay = remaining > TimeSpan.Zero
+                ? TimeSpan.FromMilliseconds(Math.Clamp(remaining.TotalMilliseconds, 1000.0, 30_000.0))
+                : TimeSpan.FromSeconds(2);
+        } else {
+            baseDelay = TimeSpan.FromSeconds(30);
+        }
+
+        return nowUtc.Add(baseDelay).AddMilliseconds(nextJitterMs(50, 250));
+    }
+
     internal static int NormalizeRetryCount(int configuredRetries) {
         return Math.Max(0, configuredRetries);
     }
