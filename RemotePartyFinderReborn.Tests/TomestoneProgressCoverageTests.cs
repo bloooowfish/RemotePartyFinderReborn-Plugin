@@ -137,7 +137,7 @@ public sealed class TomestoneProgressCoverageTests
             new StubFFLogsIngestHttpSender(),
             progression,
             new ManualFFLogsTimeProvider(),
-            new Configuration { TomestoneRequestIntervalMs = 0, TomestoneMaxConcurrency = 1 },
+            new Configuration { TomestoneRequestIntervalMs = 0, TomestoneMaxConcurrency = 1, BypassTomestonePacingClampDebug = true },
             new ApiCredentialStatusStore(),
             static (_, _) => Task.CompletedTask);
         var session = new TomestoneLeaseSession(

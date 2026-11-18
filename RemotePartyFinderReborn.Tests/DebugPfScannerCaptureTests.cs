@@ -56,15 +56,7 @@ public sealed class DebugPfScannerCaptureTests {
         var request = captureState.BeginRequest(PartyDetailRequestOwner.Scanner, target.ListingId, target.ContentId);
         var snapshot = CreateSnapshot((uint)target.ListingId, target.ContentId);
 
-        stateMachine.UpsertVisibleCandidate(target);
-        Assert.Null(stateMachine.SyncQueue(
-            nowUtc,
-            [],
-            hasIncomingListings: false,
-            maxPerRun: 0,
-            dedupTtlSeconds: 600,
-            runFromCollectedListings: false
-        ));
+        Assert.Null(stateMachine.SyncQueue(nowUtc, [target], dedupTtlSeconds: 600));
         Assert.Equal(DebugPfScanState.OpenTarget, stateMachine.State);
 
         stateMachine.HandleOpenAttemptResult(
@@ -93,27 +85,79 @@ public sealed class DebugPfScannerCaptureTests {
     }
 
     [Fact]
-    public void Start_current_page_run_enables_debug_scanner_without_collected_listing_mode() {
-        var configuration = new Configuration {
-            EnableAutoDetailScanDebug = false,
-        };
-        var resetCount = 0;
-        var saveCount = 0;
-        var runFromCollectedListings = true;
-        var wasEnabled = true;
+    public void Collected_listing_buffer_tracks_page_turns_dedups_recent_scans_and_resets_on_clear() {
+        var t0 = new DateTime(2026, 4, 16, 4, 0, 0, DateTimeKind.Utc);
+        var buffer = new CollectedListingBuffer();
 
-        DebugPfScanner.ConfigureCurrentPageRun(
-            configuration,
-            () => resetCount++,
-            () => saveCount++,
-            ref runFromCollectedListings,
-            ref wasEnabled);
+        Assert.True(buffer.UpsertFromListing(1001UL, 11UL, batchNumber: 0, t0));
+        Assert.True(buffer.UpsertFromListing(1002UL, 22UL, batchNumber: 1, t0.AddSeconds(1)));
 
-        Assert.True(configuration.EnableAutoDetailScanDebug);
-        Assert.False(runFromCollectedListings);
-        Assert.False(wasEnabled);
-        Assert.Equal(1, resetCount);
-        Assert.Equal(1, saveCount);
+        Assert.Equal(2, buffer.Count);
+        Assert.Equal(2, buffer.PageBatchCount);
+
+        buffer.MarkSucceeded(1001UL, t0.AddSeconds(2));
+        Assert.Equal(1, buffer.Count);
+
+        // Refresh of already-scanned listing is skipped without bumping page batch count.
+        Assert.False(buffer.UpsertFromListing(1001UL, 11UL, batchNumber: 2, t0.AddSeconds(5)));
+        Assert.Equal(1, buffer.Count);
+        Assert.Equal(2, buffer.PageBatchCount);
+
+        buffer.MarkSucceeded(1002UL, t0.AddSeconds(6));
+        Assert.Equal(0, buffer.Count);
+        Assert.Equal(0, buffer.PageBatchCount);
+
+        // Even after buffer drains, recently scanned items remain skipped while fresh batch arrives.
+        Assert.False(buffer.UpsertFromListing(1001UL, 11UL, batchNumber: 3, t0.AddSeconds(7)));
+        Assert.Equal(0, buffer.PageBatchCount);
+
+        // Clearing resets dedup history so previously scanned listings can be re-collected.
+        buffer.ClearAll();
+        Assert.True(buffer.UpsertFromListing(1001UL, 11UL, batchNumber: 4, t0.AddSeconds(8)));
+        Assert.Equal(1, buffer.Count);
+        Assert.Equal(1, buffer.PageBatchCount);
+
+        // Entries older than the 10-minute TTL are pruned automatically.
+        var snapshot = buffer.TakeOrderedSnapshot(t0.AddMinutes(11));
+        Assert.Empty(snapshot);
+        Assert.Equal(0, buffer.Count);
+        Assert.Equal(0, buffer.PageBatchCount);
+    }
+
+    [Fact]
+    public void Populate_immediate_snapshot_records_arrival_without_duplicate_tick_capture() {
+        var state = new PartyDetailCaptureState();
+        using var runtime = new PartyDetailCaptureRuntime(state);
+        var captured = new List<UploadablePartyDetail>();
+        using var collector = new PartyDetailCollector(
+            state,
+            tryQueuePayload: payload => {
+                captured.Add(payload);
+                return true;
+            },
+            pumpPendingUploads: static () => { }
+        );
+
+        var attemptId = Guid.NewGuid();
+        var snapshot = CreateSnapshot(9401U, 88UL);
+
+        runtime.ArmScannerRequest(attemptId, 9401U, 88UL);
+        runtime.BeginScannerOpenAttempt(attemptId);
+        runtime.TestInterceptOpenListing(9401U, 88UL);
+        runtime.EndScannerOpenAttempt(attemptId);
+
+        Assert.True(runtime.TestPopulateListingDataSnapshot(snapshot));
+        collector.Update();
+
+        var requestSerial = runtime.GetArmedScannerRequestSerial(attemptId);
+        Assert.NotNull(requestSerial);
+        Assert.True(runtime.IsScannerConsumedAckReady(requestSerial!.Value, 9401U, 88UL));
+        Assert.Single(captured);
+
+        // Subsequent framework tick sees no remaining active cycle and does not duplicate.
+        runtime.TestFrameworkTick(snapshot);
+        collector.Update();
+        Assert.Single(captured);
     }
 
     private static UploadablePartyDetail CreateSnapshot(uint listingId, ulong leaderContentId) {

@@ -108,6 +108,7 @@ public sealed class TomestoneBatchProcessorTests
         {
             TomestoneMaxConcurrency = 2,
             TomestoneRequestIntervalMs = 250,
+            BypassTomestonePacingClampDebug = true,
         };
         var processor = CreateProcessor(
             progression,
@@ -160,6 +161,7 @@ public sealed class TomestoneBatchProcessorTests
         {
             TomestoneMaxConcurrency = 1,
             TomestoneRequestIntervalMs = 0,
+            BypassTomestonePacingClampDebug = true,
         };
         var processor = CreateProcessor(progression, configuration: configuration);
         var session = new TomestoneLeaseSession(
@@ -210,7 +212,7 @@ public sealed class TomestoneBatchProcessorTests
         };
         var processor = CreateProcessor(
             progression,
-            configuration: new Configuration { TomestoneMaxConcurrency = 1, TomestoneRequestIntervalMs = 0 },
+            configuration: new Configuration { TomestoneMaxConcurrency = 1, TomestoneRequestIntervalMs = 0, BypassTomestonePacingClampDebug = true },
             apiStatus: apiStatus);
         var session = new TomestoneLeaseSession(
             new UploadUrl("https://upload.example/"),
@@ -245,7 +247,7 @@ public sealed class TomestoneBatchProcessorTests
         };
         var processor = CreateProcessor(
             progression,
-            configuration: new Configuration { TomestoneMaxConcurrency = 1, TomestoneRequestIntervalMs = 150 },
+            configuration: new Configuration { TomestoneMaxConcurrency = 1, TomestoneRequestIntervalMs = 150, BypassTomestonePacingClampDebug = true },
             requestDelayAsync: (_, _) =>
             {
                 cooldownActive = true;
@@ -278,7 +280,7 @@ public sealed class TomestoneBatchProcessorTests
             new StubFFLogsIngestHttpSender(),
             progression,
             new ManualFFLogsTimeProvider(),
-            new Configuration { TomestoneMaxConcurrency = 1, TomestoneRequestIntervalMs = 0 },
+            new Configuration { TomestoneMaxConcurrency = 1, TomestoneRequestIntervalMs = 0, BypassTomestonePacingClampDebug = true },
             new ApiCredentialStatusStore(),
             static (_, _) => Task.CompletedTask);
         var processor = new TomestoneBatchProcessor(seams, warnings.Add);
@@ -307,6 +309,7 @@ public sealed class TomestoneBatchProcessorTests
             TomestoneApiKey = "secret-token",
             TomestoneMaxConcurrency = 1,
             TomestoneRequestIntervalMs = 0,
+            BypassTomestonePacingClampDebug = true,
         };
         using var apiClient = new TomestoneApiClient(config, handler);
         var service = new TomestoneProgressionService(apiClient, config);
@@ -347,6 +350,92 @@ public sealed class TomestoneBatchProcessorTests
         Assert.Equal([104, 105], submitted.TomestoneQueriedEncounters);
         Assert.Equal(35.2, submitted.BossPercentages[104], 1);
         Assert.Equal(8.7, submitted.BossPercentages[105], 1);
+    }
+
+    [Fact]
+    public async Task Batch_processor_clamps_concurrency_and_interval_unless_debug_override_is_enabled()
+    {
+        var delays = new List<TimeSpan>();
+        var active = 0;
+        var maxActive = 0;
+        var progression = new StubTomestoneProgressionService
+        {
+            OnFetchProgressionDataAsync = async (_, _, _, _, _) =>
+            {
+                var nowActive = Interlocked.Increment(ref active);
+                UpdateMax(ref maxActive, nowActive);
+                await Task.Delay(35);
+                Interlocked.Decrement(ref active);
+                return TomestoneProgressData.Empty;
+            },
+        };
+        var configuration = new Configuration
+        {
+            TomestoneMaxConcurrency = 3,
+            TomestoneRequestIntervalMs = 50,
+            BypassTomestonePacingClampDebug = false,
+        };
+        var processor = CreateProcessor(
+            progression,
+            configuration: configuration,
+            requestDelayAsync: (delay, _) =>
+            {
+                delays.Add(delay);
+                return Task.CompletedTask;
+            });
+        var session = new TomestoneLeaseSession(
+            new UploadUrl("https://upload.example/"),
+            [
+                CreateJob(7201, 73, 101, "A", "Tonberry"),
+                CreateJob(7202, 73, 102, "B", "Tonberry"),
+            ]);
+
+        var result = await processor.ProcessLeaseSessionAsync(session, CancellationToken.None);
+
+        Assert.Equal(2, result.ProcessedResults.Count);
+        Assert.Equal(1, maxActive);
+        var delay = Assert.Single(delays);
+        Assert.Equal(TimeSpan.FromMilliseconds(1000), delay);
+    }
+
+    [Fact]
+    public async Task Batch_processor_spaces_multiple_targets_within_single_job()
+    {
+        var delays = new List<TimeSpan>();
+        var progression = new StubTomestoneProgressionService();
+        var configuration = new Configuration
+        {
+            TomestoneMaxConcurrency = 1,
+            TomestoneRequestIntervalMs = 1000,
+        };
+        var processor = CreateProcessor(
+            progression,
+            configuration: configuration,
+            requestDelayAsync: (delay, _) =>
+            {
+                delays.Add(delay);
+                return Task.CompletedTask;
+            });
+        var job = new TomestoneJob
+        {
+            ContentId = 7301,
+            ZoneId = 73,
+            DifficultyId = 101,
+            EncounterId = 104,
+            SecondaryEncounterId = 105,
+            Name = "Split Multi",
+            Server = "Tonberry",
+            Region = "JP",
+            LeaseToken = "lease-split-multi",
+        };
+        var session = new TomestoneLeaseSession(new UploadUrl("https://upload.example/"), [job]);
+
+        var result = await processor.ProcessLeaseSessionAsync(session, CancellationToken.None);
+
+        Assert.Single(result.ProcessedResults);
+        Assert.Equal(2, progression.Requests.Count);
+        var delay = Assert.Single(delays);
+        Assert.Equal(TimeSpan.FromMilliseconds(1000), delay);
     }
 
     [Fact]
@@ -544,7 +633,7 @@ public sealed class TomestoneBatchProcessorTests
             new StubFFLogsIngestHttpSender(),
             progression,
             new ManualFFLogsTimeProvider(),
-            configuration ?? new Configuration { TomestoneMaxConcurrency = 1, TomestoneRequestIntervalMs = 0 },
+            configuration ?? new Configuration { TomestoneMaxConcurrency = 1, TomestoneRequestIntervalMs = 0, BypassTomestonePacingClampDebug = true },
             apiStatus ?? new ApiCredentialStatusStore(),
             requestDelayAsync ?? (static (_, _) => Task.CompletedTask));
         return new TomestoneBatchProcessor(seams);

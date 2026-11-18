@@ -25,13 +25,21 @@ internal sealed class Gatherer : IDisposable {
     private readonly HttpClient _httpClient = new();
     private readonly CancellationTokenSource _disposeCts = new();
 
-    private volatile bool _uploadInProgress;
+    private int _uploadWorkerRunning;
     private long _lastSuccessfulUploadAtUtcTicks;
     private long _lastSuccessfulUploadAckVersion;
 
     internal long LastSuccessfulUploadAckVersion => Interlocked.Read(ref this._lastSuccessfulUploadAckVersion);
     internal DateTime LastSuccessfulUploadAtUtc => new(Interlocked.Read(ref this._lastSuccessfulUploadAtUtcTicks), DateTimeKind.Utc);
     internal int UploadedListingIndexCount => this._lastUploadedListingAtUtc.Count;
+
+    internal bool HasPendingUploadWork {
+        get {
+            lock (_batchesLock) {
+                return _uploadWorkerRunning != 0 || _batches.Count > 0;
+            }
+        }
+    }
 
     internal Gatherer(Plugin plugin) {
         _plugin = plugin;
@@ -101,13 +109,19 @@ internal sealed class Gatherer : IDisposable {
         }
     }
 
-    private void OnUpdate(IFramework framework) {
+    internal void TriggerImmediateUpload() {
         if (!_plugin.IsPluginOperational) {
             ClearPendingBatches();
             return;
         }
 
-        if (_uploadInProgress) {
+        _uploadTimer.Restart();
+        TryStartUploadWorker();
+    }
+
+    private void OnUpdate(IFramework framework) {
+        if (!_plugin.IsPluginOperational) {
+            ClearPendingBatches();
             return;
         }
 
@@ -116,44 +130,64 @@ internal sealed class Gatherer : IDisposable {
         }
 
         _uploadTimer.Restart();
-        _uploadInProgress = true;
+        TryStartUploadWorker();
+    }
+
+    private void TryStartUploadWorker() {
+        lock (_batchesLock) {
+            if (_uploadWorkerRunning != 0 || _batches.Count == 0) {
+                return;
+            }
+
+            _uploadWorkerRunning = 1;
+        }
+
         _ = ProcessPendingBatchesAsync();
     }
 
     private Task ProcessPendingBatchesAsync() {
         return Task.Run(async () => {
+            var exitedUnderLock = false;
             try {
-                var listingsToUpload = DrainBatches();
-                if (listingsToUpload.Count == 0) {
-                    return;
+                while (!_disposeCts.IsCancellationRequested && _plugin.IsPluginOperational) {
+                    var listingsToUpload = DrainBatchesOrExitWorker();
+                    if (listingsToUpload.Count == 0) {
+                        exitedUnderLock = true;
+                        return;
+                    }
+
+                    var payload = JsonConvert.SerializeObject(listingsToUpload);
+                    var uploadedListingIds = listingsToUpload.Select(static listing => listing.Id).Distinct().ToArray();
+                    var uploadSucceeded = await UploadBatchToEnabledEndpointsAsync(payload, listingsToUpload.Count);
+
+                    if (!uploadSucceeded) {
+                        return;
+                    }
+
+                    var now = DateTime.UtcNow;
+                    foreach (var listingId in uploadedListingIds) {
+                        _lastUploadedListingAtUtc[listingId] = now;
+                    }
+
+                    Interlocked.Exchange(ref _lastSuccessfulUploadAtUtcTicks, now.Ticks);
+                    Interlocked.Increment(ref _lastSuccessfulUploadAckVersion);
+                    PruneUploadIndex(now);
                 }
-
-                var payload = JsonConvert.SerializeObject(listingsToUpload);
-                var uploadedListingIds = listingsToUpload.Select(static listing => listing.Id).Distinct().ToArray();
-                var uploadSucceeded = await UploadBatchToEnabledEndpointsAsync(payload, listingsToUpload.Count);
-
-                if (!uploadSucceeded) {
-                    return;
-                }
-
-                var now = DateTime.UtcNow;
-                foreach (var listingId in uploadedListingIds) {
-                    _lastUploadedListingAtUtc[listingId] = now;
-                }
-
-                Interlocked.Exchange(ref _lastSuccessfulUploadAtUtcTicks, now.Ticks);
-                Interlocked.Increment(ref _lastSuccessfulUploadAckVersion);
-                PruneUploadIndex(now);
             } finally {
-                _uploadInProgress = false;
+                if (!exitedUnderLock) {
+                    lock (_batchesLock) {
+                        _uploadWorkerRunning = 0;
+                    }
+                }
             }
         });
     }
 
-    private List<UploadableListing> DrainBatches() {
+    private List<UploadableListing> DrainBatchesOrExitWorker() {
         Dictionary<int, List<UploadableListing>> drained;
         lock (_batchesLock) {
             if (_batches.Count == 0) {
+                _uploadWorkerRunning = 0;
                 return [];
             }
 

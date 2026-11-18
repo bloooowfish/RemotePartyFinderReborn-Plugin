@@ -358,14 +358,10 @@ public sealed class FFLogsActivationGateTests {
             FFLogsWorkerJitterMs = 5000,
             TomestoneRequestIntervalMs = 2500,
             TomestoneMaxConcurrency = 3,
-            AutoDetailScanActionIntervalMs = 1500,
-            AutoDetailScanDetailTimeoutMs = 9000,
-            AutoDetailScanMinDwellMs = 2000,
-            AutoDetailScanPostListingCooldownMs = 1500,
-            AutoDetailScanDedupTtlSeconds = 1800,
-            AutoDetailScanMaxConsecutiveFailures = 12,
-            AutoDetailScanRetryCount = 4,
-            AutoDetailScanMaxPerRun = 50,
+            AutoDetailScanActionIntervalMs = 600,
+            AutoDetailScanPostListingCooldownMs = 250,
+            AutoDetailScanDetailTimeoutMs = 4500,
+            AutoDetailScanRetryCount = 3,
         };
 
         configuration.ResetUploadBehaviorDefaults();
@@ -383,17 +379,13 @@ public sealed class FFLogsActivationGateTests {
         Assert.Equal(60000, configuration.FFLogsWorkerMaxBackoffDelayMs);
         Assert.Equal(2000, configuration.FFLogsWorkerJitterMs);
 
-        Assert.Equal(750, configuration.TomestoneRequestIntervalMs);
+        Assert.Equal(1000, configuration.TomestoneRequestIntervalMs);
         Assert.Equal(1, configuration.TomestoneMaxConcurrency);
 
-        Assert.Equal(400, configuration.AutoDetailScanActionIntervalMs);
-        Assert.Equal(3500, configuration.AutoDetailScanDetailTimeoutMs);
-        Assert.Equal(800, configuration.AutoDetailScanMinDwellMs);
-        Assert.Equal(300, configuration.AutoDetailScanPostListingCooldownMs);
-        Assert.Equal(600, configuration.AutoDetailScanDedupTtlSeconds);
-        Assert.Equal(5, configuration.AutoDetailScanMaxConsecutiveFailures);
-        Assert.Equal(1, configuration.AutoDetailScanRetryCount);
-        Assert.Equal(0, configuration.AutoDetailScanMaxPerRun);
+        Assert.Equal(Configuration.DefaultScanActionIntervalMs, configuration.AutoDetailScanActionIntervalMs);
+        Assert.Equal(Configuration.DefaultScanPostListingCooldownMs, configuration.AutoDetailScanPostListingCooldownMs);
+        Assert.Equal(Configuration.DefaultScanDetailTimeoutMs, configuration.AutoDetailScanDetailTimeoutMs);
+        Assert.Equal(Configuration.DefaultScanRetryCount, configuration.AutoDetailScanRetryCount);
 
         var defaultUrl = Assert.Single(Configuration.DefaultUploadUrls());
         Assert.Equal("http://127.0.0.1:8000", defaultUrl.Url);

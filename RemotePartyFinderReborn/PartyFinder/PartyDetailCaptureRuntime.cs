@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.CompilerServices;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
@@ -10,6 +11,7 @@ namespace RemotePartyFinderReborn;
 internal enum PartyDetailScannerAttemptOutcome {
     OpenFailed,
     TimedOut,
+    Unavailable,
     Succeeded,
 }
 
@@ -243,6 +245,15 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         return _requestCoordinator.ShouldSuppressScannerGameLog(_state, logMessageId);
     }
 
+    internal bool TryGetScannerFailureSignal(
+        long requestSerial,
+        ulong listingId,
+        ulong contentId,
+        out PartyDetailScannerFailureSignal signal
+    ) {
+        return _requestCoordinator.TryGetScannerFailureSignal(requestSerial, listingId, contentId, out signal);
+    }
+
     internal void TestInterceptOpenListing(ulong listingId, ulong contentId) {
         _ = contentId;
         EnsureRequestCycleForIntercept(listingId, 0UL);
@@ -271,6 +282,27 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
     internal void TestObservePopulationEvent() {
         RaisePostRequestPopulationSignal();
+    }
+
+    internal bool TestPopulateListingDataSnapshot(
+        UploadablePartyDetail? snapshot,
+        PartyDetailDebugSnapshot? debugSnapshot = null
+    ) {
+        if (!_isCaptureEnabled()) {
+            return false;
+        }
+
+        RaisePostRequestPopulationSignal();
+        if (snapshot is null || !_state.TryGetCurrentRequestCycle(out var cycle)) {
+            return false;
+        }
+
+        return TryRecordAgentSnapshot(
+            snapshot,
+            debugSnapshot,
+            enforceFreshness: true,
+            expectedRequestSerial: cycle.RequestSerial
+        );
     }
 
     internal void TestFrameworkTick(UploadablePartyDetail? snapshot) {
@@ -310,7 +342,6 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     }
 
     private void PopulateListingDataDetour(nint agent, nint listingData) {
-        _ = agent;
         _ = listingData;
         if (!_isCaptureEnabled()) {
             return;
@@ -318,9 +349,34 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
         try {
             RaisePostRequestPopulationSignal();
+            if (agent != 0) {
+                TryCaptureFromPopulatedAgent(agent);
+            }
         } catch (Exception ex) {
             Plugin.Log?.Warning(ex, "PartyDetailCaptureRuntime: PopulateListingDataDetour failed.");
         }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private unsafe void TryCaptureFromPopulatedAgent(nint agent) {
+        if (agent == 0 || !_state.TryGetCurrentRequestCycle(out var cycle)) {
+            return;
+        }
+
+        if (!PartyDetailSnapshotBuilder.TryBuildFromAgent(
+                (AgentLookingForGroup*)agent,
+                out var snapshot,
+                out var debugSnapshot
+            )) {
+            return;
+        }
+
+        _ = TryRecordAgentSnapshot(
+            snapshot,
+            debugSnapshot,
+            enforceFreshness: true,
+            expectedRequestSerial: cycle.RequestSerial
+        );
     }
 
     private bool PfDetailOpenDetour(

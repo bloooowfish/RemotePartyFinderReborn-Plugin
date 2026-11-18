@@ -285,16 +285,8 @@ public sealed class PartyDetailCaptureStateTests {
         var queue = new DebugPfListingQueue();
         var stateMachine = new DebugPfScanStateMachine(queue);
         var target = new DebugPfListingCandidate(9001U, 44UL, nowUtc, 1);
-        stateMachine.UpsertVisibleCandidate(target);
 
-        _ = stateMachine.SyncQueue(
-            nowUtc,
-            [],
-            hasIncomingListings: false,
-            maxPerRun: 0,
-            dedupTtlSeconds: 600,
-            runFromCollectedListings: false
-        );
+        _ = stateMachine.SyncQueue(nowUtc, [target], dedupTtlSeconds: 600);
 
         stateMachine.HandleOpenAttemptResult(
             nowUtc,
@@ -317,16 +309,8 @@ public sealed class PartyDetailCaptureStateTests {
         var queue = new DebugPfListingQueue();
         var stateMachine = new DebugPfScanStateMachine(queue);
         var target = new DebugPfListingCandidate(api15ListingId, 44UL, nowUtc, 1);
-        stateMachine.UpsertVisibleCandidate(target);
 
-        _ = stateMachine.SyncQueue(
-            nowUtc,
-            [],
-            hasIncomingListings: false,
-            maxPerRun: 0,
-            dedupTtlSeconds: 600,
-            runFromCollectedListings: false
-        );
+        _ = stateMachine.SyncQueue(nowUtc, [target], dedupTtlSeconds: 600);
 
         Assert.Equal(api15ListingId, stateMachine.CurrentTargetListingId);
     }
@@ -337,16 +321,8 @@ public sealed class PartyDetailCaptureStateTests {
         var queue = new DebugPfListingQueue();
         var stateMachine = new DebugPfScanStateMachine(queue);
         var target = new DebugPfListingCandidate(9101U, 55UL, nowUtc, 1);
-        stateMachine.UpsertVisibleCandidate(target);
 
-        _ = stateMachine.SyncQueue(
-            nowUtc,
-            [],
-            hasIncomingListings: false,
-            maxPerRun: 0,
-            dedupTtlSeconds: 600,
-            runFromCollectedListings: false
-        );
+        _ = stateMachine.SyncQueue(nowUtc, [target], dedupTtlSeconds: 600);
 
         stateMachine.HandleOpenAttemptResult(
             nowUtc,
@@ -359,7 +335,6 @@ public sealed class PartyDetailCaptureStateTests {
         stateMachine.HandleDetailReadyState(
             nowUtc.AddMilliseconds(10),
             new DebugPfDetailSnapshot(target.ListingId, target.ContentId, NonZeroMembers: 4, TotalSlots: 8),
-            minDwellMs: 800,
             detailReadyTimeoutMs: 3500,
             configuredRetries: 0,
             postListingCooldownMs: 300
@@ -367,7 +342,6 @@ public sealed class PartyDetailCaptureStateTests {
         stateMachine.HandleDetailReadyState(
             nowUtc.AddMilliseconds(20),
             new DebugPfDetailSnapshot(target.ListingId, target.ContentId, NonZeroMembers: 4, TotalSlots: 8),
-            minDwellMs: 800,
             detailReadyTimeoutMs: 3500,
             configuredRetries: 0,
             postListingCooldownMs: 300

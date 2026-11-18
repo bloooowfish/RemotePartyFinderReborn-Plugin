@@ -11,10 +11,17 @@ internal static class PartyDetailSnapshotBuilder {
         out UploadablePartyDetail snapshot,
         out PartyDetailDebugSnapshot? debugSnapshot
     ) {
+        return TryBuildFromAgent(AgentLookingForGroup.Instance(), out snapshot, out debugSnapshot);
+    }
+
+    internal static unsafe bool TryBuildFromAgent(
+        AgentLookingForGroup* lookingForGroupAgent,
+        out UploadablePartyDetail snapshot,
+        out PartyDetailDebugSnapshot? debugSnapshot
+    ) {
         snapshot = new UploadablePartyDetail();
         debugSnapshot = null;
 
-        var lookingForGroupAgent = AgentLookingForGroup.Instance();
         if (lookingForGroupAgent == null) {
             return false;
         }

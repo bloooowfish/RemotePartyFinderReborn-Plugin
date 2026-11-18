@@ -378,6 +378,7 @@ public sealed class TomestoneBackgroundWorkerTests
         TomestoneApiKey = "valid-api-key",
         TomestoneMaxConcurrency = 1,
         TomestoneRequestIntervalMs = 0,
+        BypassTomestonePacingClampDebug = true,
         FFLogsWorkerBaseDelayMs = 250,
         FFLogsWorkerIdleDelayMs = 250,
         FFLogsWorkerMaxBackoffDelayMs = 1000,

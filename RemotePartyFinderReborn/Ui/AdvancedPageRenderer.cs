@@ -3,6 +3,7 @@
 using System;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Utility.Raii;
 
 namespace RemotePartyFinderReborn;
 
@@ -143,35 +144,57 @@ internal sealed class AdvancedPageRenderer {
     }
 
     private void DrawTomestonePacingCard() {
+        var bypassClamp = _configuration.BypassTomestonePacingClampDebug;
+        var minInterval = bypassClamp
+            ? Configuration.DebugMinTomestoneRequestIntervalMs
+            : Configuration.SafeMinTomestoneRequestIntervalMs;
+        var maxInterval = bypassClamp
+            ? Configuration.DebugMaxTomestoneRequestIntervalMs
+            : Configuration.SafeMaxTomestoneRequestIntervalMs;
+        var maxAllowedConcurrency = bypassClamp
+            ? Configuration.DebugMaxTomestoneConcurrency
+            : Configuration.SafeMaxTomestoneConcurrency;
+
         UiTheme.DrawCard(
             "AdvancedTomestonePacingCard",
             "Tomestone Request Pacing",
             "Request interval and concurrency for official Tomestone API lookups.",
             () => {
+                if (bypassClamp) {
+                    UiTheme.DrawColoredWrappedText(
+                        UiTheme.Warning,
+                        "Debug pacing clamp override is active for this session (resets on plugin reload).");
+                    ImGui.Spacing();
+                }
+
                 UiTheme.DrawFormTable("AdvancedTomestonePacingForm", () => {
                     UiTheme.FormRow(
                         "Request Interval",
-                        "Delay between Tomestone requests. Ctrl+Click slider to enter an exact number.",
+                        bypassClamp
+                            ? "Delay between Tomestone requests (debug override active). Ctrl+Click slider to enter an exact number."
+                            : "Delay between Tomestone requests (clamped to >= 1000 ms to avoid HTTP 429; override available in Debug).",
                         () => {
-                            var requestIntervalMs = Configuration.NormalizeTomestoneRequestIntervalMs(
-                                _configuration.TomestoneRequestIntervalMs);
-                            if (ImGui.SliderInt("##tomestoneInterval", ref requestIntervalMs, 0, 60000, "%d ms")) {
+                            var requestIntervalMs = _configuration.GetEffectiveTomestoneRequestIntervalMs();
+                            if (ImGui.SliderInt("##tomestoneInterval", ref requestIntervalMs, minInterval, maxInterval, "%d ms")) {
                                 _configuration.TomestoneRequestIntervalMs =
-                                    Configuration.NormalizeTomestoneRequestIntervalMs(requestIntervalMs);
+                                    Configuration.NormalizeTomestoneRequestIntervalMs(requestIntervalMs, bypassClamp);
                                 _configuration.Save();
                             }
                         });
 
                     UiTheme.FormRow(
                         "Max Concurrency",
-                        "Maximum number of Tomestone progress requests started in the same wave.",
+                        bypassClamp
+                            ? "Maximum number of Tomestone progress requests started in the same wave (debug override active)."
+                            : "Locked to 1 to prevent Tomestone API HTTP 429 bursts (override available in Debug).",
                         () => {
-                            var maxConcurrency = Configuration.NormalizeTomestoneMaxConcurrency(
-                                _configuration.TomestoneMaxConcurrency);
-                            if (ImGui.SliderInt("##tomestoneConcurrency", ref maxConcurrency, 1, 3, "%d")) {
-                                _configuration.TomestoneMaxConcurrency =
-                                    Configuration.NormalizeTomestoneMaxConcurrency(maxConcurrency);
-                                _configuration.Save();
+                            var maxConcurrency = _configuration.GetEffectiveTomestoneMaxConcurrency();
+                            using (ImRaii.Disabled(!bypassClamp)) {
+                                if (ImGui.SliderInt("##tomestoneConcurrency", ref maxConcurrency, 1, maxAllowedConcurrency, "%d")) {
+                                    _configuration.TomestoneMaxConcurrency =
+                                        Configuration.NormalizeTomestoneMaxConcurrency(maxConcurrency, bypassClamp);
+                                    _configuration.Save();
+                                }
                             }
                         });
                 });

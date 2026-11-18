@@ -58,8 +58,8 @@ internal sealed class TomestoneBatchProcessor
                 CooldownRemaining: TimeSpan.Zero);
         }
 
-        var maxConcurrency = Configuration.NormalizeTomestoneMaxConcurrency(_seams.Configuration.TomestoneMaxConcurrency);
-        var requestIntervalMs = Configuration.NormalizeTomestoneRequestIntervalMs(_seams.Configuration.TomestoneRequestIntervalMs);
+        var maxConcurrency = _seams.Configuration.GetEffectiveTomestoneMaxConcurrency();
+        var requestIntervalMs = _seams.Configuration.GetEffectiveTomestoneRequestIntervalMs();
 
         var hadTransientFailure = false;
         var hitRateLimitCooldown = false;
@@ -128,7 +128,7 @@ internal sealed class TomestoneBatchProcessor
             }
 
             hasExecutedAnyQuery = true;
-            var waveOutcomes = await Task.WhenAll(wave.Select(item => ExecuteJobAsync(item, cancellationToken)))
+            var waveOutcomes = await Task.WhenAll(wave.Select(item => ExecuteJobAsync(item, requestIntervalMs, cancellationToken)))
                 .ConfigureAwait(false);
 
             foreach (var outcome in waveOutcomes)
@@ -171,6 +171,7 @@ internal sealed class TomestoneBatchProcessor
 
     private async Task<SingleJobOutcome> ExecuteJobAsync(
         QueryItem item,
+        int requestIntervalMs,
         CancellationToken cancellationToken)
     {
         var job = item.Job;
@@ -178,9 +179,23 @@ internal sealed class TomestoneBatchProcessor
 
         for (var i = 0; i < item.Targets.Count; i++)
         {
-            if (i > 0 && TryAbortForWorkerState(out var preRateLimited, out var preRejected, out _))
+            if (i > 0)
             {
-                return CreateDeferredOutcome(job, preRateLimited, preRejected);
+                if (TryAbortForWorkerState(out var preRateLimited, out var preRejected, out _))
+                {
+                    return CreateDeferredOutcome(job, preRateLimited, preRejected);
+                }
+
+                if (requestIntervalMs > 0)
+                {
+                    await _seams.RequestDelayAsync(TimeSpan.FromMilliseconds(requestIntervalMs), cancellationToken)
+                        .ConfigureAwait(false);
+
+                    if (TryAbortForWorkerState(out var postDelayRateLimited, out var postDelayRejected, out _))
+                    {
+                        return CreateDeferredOutcome(job, postDelayRateLimited, postDelayRejected);
+                    }
+                }
             }
 
             var target = item.Targets[i];

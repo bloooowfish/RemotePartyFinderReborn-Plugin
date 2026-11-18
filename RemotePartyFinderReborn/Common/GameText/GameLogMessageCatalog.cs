@@ -41,6 +41,10 @@ internal static class GameLogMessageCatalog {
         return PartyDetailFailureChatLogIdSet.Contains(logMessageId);
     }
 
+    internal static bool IsNonRetryablePartyDetailFailureChatLogId(uint logMessageId) {
+        return logMessageId is 969 or 974 or 7479;
+    }
+
     internal static IReadOnlyList<uint> FindMissingKnownIds(ILogMessageLookup lookup) {
         return KnownSuppressionLogMessageIds()
             .Where(id => !lookup.TryGet(id, out _))

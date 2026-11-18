@@ -12,6 +12,7 @@ internal sealed class PartyDetailRequestCoordinator {
     private ScannerAttempt? _scannerAttempt;
     private ActiveScannerIntercept? _activeScannerIntercept;
     private PartyDetailScannerHeadlessScope? _activeScannerHeadlessScope;
+    private PartyDetailScannerFailureSignal? _scannerFailureSignal;
 
     internal PartyDetailRequestCoordinator(
         ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled
@@ -49,6 +50,7 @@ internal sealed class PartyDetailRequestCoordinator {
             }
 
             _scannerAttempt = new ScannerAttempt(attemptId, listingId, contentId, null, allowHeadless);
+            _scannerFailureSignal = null;
         }
     }
 
@@ -74,6 +76,7 @@ internal sealed class PartyDetailRequestCoordinator {
         lock (_gate) {
             if (_scannerAttempt is { AttemptId: var armedAttemptId } && armedAttemptId == attemptId) {
                 _scannerAttempt = null;
+                _scannerFailureSignal = null;
             }
 
             if (_activeScannerIntercept is { AttemptId: var activeAttemptId } && activeAttemptId == attemptId) {
@@ -91,6 +94,7 @@ internal sealed class PartyDetailRequestCoordinator {
             _scannerAttempt = null;
             _activeScannerIntercept = null;
             _activeScannerHeadlessScope = null;
+            _scannerFailureSignal = null;
         }
     }
 
@@ -218,12 +222,41 @@ internal sealed class PartyDetailRequestCoordinator {
             var isScannerOwnedCapture = cycle.Owner == PartyDetailRequestOwner.Scanner
                                         && cycle.RequestSerial == requestSerial.Value
                                         && IsCompatible(attempt.ListingId, attempt.ContentId, cycle.ListingId, cycle.ContentId);
+            if (isScannerOwnedCapture && GameLogMessageCatalog.IsPartyDetailFailureChatLogId(logMessageId)) {
+                _scannerFailureSignal ??= new PartyDetailScannerFailureSignal(
+                    cycle.RequestSerial,
+                    cycle.ListingId,
+                    cycle.ContentId,
+                    logMessageId,
+                    GameLogMessageCatalog.IsNonRetryablePartyDetailFailureChatLogId(logMessageId)
+                );
+            }
+
             return GameLogSuppressionPolicy.ShouldSuppress(
                 logMessageId,
                 activeCandidate with {
                     IsScannerOwnedCapture = isScannerOwnedCapture,
                 }
             );
+        }
+    }
+
+    internal bool TryGetScannerFailureSignal(
+        long requestSerial,
+        ulong listingId,
+        ulong contentId,
+        out PartyDetailScannerFailureSignal signal
+    ) {
+        lock (_gate) {
+            if (_scannerFailureSignal is { } recorded
+                && recorded.RequestSerial == requestSerial
+                && IsCompatible(recorded.ListingId, recorded.ContentId, listingId, contentId)) {
+                signal = recorded;
+                return true;
+            }
+
+            signal = default;
+            return false;
         }
     }
 
@@ -296,6 +329,7 @@ internal sealed class PartyDetailRequestCoordinator {
         return outcome switch {
             PartyDetailScannerAttemptOutcome.OpenFailed => true,
             PartyDetailScannerAttemptOutcome.TimedOut => true,
+            PartyDetailScannerAttemptOutcome.Unavailable => true,
             PartyDetailScannerAttemptOutcome.Succeeded => true,
             _ => false,
         };
@@ -329,4 +363,12 @@ internal readonly record struct PartyDetailScannerHeadlessScope(
     long RequestSerial,
     ulong ListingId,
     ulong ContentId
+);
+
+internal readonly record struct PartyDetailScannerFailureSignal(
+    long RequestSerial,
+    ulong ListingId,
+    ulong ContentId,
+    uint LogMessageId,
+    bool IsNonRetryableUnavailable
 );
