@@ -32,6 +32,8 @@ public class Configuration : IPluginConfiguration {
     
     [Newtonsoft.Json.JsonIgnore]
     private readonly object _uploadUrlsSync = new();
+    [Newtonsoft.Json.JsonIgnore]
+    private readonly object _saveSync = new();
     private ImmutableList<UploadUrl> _uploadUrls = DefaultUploadUrls();
 
     public ImmutableList<UploadUrl> UploadUrls {
@@ -183,6 +185,8 @@ public class Configuration : IPluginConfiguration {
         => Math.Clamp(configured, 0, 5);
 
     public void Save() {
-        Plugin.PluginInterface.SavePluginConfig(this);
+        lock (_saveSync) {
+            Plugin.PluginInterface.SavePluginConfig(this);
+        }
     }
 }

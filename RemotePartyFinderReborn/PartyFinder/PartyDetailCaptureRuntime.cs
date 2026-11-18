@@ -359,7 +359,12 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private unsafe void TryCaptureFromPopulatedAgent(nint agent) {
-        if (agent == 0 || !_state.TryGetCurrentRequestCycle(out var cycle)) {
+        if (!NativePointerValidator.IsValidUserPointer(agent) || !_state.TryGetCurrentRequestCycle(out var cycle)) {
+            return;
+        }
+
+        var expectedAgent = AgentLookingForGroup.Instance();
+        if (expectedAgent != null && (AgentLookingForGroup*)agent != expectedAgent) {
             return;
         }
 

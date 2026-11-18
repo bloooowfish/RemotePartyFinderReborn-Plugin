@@ -13,6 +13,7 @@ namespace RemotePartyFinderReborn;
 
 internal sealed class PartyDetailCollector : IDisposable {
     private static readonly TimeSpan UploadPumpInterval = TimeSpan.FromMilliseconds(150);
+    private static readonly TimeSpan ShutdownWaitTimeout = TimeSpan.FromSeconds(2);
 
     private readonly Plugin? _plugin;
     private readonly Configuration? _configuration;
@@ -26,6 +27,12 @@ internal sealed class PartyDetailCollector : IDisposable {
     private readonly PartyDetailUploadExecutor? _uploadExecutor;
     private readonly Stopwatch _uploadPumpTimer = new();
     private readonly PendingDetailQueue _pendingDetailQueue = new();
+    private readonly CancellationTokenSource _disposeCts = new();
+    private readonly object _activeTasksLock = new();
+    private readonly HashSet<Task> _activeUploadTasks = new();
+
+    private int _shutdownSignaled;
+    private int _disposed;
 
     private uint _lastQueuedListingId;
     private long _lastQueuedAckVersion;
@@ -67,7 +74,7 @@ internal sealed class PartyDetailCollector : IDisposable {
         _captureState = captureState ?? throw new ArgumentNullException(nameof(captureState));
         _tryQueueArrival = TryQueueArrivalCore;
         _pumpPendingUploads = PumpUploadQueue;
-        _httpClient = httpClient ?? new HttpClient();
+        _httpClient = httpClient ?? PluginHttpClientFactory.CreateIngestClient();
         _ownsHttpClient = httpClient is null;
         _utcNow = utcNow ?? (static () => DateTime.UtcNow);
         _nextJitterMs = nextJitterMs ?? (static (min, max) => Random.Shared.Next(min, max));
@@ -87,7 +94,7 @@ internal sealed class PartyDetailCollector : IDisposable {
         _captureState = captureState ?? throw new ArgumentNullException(nameof(captureState));
         _tryQueueArrival = TryQueueArrivalCore;
         _pumpPendingUploads = PumpUploadQueue;
-        _httpClient = httpClient ?? new HttpClient();
+        _httpClient = httpClient ?? PluginHttpClientFactory.CreateIngestClient();
         _ownsHttpClient = httpClient is null;
         _utcNow = utcNow ?? (static () => DateTime.UtcNow);
         _nextJitterMs = nextJitterMs ?? (static (min, max) => Random.Shared.Next(min, max));
@@ -107,11 +114,22 @@ internal sealed class PartyDetailCollector : IDisposable {
         ArgumentNullException.ThrowIfNull(tryQueuePayload);
         _tryQueueArrival = arrival => tryQueuePayload(arrival.Payload);
         _pumpPendingUploads = pumpPendingUploads ?? throw new ArgumentNullException(nameof(pumpPendingUploads));
-        _httpClient = httpClient ?? new HttpClient();
+        _httpClient = httpClient ?? PluginHttpClientFactory.CreateIngestClient();
         _ownsHttpClient = httpClient is null;
         _utcNow = utcNow ?? (static () => DateTime.UtcNow);
         _nextJitterMs = nextJitterMs ?? (static (min, max) => Random.Shared.Next(min, max));
         _uploadPumpTimer.Start();
+    }
+
+    internal void BeginShutdown() {
+        if (Interlocked.Exchange(ref _shutdownSignaled, 1) != 0) {
+            return;
+        }
+
+        try {
+            _disposeCts.Cancel();
+        } catch (ObjectDisposedException) {
+        }
     }
 
     public void Dispose() {
@@ -119,6 +137,24 @@ internal sealed class PartyDetailCollector : IDisposable {
             DetachFrameworkUpdateHandler(_plugin);
         }
 
+        BeginShutdown();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) {
+            return;
+        }
+
+        Task[] activeTasks;
+        lock (_activeTasksLock) {
+            activeTasks = _activeUploadTasks.ToArray();
+        }
+
+        if (activeTasks.Length > 0) {
+            try {
+                Task.WhenAll(activeTasks).Wait(ShutdownWaitTimeout);
+            } catch (Exception) {
+            }
+        }
+
+        _disposeCts.Dispose();
         if (_ownsHttpClient) {
             _httpClient.Dispose();
         }
@@ -143,19 +179,17 @@ internal sealed class PartyDetailCollector : IDisposable {
     }
 
     private void TryCapturePendingGeneration() {
-        if (!_captureState.TryGetNextUnconsumedArrival(out var arrival)) {
-            return;
-        }
+        while (_captureState.TryGetNextUnconsumedArrival(out var arrival)) {
+            if (!PartyDetailUploadPolicy.IsSnapshotReadyForEnqueue(arrival.Payload)) {
+                break;
+            }
 
-        if (!PartyDetailUploadPolicy.IsSnapshotReadyForEnqueue(arrival.Payload)) {
-            return;
-        }
+            if (!_tryQueueArrival(arrival)) {
+                break;
+            }
 
-        if (!_tryQueueArrival(arrival)) {
-            return;
+            _captureState.TryMarkConsumed(arrival.Generation);
         }
-
-        _captureState.TryMarkConsumed(arrival.Generation);
     }
 
     private bool TryQueueArrivalCore(PartyDetailPendingArrival arrival) {
@@ -189,11 +223,15 @@ internal sealed class PartyDetailCollector : IDisposable {
     }
 
     private void StartDueUploads(DateTime nowUtc) {
+        if (_shutdownSignaled != 0) {
+            return;
+        }
+
         _pendingDetailQueue.PruneExpiredManualEntries(nowUtc, TimeSpan.FromMinutes(1));
         _captureState.PruneExpiredManualRequests();
         var maxConcurrency = PartyDetailUploadPolicy.NormalizeDetailUploadConcurrency(_configuration?.DetailUploadMaxConcurrency ?? 1);
         var batchSize = PartyDetailUploadPolicy.NormalizeDetailUploadBatchSize(_configuration?.DetailUploadBatchSize ?? 1);
-        while (Volatile.Read(ref _activeUploadWorkers) < maxConcurrency) {
+        while (_shutdownSignaled == 0 && Volatile.Read(ref _activeUploadWorkers) < maxConcurrency) {
 #if DEBUG
             var pendingQueueUnits = _pendingDetailQueue.Count;
             var queueStartedAt = DebugPerformanceDiagnostics.Begin();
@@ -210,8 +248,13 @@ internal sealed class PartyDetailCollector : IDisposable {
                 return;
             }
 
+            if (!TryGetDisposeToken(out var cancellationToken)) {
+                _pendingDetailQueue.ReleaseInFlight(nextBatch);
+                return;
+            }
+
             Interlocked.Increment(ref _activeUploadWorkers);
-            _ = ProcessQueuedBatchAsync(nextBatch);
+            TrackUploadTask(ProcessQueuedBatchAsync(nextBatch, cancellationToken));
         }
     }
 
@@ -241,18 +284,22 @@ internal sealed class PartyDetailCollector : IDisposable {
         );
     }
 
-    private Task ProcessQueuedBatchAsync(IReadOnlyList<PendingDetailEntry> pendingBatch) {
+    private Task ProcessQueuedBatchAsync(
+        IReadOnlyList<PendingDetailEntry> pendingBatch,
+        CancellationToken cancellationToken
+    ) {
         return Task.Run(async () => {
             try {
                 var uploadExecutor = _uploadExecutor
                     ?? throw new InvalidOperationException("Detail uploads require collector configuration.");
-                var uploadOutcomes = await uploadExecutor.UploadBatchToAllTargetsAsync(pendingBatch);
+                var uploadOutcomes = await uploadExecutor.UploadBatchToAllTargetsAsync(pendingBatch, cancellationToken);
                 foreach (var pending in pendingBatch) {
                     var uploadOutcome = uploadOutcomes.TryGetValue(pending.Detail.ListingId, out var outcome)
                         ? outcome
                         : new DetailUploadOutcome(DetailUploadResult.RetryableFailure);
                     ApplyUploadOutcome(pending, uploadOutcome);
                 }
+            } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
             } catch (Exception exception) {
                 LogError($"PartyDetailCollector upload error: {exception.Message}");
                 foreach (var pending in pendingBatch) {
@@ -264,6 +311,46 @@ internal sealed class PartyDetailCollector : IDisposable {
                 Interlocked.Decrement(ref _activeUploadWorkers);
             }
         });
+    }
+
+    private bool TryGetDisposeToken(out CancellationToken cancellationToken) {
+        if (_shutdownSignaled != 0) {
+            cancellationToken = default;
+            return false;
+        }
+
+        try {
+            cancellationToken = _disposeCts.Token;
+            return !cancellationToken.IsCancellationRequested;
+        } catch (ObjectDisposedException) {
+            cancellationToken = default;
+            return false;
+        }
+    }
+
+    private Task TrackUploadTask(Task uploadTask) {
+        if (uploadTask.IsCompleted) {
+            return uploadTask;
+        }
+
+        lock (_activeTasksLock) {
+            _activeUploadTasks.Add(uploadTask);
+        }
+
+        _ = uploadTask.ContinueWith(
+            static (completed, state) => {
+                var owner = (PartyDetailCollector)state!;
+                lock (owner._activeTasksLock) {
+                    owner._activeUploadTasks.Remove(completed);
+                }
+            },
+            this,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default
+        );
+
+        return uploadTask;
     }
 
     private void ApplyUploadOutcome(PendingDetailEntry pending, DetailUploadOutcome uploadOutcome) {
@@ -399,8 +486,13 @@ internal sealed class PartyDetailCollector : IDisposable {
             return Task.CompletedTask;
         }
 
+        if (!TryGetDisposeToken(out var cancellationToken)) {
+            _pendingDetailQueue.ReleaseInFlight(nextBatch);
+            return Task.CompletedTask;
+        }
+
         Interlocked.Increment(ref _activeUploadWorkers);
-        return ProcessQueuedBatchAsync(nextBatch);
+        return TrackUploadTask(ProcessQueuedBatchAsync(nextBatch, cancellationToken));
     }
 
     internal void PumpDueUploadsForTesting() {
@@ -433,7 +525,7 @@ internal sealed class PartyDetailCollector : IDisposable {
 
         if (_configuration is not null) {
             openCircuitTargets = enabledTargets.Count(target =>
-                UploadAttemptRecorder.IsCircuitOpen(target, _configuration, nowUtc));
+                UploadAttemptRecorder.PeekIsCircuitOpen(target, _configuration, nowUtc));
         }
 
         foreach (var pending in pendingEntries) {
@@ -455,7 +547,7 @@ internal sealed class PartyDetailCollector : IDisposable {
             var hasAvailableTarget = false;
             var hasCapabilityEligibleTarget = false;
             foreach (var target in enabledTargets) {
-                if (UploadAttemptRecorder.IsCircuitOpen(target, _configuration, nowUtc)) {
+                if (UploadAttemptRecorder.PeekIsCircuitOpen(target, _configuration, nowUtc)) {
                     continue;
                 }
 

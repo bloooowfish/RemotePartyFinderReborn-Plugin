@@ -10,6 +10,7 @@ internal sealed class FFLogsCandidateMatcher
     private readonly uint _zoneId;
     private readonly int _difficultyId;
     private readonly Dictionary<ulong, List<ParseJobCandidateServer>> _candidatesByContentId = new();
+    private readonly List<ParseJob> _missingIdentityJobs = new();
 
     public FFLogsCandidateMatcher(IReadOnlyList<ParseJob> jobs, uint zoneId, int difficultyId)
     {
@@ -25,14 +26,18 @@ internal sealed class FFLogsCandidateMatcher
         foreach (var job in _jobs)
         {
             var candidates = GetCandidates(job);
-            if (candidates.Count > 0)
+            if (string.IsNullOrWhiteSpace(job.Name) || candidates.Count == 0)
             {
-                _candidatesByContentId[job.ContentId] = candidates;
+                _missingIdentityJobs.Add(job);
+                continue;
             }
+
+            _candidatesByContentId[job.ContentId] = candidates;
         }
     }
 
     public IReadOnlyList<ParseJob> Jobs => _jobs;
+    public IReadOnlyList<ParseJob> MissingIdentityJobs => _missingIdentityJobs;
 
     public List<FFLogsClient.CandidateCharacterQuery> BuildCandidateQueries()
     {
@@ -67,6 +72,7 @@ internal sealed class FFLogsCandidateMatcher
         ArgumentNullException.ThrowIfNull(fetchedByKey);
 
         var resultsByContentId = new Dictionary<ulong, ParseResult>();
+        var notFoundCandidateJobs = new List<ParseJob>();
         foreach (var job in _jobs)
         {
             if (!_candidatesByContentId.TryGetValue(job.ContentId, out var candidates) || candidates.Count == 0)
@@ -74,6 +80,7 @@ internal sealed class FFLogsCandidateMatcher
                 continue;
             }
 
+            var isCandidateSearch = job.CandidateServers != null && job.CandidateServers.Count > 0;
             var bestIdx = -1;
             var bestScore = long.MinValue;
             FFLogsClient.CharacterFetchedData bestData = null;
@@ -86,7 +93,6 @@ internal sealed class FFLogsCandidateMatcher
                     continue;
                 }
 
-                var isCandidateSearch = job.CandidateServers != null && job.CandidateServers.Count > 0;
                 if (isCandidateSearch && !data.Exists)
                 {
                     continue;
@@ -103,6 +109,11 @@ internal sealed class FFLogsCandidateMatcher
 
             if (bestIdx < 0 || bestData == null)
             {
+                if (isCandidateSearch)
+                {
+                    notFoundCandidateJobs.Add(job);
+                }
+
                 continue;
             }
 
@@ -133,7 +144,7 @@ internal sealed class FFLogsCandidateMatcher
             resultsByContentId[job.ContentId] = parseResult;
         }
 
-        return new FFLogsCandidateMatchResult(resultsByContentId);
+        return new FFLogsCandidateMatchResult(resultsByContentId, notFoundCandidateJobs, _missingIdentityJobs);
     }
 
     private static long ScoreCandidate(
@@ -221,10 +232,17 @@ internal sealed class FFLogsCandidateMatcher
 
 internal sealed class FFLogsCandidateMatchResult
 {
-    public FFLogsCandidateMatchResult(Dictionary<ulong, ParseResult> resultsByContentId)
+    public FFLogsCandidateMatchResult(
+        Dictionary<ulong, ParseResult> resultsByContentId,
+        IReadOnlyList<ParseJob> notFoundCandidateJobs = null,
+        IReadOnlyList<ParseJob> missingIdentityJobs = null)
     {
         ResultsByContentId = resultsByContentId ?? throw new ArgumentNullException(nameof(resultsByContentId));
+        NotFoundCandidateJobs = notFoundCandidateJobs ?? Array.Empty<ParseJob>();
+        MissingIdentityJobs = missingIdentityJobs ?? Array.Empty<ParseJob>();
     }
 
     public Dictionary<ulong, ParseResult> ResultsByContentId { get; }
+    public IReadOnlyList<ParseJob> NotFoundCandidateJobs { get; }
+    public IReadOnlyList<ParseJob> MissingIdentityJobs { get; }
 }

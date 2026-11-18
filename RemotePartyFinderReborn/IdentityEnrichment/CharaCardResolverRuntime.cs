@@ -532,15 +532,27 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
     }
 
     private AtkValue* SelectOkStateTransitionDetour(AgentCharaCard* thisPtr, AtkValue* returnValue, AtkValue* values, uint valueCount, ulong eventKind) {
+        if (!IsValidPointer(thisPtr)) {
+            return returnValue;
+        }
+
+        var expectedAgent = AgentCharaCard.Instance();
+        if (expectedAgent != null && thisPtr != expectedAgent) {
+            return _selectOkStateTransitionHook is { } mismatchedHook
+                ? mismatchedHook.Original(thisPtr, returnValue, values, valueCount, eventKind)
+                : returnValue;
+        }
+
         try {
-            var storage = thisPtr == null ? null : thisPtr->Data;
-            if (storage != null && !_loggedSelectOkStateTransitionDetourHit) {
+            var storage = thisPtr->Data;
+            var hasValidStorage = IsValidPointer(storage);
+            if (hasValidStorage && !_loggedSelectOkStateTransitionDetourHit) {
                 _loggedSelectOkStateTransitionDetourHit = true;
                 _debugSink?.Invoke(
                     $"CharaCardResolver: hit SelectOk state transition detour eventKind={eventKind} contentId={storage->ContentId}."
                 );
             }
-            if (storage != null
+            if (hasValidStorage
                 && _selectOkStateTransitionHandler?.Invoke(new SelectOkStateTransitionModel(
                     storage->ContentId,
                     unchecked((int)eventKind),
@@ -549,7 +561,7 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
                     storage->WasResetDueToFantasia
                 )) == false) {
                 storage->SelectOkAddonId = 0;
-                if (returnValue != null) {
+                if (IsValidPointer(returnValue)) {
                     returnValue->SetBool(false);
                 }
 
@@ -565,15 +577,25 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
     }
 
     private uint CreateSelectOkDialogDetour(AgentCharaCard* thisPtr, uint messageId, uint variant) {
+        if (!IsValidPointer(thisPtr)) {
+            return 0;
+        }
+
+        var expectedAgent = AgentCharaCard.Instance();
+        if (expectedAgent != null && thisPtr != expectedAgent) {
+            return _createSelectOkDialogHook?.Original(thisPtr, messageId, variant) ?? 0;
+        }
+
         try {
-            var storage = thisPtr == null ? null : thisPtr->Data;
-            if (storage != null && !_loggedFinalSelectOkDialogDetourHit) {
+            var storage = thisPtr->Data;
+            var hasValidStorage = IsValidPointer(storage);
+            if (hasValidStorage && !_loggedFinalSelectOkDialogDetourHit) {
                 _loggedFinalSelectOkDialogDetourHit = true;
                 _debugSink?.Invoke(
                     $"CharaCardResolver: hit final SelectOk dialog detour messageId=0x{messageId:X} variant={variant} contentId={storage->ContentId}."
                 );
             }
-            if (storage != null
+            if (hasValidStorage
                 && _selectOkDialogHandler?.Invoke(new SelectOkDialogRequestModel(
                     storage->ContentId,
                     messageId,
@@ -624,7 +646,7 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
     }
 
     private static bool IsValidPointer(void* pointer) {
-        return (nuint)pointer >= 0x10000;
+        return NativePointerValidator.IsValidUserPointer(pointer);
     }
 
     internal static string DecodeNullTerminatedUtf8(ReadOnlySpan<byte> bytes) {

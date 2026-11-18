@@ -416,14 +416,17 @@ public sealed class TomestoneApiClientTests
         Assert.NotNull(httpClientField);
         var httpClient = Assert.IsType<HttpClient>(httpClientField!.GetValue(client));
         Assert.Equal(TimeSpan.FromSeconds(20), httpClient.Timeout);
+        Assert.Equal(PluginHttpClientFactory.MaxResponseContentBufferSizeBytes, httpClient.MaxResponseContentBufferSize);
 
         var handlerField = typeof(HttpMessageInvoker)
             .GetFields(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
             .FirstOrDefault(static f => typeof(HttpMessageHandler).IsAssignableFrom(f.FieldType));
-        if (handlerField?.GetValue(httpClient) is HttpClientHandler innerHandler)
-        {
-            Assert.False(innerHandler.AllowAutoRedirect);
-        }
+        Assert.NotNull(handlerField);
+        var innerHandler = Assert.IsType<SocketsHttpHandler>(handlerField!.GetValue(httpClient));
+        Assert.False(innerHandler.AllowAutoRedirect);
+        Assert.Equal(TimeSpan.FromSeconds(5), innerHandler.ConnectTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(5), innerHandler.PooledConnectionLifetime);
+        Assert.Equal(DecompressionMethods.All, innerHandler.AutomaticDecompression);
     }
 
     private sealed class RecordingHttpMessageHandler : HttpMessageHandler

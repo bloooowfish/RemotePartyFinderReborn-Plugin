@@ -269,6 +269,8 @@ internal sealed class DebugPageRenderer {
                             var actionInterval = Configuration.NormalizeScanActionIntervalMs(_configuration.AutoDetailScanActionIntervalMs);
                             if (ImGui.SliderInt("##scanActionInterval", ref actionInterval, 50, 2000, "%d ms")) {
                                 _configuration.AutoDetailScanActionIntervalMs = Configuration.NormalizeScanActionIntervalMs(actionInterval);
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
                                 _configuration.Save();
                             }
                         });
@@ -280,6 +282,8 @@ internal sealed class DebugPageRenderer {
                             var postCooldown = Configuration.NormalizeScanPostCooldownMs(_configuration.AutoDetailScanPostListingCooldownMs);
                             if (ImGui.SliderInt("##scanPostCooldown", ref postCooldown, 0, 2000, "%d ms")) {
                                 _configuration.AutoDetailScanPostListingCooldownMs = Configuration.NormalizeScanPostCooldownMs(postCooldown);
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
                                 _configuration.Save();
                             }
                         });
@@ -291,6 +295,8 @@ internal sealed class DebugPageRenderer {
                             var detailTimeout = Configuration.NormalizeScanDetailTimeoutMs(_configuration.AutoDetailScanDetailTimeoutMs);
                             if (ImGui.SliderInt("##scanDetailTimeout", ref detailTimeout, 500, 10000, "%d ms")) {
                                 _configuration.AutoDetailScanDetailTimeoutMs = Configuration.NormalizeScanDetailTimeoutMs(detailTimeout);
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
                                 _configuration.Save();
                             }
                         });
@@ -302,6 +308,8 @@ internal sealed class DebugPageRenderer {
                             var retryCount = Configuration.NormalizeScanRetryCount(_configuration.AutoDetailScanRetryCount);
                             if (ImGui.SliderInt("##scanRetryCount", ref retryCount, 0, 5, "%d")) {
                                 _configuration.AutoDetailScanRetryCount = Configuration.NormalizeScanRetryCount(retryCount);
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
                                 _configuration.Save();
                             }
                         });

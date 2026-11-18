@@ -25,7 +25,8 @@ internal sealed class TomestoneBatchProcessor
         AbandonTomestoneLease Abandonment,
         bool TransientFailure,
         bool HitRateLimitCooldown,
-        bool HitApiKeyRejected);
+        bool HitApiKeyRejected,
+        bool PerformedHttpRequest = false);
 
     private readonly TomestoneCollectorSeams _seams;
     private readonly Action<string> _warningLog;
@@ -109,10 +110,20 @@ internal sealed class TomestoneBatchProcessor
                 continue;
             }
 
-            if (hasExecutedAnyQuery && requestIntervalMs > 0)
+            var waveRequiresHttpRequest = wave.Any(item => item.Targets.Any(target =>
+                !_seams.ProgressionService.TryGetCachedProgressionData(
+                    item.Job.Name.Trim(),
+                    item.Job.Server.Trim(),
+                    target.ZoneId,
+                    target.EncounterId,
+                    out _)));
+
+            if (hasExecutedAnyQuery && waveRequiresHttpRequest && requestIntervalMs > 0)
             {
                 await _seams.RequestDelayAsync(TimeSpan.FromMilliseconds(requestIntervalMs), cancellationToken)
                     .ConfigureAwait(false);
+
+                hasExecutedAnyQuery = false;
 
                 if (TryAbortForWorkerState(out hitRateLimitCooldown, out hitApiKeyRejected, out cooldownRemaining))
                 {
@@ -127,9 +138,9 @@ internal sealed class TomestoneBatchProcessor
                 }
             }
 
-            hasExecutedAnyQuery = true;
             var waveOutcomes = await Task.WhenAll(wave.Select(item => ExecuteJobAsync(item, requestIntervalMs, cancellationToken)))
                 .ConfigureAwait(false);
+            hasExecutedAnyQuery |= waveOutcomes.Any(static outcome => outcome.PerformedHttpRequest);
 
             foreach (var outcome in waveOutcomes)
             {
@@ -176,53 +187,73 @@ internal sealed class TomestoneBatchProcessor
     {
         var job = item.Job;
         var targetResults = new List<(uint EncounterId, TomestoneProgressData Data)>(item.Targets.Count);
+        var performedHttpRequest = false;
+        var needsRateLimitSpacing = false;
 
         for (var i = 0; i < item.Targets.Count; i++)
         {
-            if (i > 0)
-            {
-                if (TryAbortForWorkerState(out var preRateLimited, out var preRejected, out _))
-                {
-                    return CreateDeferredOutcome(job, preRateLimited, preRejected);
-                }
-
-                if (requestIntervalMs > 0)
-                {
-                    await _seams.RequestDelayAsync(TimeSpan.FromMilliseconds(requestIntervalMs), cancellationToken)
-                        .ConfigureAwait(false);
-
-                    if (TryAbortForWorkerState(out var postDelayRateLimited, out var postDelayRejected, out _))
-                    {
-                        return CreateDeferredOutcome(job, postDelayRateLimited, postDelayRejected);
-                    }
-                }
-            }
-
             var target = item.Targets[i];
             OperationOutcome<TomestoneProgressData> outcome;
-            try
-            {
-                outcome = await _seams.ProgressionService.FetchProgressionDataAsync(
+            if (_seams.ProgressionService.TryGetCachedProgressionData(
                     job.Name.Trim(),
                     job.Server.Trim(),
                     target.ZoneId,
                     target.EncounterId,
-                    cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+                    out var cachedOutcome))
             {
-                _warningLog(
-                    $"TomestoneCollector: progression fetch failed for content_id={job.ContentId}, encounter_id={target.EncounterId}: {ex.Message}");
-                return new SingleJobOutcome(
-                    Result: null,
-                    Abandonment: TomestoneLeaseAbandoner.CreateJobAbandonment(
-                        job,
-                        "worker_transient_failure",
-                        "tomestone_unexpected_error",
-                        ex.Message),
-                    TransientFailure: true,
-                    HitRateLimitCooldown: false,
-                    HitApiKeyRejected: false);
+                outcome = cachedOutcome;
+            }
+            else
+            {
+                if (needsRateLimitSpacing)
+                {
+                    if (TryAbortForWorkerState(out var preRateLimited, out var preRejected, out _))
+                    {
+                        return CreateDeferredOutcome(job, preRateLimited, preRejected, performedHttpRequest);
+                    }
+
+                    if (requestIntervalMs > 0)
+                    {
+                        await _seams.RequestDelayAsync(TimeSpan.FromMilliseconds(requestIntervalMs), cancellationToken)
+                            .ConfigureAwait(false);
+
+                        needsRateLimitSpacing = false;
+
+                        if (TryAbortForWorkerState(out var postDelayRateLimited, out var postDelayRejected, out _))
+                        {
+                            return CreateDeferredOutcome(job, postDelayRateLimited, postDelayRejected, performedHttpRequest);
+                        }
+                    }
+                }
+
+                try
+                {
+                    var fetchResult = await _seams.ProgressionService.FetchProgressionDataWithTelemetryAsync(
+                        job.Name.Trim(),
+                        job.Server.Trim(),
+                        target.ZoneId,
+                        target.EncounterId,
+                        cancellationToken).ConfigureAwait(false);
+                    outcome = fetchResult.Outcome;
+                    performedHttpRequest |= fetchResult.PerformedHttpRequest;
+                    needsRateLimitSpacing = fetchResult.PerformedHttpRequest;
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    _warningLog(
+                        $"TomestoneCollector: progression fetch failed for content_id={job.ContentId}, encounter_id={target.EncounterId}: {ex.Message}");
+                    return new SingleJobOutcome(
+                        Result: null,
+                        Abandonment: TomestoneLeaseAbandoner.CreateJobAbandonment(
+                            job,
+                            "worker_transient_failure",
+                            "tomestone_unexpected_error",
+                            ex.Message),
+                        TransientFailure: true,
+                        HitRateLimitCooldown: false,
+                        HitApiKeyRejected: false,
+                        PerformedHttpRequest: performedHttpRequest);
+                }
             }
 
             if (!outcome.Succeeded)
@@ -238,7 +269,8 @@ internal sealed class TomestoneBatchProcessor
                             outcome.ErrorMessage ?? "Tomestone API rate-limit cooldown became active."),
                         TransientFailure: false,
                         HitRateLimitCooldown: true,
-                        HitApiKeyRejected: false);
+                        HitApiKeyRejected: false,
+                        PerformedHttpRequest: performedHttpRequest);
                 }
 
                 if (_seams.ApiCredentialStatus.Tomestone.State == ApiCredentialValidationState.Rejected)
@@ -252,7 +284,8 @@ internal sealed class TomestoneBatchProcessor
                             outcome.ErrorMessage ?? "Tomestone API key was rejected."),
                         TransientFailure: false,
                         HitRateLimitCooldown: false,
-                        HitApiKeyRejected: true);
+                        HitApiKeyRejected: true,
+                        PerformedHttpRequest: performedHttpRequest);
                 }
 
                 return new SingleJobOutcome(
@@ -264,7 +297,8 @@ internal sealed class TomestoneBatchProcessor
                         outcome.ErrorMessage ?? "Tomestone progression fetch failed."),
                     TransientFailure: outcome.TransientFailure,
                     HitRateLimitCooldown: false,
-                    HitApiKeyRejected: false);
+                    HitApiKeyRejected: false,
+                    PerformedHttpRequest: performedHttpRequest);
             }
 
             var data = outcome.Value ?? TomestoneProgressData.Skipped;
@@ -279,7 +313,8 @@ internal sealed class TomestoneBatchProcessor
                         "Tomestone progression query returned a non-authoritative skipped result."),
                     TransientFailure: false,
                     HitRateLimitCooldown: false,
-                    HitApiKeyRejected: false);
+                    HitApiKeyRejected: false,
+                    PerformedHttpRequest: performedHttpRequest);
             }
 
             targetResults.Add((target.EncounterId, data));
@@ -292,20 +327,23 @@ internal sealed class TomestoneBatchProcessor
             Abandonment: null,
             TransientFailure: false,
             HitRateLimitCooldown: false,
-            HitApiKeyRejected: false);
+            HitApiKeyRejected: false,
+            PerformedHttpRequest: performedHttpRequest);
     }
 
     private static SingleJobOutcome CreateDeferredOutcome(
         TomestoneJob job,
         bool hitRateLimitCooldown,
-        bool hitApiKeyRejected)
+        bool hitApiKeyRejected,
+        bool performedHttpRequest = false)
     {
         return new SingleJobOutcome(
             Result: null,
             Abandonment: CreateDeferredAbandonment(job, hitRateLimitCooldown, hitApiKeyRejected),
             TransientFailure: false,
             HitRateLimitCooldown: hitRateLimitCooldown,
-            HitApiKeyRejected: hitApiKeyRejected);
+            HitApiKeyRejected: hitApiKeyRejected,
+            PerformedHttpRequest: performedHttpRequest);
     }
 
     private static TomestoneResult BuildTomestoneResult(

@@ -7,7 +7,8 @@ namespace RemotePartyFinderReborn;
 
 internal sealed class FFLogsBackgroundWorker
 {
-    private static readonly TimeSpan ShutdownFlushTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan ShutdownFlushTimeout = TimeSpan.FromMilliseconds(1000);
+    private static readonly TimeSpan ShutdownAbandonTimeout = TimeSpan.FromMilliseconds(800);
 
     private readonly Configuration _configuration;
     private readonly IFFLogsApiClient _apiClient;
@@ -180,6 +181,17 @@ internal sealed class FFLogsBackgroundWorker
             return 0;
         }
 
+        if (processResult.AbandonedLeases is { Count: > 0 })
+        {
+            await _leaseAbandoner.AbandonExplicitLeasesAsync(
+                _configuration,
+                leaseSession,
+                processResult.AbandonedLeases,
+                cancellationToken,
+                _warningLog,
+                _debugLog);
+        }
+
         if (processResult.ShouldAbandonRemainingLeases || processResult.HadTransientFailure)
         {
             var abandonReason = processResult.HitRateLimitCooldown
@@ -193,7 +205,8 @@ internal sealed class FFLogsBackgroundWorker
                 abandonReason,
                 cancellationToken,
                 _warningLog,
-                _debugLog);
+                _debugLog,
+                processResult.AbandonedLeases);
         }
 
         if (processResult.HitRateLimitCooldown)
@@ -276,7 +289,7 @@ internal sealed class FFLogsBackgroundWorker
             var remaining = _resultSubmitter.DrainPendingResults();
             try
             {
-                using var abandonCts = new CancellationTokenSource(ShutdownFlushTimeout);
+                using var abandonCts = new CancellationTokenSource(ShutdownAbandonTimeout);
                 await _leaseAbandoner.AbandonResultLeasesAsync(
                     _configuration,
                     targetUrl,

@@ -86,6 +86,8 @@ public class FFLogsCollector : IDisposable
     private IReadOnlyList<IDisposable> OwnedDisposables { get; set; } = [];
     private CancellationTokenSource Cts { get; set; } = new();
     private Task _workerTask = Task.CompletedTask;
+    private int _shutdownSignaled;
+    private int _disposed;
 
     internal static FFLogsCollectorSeams CreateSeams(
         IIngestHttpSender ingestHttpSender,
@@ -143,12 +145,18 @@ public class FFLogsCollector : IDisposable
     }
 
     public FFLogsCollector(Plugin plugin)
+        : this(plugin, null)
+    {
+    }
+
+    internal FFLogsCollector(Plugin plugin, IFFLogsWorkerRegionProvider workerRegionProvider)
     {
         ArgumentNullException.ThrowIfNull(plugin);
 
-        var httpClient = new HttpClient();
+        var httpClient = PluginHttpClientFactory.CreateIngestClient();
         var ffLogsClient = new FFLogsClient(plugin.Configuration, plugin.ActivationGate.OnFFLogsCredentialStatusReported);
-        var workerRegionProvider = new DalamudFFLogsWorkerRegionProvider(
+        var ownsWorkerRegionProvider = workerRegionProvider is null;
+        workerRegionProvider ??= new DalamudFFLogsWorkerRegionProvider(
             plugin.Framework,
             plugin.ObjectTable,
             message => Plugin.Log.Warning(message));
@@ -158,6 +166,12 @@ public class FFLogsCollector : IDisposable
             new SystemFFLogsTimeProvider());
         var submitBuffer = new FFLogsSubmitBuffer();
         var leaseAbandoner = new FFLogsLeaseAbandoner(seams);
+        var ownedDisposables = new List<IDisposable> { ffLogsClient, httpClient };
+        if (ownsWorkerRegionProvider && workerRegionProvider is IDisposable disposableProvider)
+        {
+            ownedDisposables.Add(disposableProvider);
+        }
+
         Initialize(
             plugin.Configuration,
             message => Plugin.Log.Info(message),
@@ -173,14 +187,35 @@ public class FFLogsCollector : IDisposable
                 seams,
                 workerRegionProvider),
             new FFLogsBatchProcessor(seams),
-            [ffLogsClient, httpClient, workerRegionProvider],
+            ownedDisposables,
             startWorker: true,
             isPluginOperational: () => plugin.IsPluginOperational);
     }
 
+    internal void BeginShutdown()
+    {
+        if (Interlocked.Exchange(ref _shutdownSignaled, 1) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            Cts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+
     public void Dispose()
     {
-        Cts.Cancel();
+        BeginShutdown();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
         try
         {
             _workerTask.Wait(TimeSpan.FromSeconds(2));

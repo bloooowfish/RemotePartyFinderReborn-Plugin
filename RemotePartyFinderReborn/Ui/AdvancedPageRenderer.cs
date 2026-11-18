@@ -37,6 +37,8 @@ internal sealed class AdvancedPageRenderer {
                             var threshold = _configuration.CircuitBreakerFailureThreshold;
                             if (ImGui.SliderInt("##cbThreshold", ref threshold, 1, 20, "%d failures")) {
                                 _configuration.CircuitBreakerFailureThreshold = threshold;
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
                                 _configuration.Save();
                             }
                         });
@@ -48,6 +50,8 @@ internal sealed class AdvancedPageRenderer {
                             var duration = _configuration.CircuitBreakerBreakDurationMinutes;
                             if (ImGui.SliderInt("##cbBreakDuration", ref duration, 1, 60, "%d min")) {
                                 _configuration.CircuitBreakerBreakDurationMinutes = duration;
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
                                 _configuration.Save();
                             }
                         });
@@ -59,6 +63,8 @@ internal sealed class AdvancedPageRenderer {
                             var detailUploadRetryCount = _configuration.DetailUploadRetryCount;
                             if (ImGui.SliderInt("##detailUploadRetries", ref detailUploadRetryCount, 0, 5, "%d")) {
                                 _configuration.DetailUploadRetryCount = detailUploadRetryCount;
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
                                 _configuration.Save();
                             }
                         });
@@ -70,6 +76,8 @@ internal sealed class AdvancedPageRenderer {
                             var charaCardResolveRetryCount = _configuration.CharaCardResolveRetryCount;
                             if (ImGui.SliderInt("##plateResolveRetries", ref charaCardResolveRetryCount, 0, 5, "%d")) {
                                 _configuration.CharaCardResolveRetryCount = charaCardResolveRetryCount;
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
                                 _configuration.Save();
                             }
                         });
@@ -97,6 +105,8 @@ internal sealed class AdvancedPageRenderer {
                             var workerBaseDelay = _configuration.FFLogsWorkerBaseDelayMs;
                             if (ImGui.SliderInt("##fflogsBaseDelay", ref workerBaseDelay, 1000, 30000, "%d ms")) {
                                 _configuration.FFLogsWorkerBaseDelayMs = workerBaseDelay;
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
                                 _configuration.Save();
                             }
                         });
@@ -108,6 +118,8 @@ internal sealed class AdvancedPageRenderer {
                             var workerIdleDelay = _configuration.FFLogsWorkerIdleDelayMs;
                             if (ImGui.SliderInt("##fflogsIdleDelay", ref workerIdleDelay, 1000, 60000, "%d ms")) {
                                 _configuration.FFLogsWorkerIdleDelayMs = workerIdleDelay;
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
                                 _configuration.Save();
                             }
                         });
@@ -119,6 +131,8 @@ internal sealed class AdvancedPageRenderer {
                             var workerMaxBackoffDelay = _configuration.FFLogsWorkerMaxBackoffDelayMs;
                             if (ImGui.SliderInt("##fflogsMaxBackoff", ref workerMaxBackoffDelay, 5000, 180000, "%d ms")) {
                                 _configuration.FFLogsWorkerMaxBackoffDelayMs = workerMaxBackoffDelay;
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
                                 _configuration.Save();
                             }
                         });
@@ -130,6 +144,8 @@ internal sealed class AdvancedPageRenderer {
                             var workerJitter = _configuration.FFLogsWorkerJitterMs;
                             if (ImGui.SliderInt("##fflogsJitter", ref workerJitter, 0, 10000, "%d ms")) {
                                 _configuration.FFLogsWorkerJitterMs = workerJitter;
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
                                 _configuration.Save();
                             }
                         });
@@ -178,6 +194,8 @@ internal sealed class AdvancedPageRenderer {
                             if (ImGui.SliderInt("##tomestoneInterval", ref requestIntervalMs, minInterval, maxInterval, "%d ms")) {
                                 _configuration.TomestoneRequestIntervalMs =
                                     Configuration.NormalizeTomestoneRequestIntervalMs(requestIntervalMs, bypassClamp);
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
                                 _configuration.Save();
                             }
                         });
@@ -193,6 +211,8 @@ internal sealed class AdvancedPageRenderer {
                                 if (ImGui.SliderInt("##tomestoneConcurrency", ref maxConcurrency, 1, maxAllowedConcurrency, "%d")) {
                                     _configuration.TomestoneMaxConcurrency =
                                         Configuration.NormalizeTomestoneMaxConcurrency(maxConcurrency, bypassClamp);
+                                }
+                                if (ImGui.IsItemDeactivatedAfterEdit()) {
                                     _configuration.Save();
                                 }
                             }

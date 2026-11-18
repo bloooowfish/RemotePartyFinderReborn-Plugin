@@ -7,6 +7,7 @@ internal sealed class UploadCircuitState
     private readonly object _lock = new();
     private int _failureCount;
     private DateTime _lastFailureTime = DateTime.MinValue;
+    private bool _halfOpenProbeInFlight;
 
     internal int FailureCount
     {
@@ -50,6 +51,7 @@ internal sealed class UploadCircuitState
         {
             _failureCount = 0;
             _lastFailureTime = DateTime.MinValue;
+            _halfOpenProbeInFlight = false;
         }
     }
 
@@ -59,20 +61,48 @@ internal sealed class UploadCircuitState
         {
             _failureCount++;
             _lastFailureTime = utcNow;
+            _halfOpenProbeInFlight = false;
         }
     }
 
     internal bool IsCircuitOpen(int failureThreshold, int breakDurationMinutes, DateTime utcNow)
     {
+        var effectiveThreshold = Math.Max(1, failureThreshold);
         lock (_lock)
         {
-            if (_failureCount < failureThreshold)
+            if (_failureCount < effectiveThreshold)
             {
                 return false;
             }
 
             var elapsedSinceFailure = utcNow - _lastFailureTime;
-            return elapsedSinceFailure.TotalMinutes < breakDurationMinutes;
+            if (elapsedSinceFailure.TotalMinutes < breakDurationMinutes)
+            {
+                return true;
+            }
+
+            if (_halfOpenProbeInFlight)
+            {
+                return true;
+            }
+
+            _halfOpenProbeInFlight = true;
+            return false;
+        }
+    }
+
+    internal bool PeekIsCircuitOpen(int failureThreshold, int breakDurationMinutes, DateTime utcNow)
+    {
+        var effectiveThreshold = Math.Max(1, failureThreshold);
+        lock (_lock)
+        {
+            if (_failureCount < effectiveThreshold)
+            {
+                return false;
+            }
+
+            var elapsedSinceFailure = utcNow - _lastFailureTime;
+            return _halfOpenProbeInFlight || elapsedSinceFailure.TotalMinutes < breakDurationMinutes;
         }
     }
 }

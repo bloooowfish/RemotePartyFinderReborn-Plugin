@@ -84,10 +84,18 @@ internal class FFLogsJobLeaseClient
 
         if (result.Success)
         {
-            var jobs = JsonConvert.DeserializeObject<List<ParseJob>>(result.Body) ?? [];
-            return new FFLogsJobLeaseAttempt(
-                new FFLogsLeaseSession(uploadUrl, jobs),
-                false);
+            try
+            {
+                var jobs = JsonConvert.DeserializeObject<List<ParseJob>>(result.Body) ?? [];
+                return new FFLogsJobLeaseAttempt(
+                    new FFLogsLeaseSession(uploadUrl, jobs),
+                    false);
+            }
+            catch (JsonException ex)
+            {
+                warningLog($"FFLogsCollector: failed to deserialize leased jobs: {ex.Message}");
+                return new FFLogsJobLeaseAttempt(emptySession, true);
+            }
         }
 
         if (result.StatusCode == HttpStatusCode.NotFound)

@@ -7,7 +7,8 @@ namespace RemotePartyFinderReborn.Tomestone;
 
 internal sealed class TomestoneBackgroundWorker
 {
-    private static readonly TimeSpan ShutdownFlushTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan ShutdownFlushTimeout = TimeSpan.FromMilliseconds(1000);
+    private static readonly TimeSpan ShutdownAbandonTimeout = TimeSpan.FromMilliseconds(800);
 
     private readonly Configuration _configuration;
     private readonly ITomestoneProgressionService _progressionService;
@@ -312,7 +313,7 @@ internal sealed class TomestoneBackgroundWorker
             var remaining = _resultSubmitter.DrainPendingResults();
             try
             {
-                using var abandonCts = new CancellationTokenSource(ShutdownFlushTimeout);
+                using var abandonCts = new CancellationTokenSource(ShutdownAbandonTimeout);
                 await _leaseAbandoner.AbandonResultLeasesAsync(
                     _configuration,
                     targetUrl,

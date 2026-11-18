@@ -32,6 +32,8 @@ internal sealed class TomestoneCollector : IDisposable
     private IReadOnlyList<IDisposable> OwnedDisposables { get; set; } = [];
     private CancellationTokenSource Cts { get; set; } = new();
     private Task _workerTask = Task.CompletedTask;
+    private int _shutdownSignaled;
+    private int _disposed;
 
     internal static TomestoneCollectorSeams CreateSeams(
         IIngestHttpSender ingestHttpSender,
@@ -97,16 +99,22 @@ internal sealed class TomestoneCollector : IDisposable
     }
 
     public TomestoneCollector(Plugin plugin)
+        : this(plugin, null)
+    {
+    }
+
+    internal TomestoneCollector(Plugin plugin, IFFLogsWorkerRegionProvider workerRegionProvider)
     {
         ArgumentNullException.ThrowIfNull(plugin);
 
-        var httpClient = new HttpClient();
+        var httpClient = PluginHttpClientFactory.CreateIngestClient();
         var progressionService = new TomestoneProgressionService(
             plugin.TomestoneApiClient,
             plugin.Configuration,
             message => Plugin.Log.Debug(message),
             message => Plugin.Log.Warning(message));
-        var workerRegionProvider = new DalamudFFLogsWorkerRegionProvider(
+        var ownsWorkerRegionProvider = workerRegionProvider is null;
+        workerRegionProvider ??= new DalamudFFLogsWorkerRegionProvider(
             plugin.Framework,
             plugin.ObjectTable,
             message => Plugin.Log.Warning(message));
@@ -118,6 +126,11 @@ internal sealed class TomestoneCollector : IDisposable
             plugin.ApiCredentialStatus);
         var submitBuffer = new TomestoneSubmitBuffer();
         var leaseAbandoner = new TomestoneLeaseAbandoner(seams);
+        var ownedDisposables = new List<IDisposable> { httpClient };
+        if (ownsWorkerRegionProvider && workerRegionProvider is IDisposable disposableProvider)
+        {
+            ownedDisposables.Add(disposableProvider);
+        }
 
         Initialize(
             plugin.Configuration,
@@ -128,7 +141,7 @@ internal sealed class TomestoneCollector : IDisposable
             leaseAbandoner,
             new TomestoneJobLeaseClient(seams, workerRegionProvider),
             new TomestoneBatchProcessor(seams, message => Plugin.Log.Warning(message)),
-            [httpClient, workerRegionProvider],
+            ownedDisposables,
             message => Plugin.Log.Info(message),
             message => Plugin.Log.Warning(message),
             message => Plugin.Log.Error(message),
@@ -178,9 +191,30 @@ internal sealed class TomestoneCollector : IDisposable
         }
     }
 
+    internal void BeginShutdown()
+    {
+        if (Interlocked.Exchange(ref _shutdownSignaled, 1) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            Cts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+    }
+
     public void Dispose()
     {
-        Cts.Cancel();
+        BeginShutdown();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
         try
         {
             _workerTask.Wait(TimeSpan.FromSeconds(2));

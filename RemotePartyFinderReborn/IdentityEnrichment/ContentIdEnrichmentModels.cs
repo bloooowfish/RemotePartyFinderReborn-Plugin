@@ -87,6 +87,8 @@ internal sealed record ResolveRequestStatus(
 );
 
 internal sealed class ContentIdResolveQueue {
+    internal const int MaxTrackedRequests = 2048;
+
     private static readonly TimeSpan[] TimeoutBackoffSchedule = [
         TimeSpan.FromSeconds(10),
         TimeSpan.FromSeconds(30),
@@ -96,10 +98,16 @@ internal sealed class ContentIdResolveQueue {
     private readonly Dictionary<ulong, ResolveRequestStatus> _requests = new();
     private readonly TimeSpan _freshIdentityTtl;
     private readonly int _maxAttempts;
+    private readonly int _maxTrackedRequests;
 
-    public ContentIdResolveQueue(TimeSpan? freshIdentityTtl = null, int maxAttempts = 2) {
+    public ContentIdResolveQueue(
+        TimeSpan? freshIdentityTtl = null,
+        int maxAttempts = 2,
+        int maxTrackedRequests = MaxTrackedRequests
+    ) {
         _freshIdentityTtl = freshIdentityTtl ?? TimeSpan.FromHours(24);
         _maxAttempts = Math.Max(1, maxAttempts);
+        _maxTrackedRequests = Math.Max(1, maxTrackedRequests);
     }
 
     public IReadOnlyCollection<ResolveRequestStatus> Requests =>
@@ -140,6 +148,7 @@ internal sealed class ContentIdResolveQueue {
                 DateTime.MinValue,
                 nowUtc
             );
+            PruneTerminalEntriesIfNeeded(nowUtc, preserveContentId: contentId);
             return true;
         }
 
@@ -162,6 +171,7 @@ internal sealed class ContentIdResolveQueue {
             NextEligibleAttemptAtUtc = nowUtc,
             FailureCount = existing.State == ResolveState.Resolved ? 0 : existing.FailureCount,
         };
+        PruneTerminalEntriesIfNeeded(nowUtc, preserveContentId: contentId);
         return true;
     }
 
@@ -246,6 +256,9 @@ internal sealed class ContentIdResolveQueue {
                 ? DateTime.MaxValue
                 : nowUtc + (retryDelay ?? GetTimeoutBackoff(failureCount)),
         };
+        if (nextState == ResolveState.FailedPermanent) {
+            PruneTerminalEntriesIfNeeded(nowUtc, preserveContentId: contentId);
+        }
         return true;
     }
 
@@ -257,6 +270,7 @@ internal sealed class ContentIdResolveQueue {
                 LastResolvedAtUtc = snapshot.LastResolvedAtUtc,
                 NextEligibleAttemptAtUtc = snapshot.LastResolvedAtUtc,
             };
+            PruneTerminalEntriesIfNeeded(snapshot.LastResolvedAtUtc, preserveContentId: snapshot.ContentId);
             return;
         }
 
@@ -269,6 +283,56 @@ internal sealed class ContentIdResolveQueue {
             snapshot.LastResolvedAtUtc,
             snapshot.LastResolvedAtUtc
         );
+        PruneTerminalEntriesIfNeeded(snapshot.LastResolvedAtUtc, preserveContentId: snapshot.ContentId);
+    }
+
+    private void PruneTerminalEntriesIfNeeded(DateTime nowUtc, ulong preserveContentId) {
+        if (_requests.Count <= _maxTrackedRequests) {
+            return;
+        }
+
+        List<ulong>? expiredKeys = null;
+        foreach (var (contentId, request) in _requests) {
+            if (contentId == preserveContentId) {
+                continue;
+            }
+
+            if (request.State == ResolveState.Resolved
+                && request.LastResolvedAtUtc != DateTime.MinValue
+                && nowUtc - request.LastResolvedAtUtc >= _freshIdentityTtl) {
+                (expiredKeys ??= []).Add(contentId);
+            } else if (request.State == ResolveState.FailedPermanent
+                       && request.LastRequestedAtUtc != DateTime.MinValue
+                       && nowUtc - request.LastRequestedAtUtc >= _freshIdentityTtl) {
+                (expiredKeys ??= []).Add(contentId);
+            }
+        }
+
+        if (expiredKeys is not null) {
+            foreach (var expiredKey in expiredKeys) {
+                _requests.Remove(expiredKey);
+            }
+        }
+
+        if (_requests.Count <= _maxTrackedRequests) {
+            return;
+        }
+
+        var excess = _requests.Count - _maxTrackedRequests;
+        var evictionCandidates = _requests.Values
+            .Where(request => request.ContentId != preserveContentId
+                              && request.State is ResolveState.Resolved or ResolveState.FailedPermanent)
+            .OrderBy(static request => request.LastResolvedAtUtc >= request.LastRequestedAtUtc
+                ? request.LastResolvedAtUtc
+                : request.LastRequestedAtUtc)
+            .ThenBy(static request => request.ContentId)
+            .Take(excess)
+            .Select(static request => request.ContentId)
+            .ToArray();
+
+        foreach (var evictionKey in evictionCandidates) {
+            _requests.Remove(evictionKey);
+        }
     }
 
     private static TimeSpan GetTimeoutBackoff(int timeoutCount) {

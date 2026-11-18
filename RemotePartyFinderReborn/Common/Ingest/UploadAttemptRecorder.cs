@@ -32,14 +32,26 @@ internal static class UploadAttemptRecorder
             utcNow);
     }
 
+    internal static bool PeekIsCircuitOpen(UploadUrl uploadUrl, Configuration configuration, DateTime utcNow)
+    {
+        ArgumentNullException.ThrowIfNull(uploadUrl);
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        return uploadUrl.PeekIsCircuitOpen(
+            configuration.CircuitBreakerFailureThreshold,
+            configuration.CircuitBreakerBreakDurationMinutes,
+            utcNow);
+    }
+
     internal static CircuitStatus GetCircuitStatus(UploadUrl uploadUrl, Configuration configuration, DateTime utcNow)
     {
         ArgumentNullException.ThrowIfNull(uploadUrl);
         ArgumentNullException.ThrowIfNull(configuration);
 
-        var isOpen = IsCircuitOpen(uploadUrl, configuration, utcNow);
+        var effectiveThreshold = Math.Max(1, configuration.CircuitBreakerFailureThreshold);
+        var isOpen = PeekIsCircuitOpen(uploadUrl, configuration, utcNow);
         var remaining = TimeSpan.Zero;
-        if (uploadUrl.FailureCount >= configuration.CircuitBreakerFailureThreshold)
+        if (uploadUrl.FailureCount >= effectiveThreshold)
         {
             var breakDuration = TimeSpan.FromMinutes(configuration.CircuitBreakerBreakDurationMinutes);
             var elapsed = utcNow - uploadUrl.LastFailureTime;

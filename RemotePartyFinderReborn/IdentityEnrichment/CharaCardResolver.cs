@@ -138,6 +138,7 @@ internal sealed class CharaCardResolver : IDisposable {
     private readonly object _sync = new();
     private CharaCardResolverDebugSnapshot? _latestDebugSnapshot;
     private DateTime _nextDispatchAllowedAtUtc = DateTime.MinValue;
+    private int _shutdownSignaled;
     private bool _disposed;
 
     internal CharaCardResolver(
@@ -196,7 +197,7 @@ internal sealed class CharaCardResolver : IDisposable {
         _queue = new ContentIdResolveQueue(maxAttempts: ResolveMaxAttemptsFromRetryCount(configuration?.CharaCardResolveRetryCount ?? 1));
         _requestTimeout = requestTimeout ?? DefaultRequestTimeout;
         var resolvedIdentityUploadAttemptTimeout = identityUploadAttemptTimeout ?? DefaultIdentityUploadAttemptTimeout;
-        _identityUploadHttpClient = identityUploadHttpClient ?? new HttpClient();
+        _identityUploadHttpClient = identityUploadHttpClient ?? PluginHttpClientFactory.CreateIngestClient();
         _ownsIdentityUploadHttpClient = identityUploadHttpClient is null;
         var resolvedIdentityUploader = uploadResolvedIdentitiesAsync
             ?? (configuration is null
@@ -412,16 +413,28 @@ internal sealed class CharaCardResolver : IDisposable {
         return true;
     }
 
+    internal void BeginShutdown() {
+        if (Interlocked.Exchange(ref _shutdownSignaled, 1) != 0) {
+            return;
+        }
+
+        IsEnabled = false;
+        try {
+            _disposeCts.Cancel();
+        } catch (ObjectDisposedException) {
+        }
+    }
+
     public void Dispose() {
+        BeginShutdown();
         if (_disposed) {
             return;
         }
 
         _disposed = true;
-        IsEnabled = false;
-        _disposeCts.Cancel();
         _selectOkDialogSuppressionRuntime?.Dispose();
         _runtime.Dispose();
+        _identityUploadPump?.WaitForActiveWorker(TimeSpan.FromSeconds(2));
         _disposeCts.Dispose();
         if (_ownsIdentityUploadHttpClient) {
             _identityUploadHttpClient.Dispose();

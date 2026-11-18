@@ -75,6 +75,7 @@ public class Plugin : IDalamudPlugin {
     internal DebugPfScanner DebugPfScanner { get; }
     internal ApiCredentialStatusStore ApiCredentialStatus { get; } = new();
     internal FFLogsActivationGate ActivationGate { get; }
+    private DalamudFFLogsWorkerRegionProvider WorkerRegionProvider { get; }
     private FFLogsCollector FFLogsCollector { get; }
     internal TomestoneApiClient TomestoneApiClient { get; }
     private TomestoneCollector TomestoneCollector { get; }
@@ -94,6 +95,7 @@ public class Plugin : IDalamudPlugin {
     internal DateTime TomestoneRateLimitCooldownUntilUtc => this.TomestoneApiClient.RateLimitCooldownUntilUtc;
 
     private readonly CancellationTokenSource _shutdownCts = new();
+    private readonly List<Action> _shutdownSignalActions = [];
     private readonly Stack<Action> _cleanupActions = new();
     private bool _disposed;
 
@@ -115,16 +117,19 @@ public class Plugin : IDalamudPlugin {
             }
 
             _cleanupActions.Push(() => _shutdownCts.Dispose());
+            _shutdownSignalActions.Add(() => _shutdownCts.Cancel());
             this.ActivationGate = new FFLogsActivationGate(Configuration, ApiCredentialStatus, Configuration.Save);
             _cleanupActions.Push(() => this.ActivationGate.Dispose());
 
             this.Gatherer = new Gatherer(this);
+            _shutdownSignalActions.Add(() => this.Gatherer.BeginShutdown());
             _cleanupActions.Push(() => this.Gatherer.Dispose());
 
             this.PlayerDatabase = new PlayerLocalDatabase(Path.Combine(PluginInterface.ConfigDirectory.FullName, "player_cache.db"));
             _cleanupActions.Push(() => this.PlayerDatabase.Dispose());
 
             this.PlayerCollector = new PlayerCollector(this, this.PlayerDatabase);
+            _shutdownSignalActions.Add(() => this.PlayerCollector.BeginShutdown());
             _cleanupActions.Push(() => this.PlayerCollector.Dispose());
 
             this.CharaCardResolver = new CharaCardResolver(
@@ -142,6 +147,7 @@ public class Plugin : IDalamudPlugin {
                 gameInteropProvider: this.GameInteropProvider,
                 isOperational: () => this.IsPluginOperational
             );
+            _shutdownSignalActions.Add(() => this.CharaCardResolver.BeginShutdown());
             _cleanupActions.Push(() => this.CharaCardResolver.Dispose());
 
             this.Framework.Update += this.CharaCardResolver.OnFrameworkUpdate;
@@ -152,6 +158,7 @@ public class Plugin : IDalamudPlugin {
             this.PartyDetailCaptureRuntime = partyDetailCapture.CaptureRuntime;
             _cleanupActions.Push(() => this.PartyDetailCaptureRuntime.Dispose());
             this.PartyDetailCollector = partyDetailCapture.PartyDetailCollector;
+            _shutdownSignalActions.Add(() => this.PartyDetailCollector.BeginShutdown());
             _cleanupActions.Push(() => this.PartyDetailCollector.Dispose());
 
             this.PartyDetailGameLogSuppressionRuntime = new DalamudGameLogSuppressionRuntime(
@@ -169,12 +176,19 @@ public class Plugin : IDalamudPlugin {
             this.TomestoneApiClient = new TomestoneApiClient(this.Configuration, this.ApiCredentialStatus.ReportTomestone);
             _cleanupActions.Push(() => this.TomestoneApiClient.Dispose());
 
-            this.TomestoneCollector = new TomestoneCollector(this);
+            this.WorkerRegionProvider = new DalamudFFLogsWorkerRegionProvider(
+                this.Framework,
+                this.ObjectTable,
+                message => Log.Warning(message));
+            _cleanupActions.Push(() => this.WorkerRegionProvider.Dispose());
+
+            this.TomestoneCollector = new TomestoneCollector(this, this.WorkerRegionProvider);
+            _shutdownSignalActions.Add(() => this.TomestoneCollector.BeginShutdown());
             _cleanupActions.Push(() => this.TomestoneCollector.Dispose());
 
-            this.FFLogsCollector = new FFLogsCollector(this);
+            this.FFLogsCollector = new FFLogsCollector(this, this.WorkerRegionProvider);
+            _shutdownSignalActions.Add(() => this.FFLogsCollector.BeginShutdown());
             _cleanupActions.Push(() => this.FFLogsCollector.Dispose());
-            _cleanupActions.Push(() => _shutdownCts.Cancel());
 
             ValidateGameLogMessageCatalog();
 
@@ -214,6 +228,18 @@ public class Plugin : IDalamudPlugin {
     }
 
     private void RunCleanupActions() {
+        for (var i = _shutdownSignalActions.Count - 1; i >= 0; i--) {
+            try {
+                _shutdownSignalActions[i]();
+            } catch (Exception ex) {
+                try {
+                    Log?.Error(ex, "Plugin: failed to signal shutdown during disposal or rollback.");
+                } catch {
+                    // Ignore logging failures during teardown.
+                }
+            }
+        }
+
         while (_cleanupActions.Count > 0) {
             var action = _cleanupActions.Pop();
             try {
@@ -273,9 +299,11 @@ public class Plugin : IDalamudPlugin {
             return OperationOutcome<bool>.Failure(false, "Plugin is shutting down.");
         }
 
+        CancellationToken shutdownToken;
         CancellationTokenSource linkedCts;
         try {
-            linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdownCts.Token);
+            shutdownToken = _shutdownCts.Token;
+            linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, shutdownToken);
         } catch (ObjectDisposedException) {
             return OperationOutcome<bool>.Failure(false, "Plugin is shutting down.");
         }
@@ -285,7 +313,7 @@ public class Plugin : IDalamudPlugin {
                 return await ActivationGate.VerifyAsync(
                     ct => FFLogsCollector.VerifyCredentialsAsync(ct),
                     linkedCts.Token).ConfigureAwait(false);
-            } catch (OperationCanceledException) when (_shutdownCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested) {
+            } catch (OperationCanceledException) when (shutdownToken.IsCancellationRequested && !cancellationToken.IsCancellationRequested) {
                 return OperationOutcome<bool>.Failure(false, "Plugin is shutting down.");
             }
         }

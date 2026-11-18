@@ -4,19 +4,22 @@ using System.Collections.Generic;
 namespace RemotePartyFinderReborn;
 
 internal sealed class PartyDetailCaptureState {
+    internal const int MaxArrivalQueueCapacity = 16;
+    internal const int MaxRecentConsumedSerials = 64;
     internal static readonly TimeSpan StaleManualRequestTtl = TimeSpan.FromSeconds(30);
 
     private readonly object _gate = new();
     private readonly Dictionary<long, PartyDetailRequestCycle> _pendingRequests = new();
     private readonly Dictionary<long, DateTime> _pendingRequestCreatedAtUtc = new();
+    private readonly Queue<PartyDetailArrival> _arrivalQueue = new();
+    private readonly Queue<long> _consumedSerialOrder = new();
+    private readonly Dictionary<long, PartyDetailArrival> _consumedArrivalsBySerial = new();
     private readonly Func<DateTime> _utcNow;
 
     private long _nextRequestSerial;
     private long _latestArrivalGeneration;
     private long _latestConsumedGeneration;
-    private PartyDetailArrival _latestArrival = new(0, default, new UploadablePartyDetail());
     private PartyDetailLatestDebugSnapshot _latestDebugSnapshot;
-    private bool _hasLatestArrival;
     private bool _hasLatestDebugSnapshot;
 
     internal PartyDetailCaptureState()
@@ -99,6 +102,10 @@ internal sealed class PartyDetailCaptureState {
         ArgumentNullException.ThrowIfNull(snapshot);
 
         lock (_gate) {
+            if (_consumedArrivalsBySerial.ContainsKey(requestSerial)) {
+                return false;
+            }
+
             if (!_pendingRequests.Remove(requestSerial, out var cycle)) {
                 return false;
             }
@@ -106,8 +113,12 @@ internal sealed class PartyDetailCaptureState {
             _pendingRequestCreatedAtUtc.Remove(requestSerial);
 
             var generation = ++_latestArrivalGeneration;
-            _latestArrival = new PartyDetailArrival(generation, cycle, CloneSnapshot(snapshot));
-            _hasLatestArrival = true;
+            var arrival = new PartyDetailArrival(generation, cycle, CloneSnapshot(snapshot));
+            while (_arrivalQueue.Count >= MaxArrivalQueueCapacity) {
+                _arrivalQueue.Dequeue();
+            }
+
+            _arrivalQueue.Enqueue(arrival);
             if (debugSnapshot is not null) {
                 _latestDebugSnapshot = new PartyDetailLatestDebugSnapshot(
                     generation,
@@ -126,11 +137,26 @@ internal sealed class PartyDetailCaptureState {
         }
 
         lock (_gate) {
-            if (generation > _latestArrivalGeneration || generation <= _latestConsumedGeneration) {
+            if (_arrivalQueue.Count == 0 || generation > _latestArrivalGeneration || generation <= _latestConsumedGeneration) {
                 return false;
             }
 
+            var head = _arrivalQueue.Peek();
+            if (head.Generation != generation) {
+                return false;
+            }
+
+            _arrivalQueue.Dequeue();
             _latestConsumedGeneration = generation;
+
+            if (_consumedArrivalsBySerial.TryAdd(head.Cycle.RequestSerial, head)) {
+                _consumedSerialOrder.Enqueue(head.Cycle.RequestSerial);
+                while (_consumedSerialOrder.Count > MaxRecentConsumedSerials) {
+                    var evictedSerial = _consumedSerialOrder.Dequeue();
+                    _consumedArrivalsBySerial.Remove(evictedSerial);
+                }
+            }
+
             return true;
         }
     }
@@ -154,42 +180,21 @@ internal sealed class PartyDetailCaptureState {
 
     public bool IsScannerAckReady(long requestSerial, ulong listingId, ulong contentId) {
         lock (_gate) {
-            if (!_hasLatestArrival) {
-                return false;
+            foreach (var arrival in _arrivalQueue) {
+                if (arrival.Generation > _latestConsumedGeneration
+                    && MatchesScannerArrival(arrival, requestSerial, listingId, contentId)) {
+                    return true;
+                }
             }
 
-            var requestContentMatches = _latestArrival.Cycle.ContentId == 0
-                                        || _latestArrival.Cycle.ContentId == contentId;
-            var snapshotContentMatches = contentId == 0
-                                         || _latestArrival.Snapshot.LeaderContentId == contentId;
-
-            return _latestArrival.Generation > _latestConsumedGeneration
-                   && _latestArrival.Cycle.RequestSerial == requestSerial
-                   && _latestArrival.Cycle.Owner == PartyDetailRequestOwner.Scanner
-                   && _latestArrival.Cycle.ListingId == listingId
-                   && _latestArrival.Snapshot.ListingId == listingId
-                   && requestContentMatches
-                   && snapshotContentMatches;
+            return false;
         }
     }
 
     public bool IsScannerConsumedAckReady(long requestSerial, ulong listingId, ulong contentId) {
         lock (_gate) {
-            if (!_hasLatestArrival || _latestArrival.Generation != _latestConsumedGeneration) {
-                return false;
-            }
-
-            var requestContentMatches = _latestArrival.Cycle.ContentId == 0
-                                        || _latestArrival.Cycle.ContentId == contentId;
-            var snapshotContentMatches = contentId == 0
-                                         || _latestArrival.Snapshot.LeaderContentId == contentId;
-
-            return _latestArrival.Cycle.RequestSerial == requestSerial
-                   && _latestArrival.Cycle.Owner == PartyDetailRequestOwner.Scanner
-                   && _latestArrival.Cycle.ListingId == listingId
-                   && _latestArrival.Snapshot.ListingId == listingId
-                   && requestContentMatches
-                   && snapshotContentMatches;
+            return _consumedArrivalsBySerial.TryGetValue(requestSerial, out var consumedArrival)
+                   && MatchesScannerArrival(consumedArrival, requestSerial, listingId, contentId);
         }
     }
 
@@ -201,18 +206,38 @@ internal sealed class PartyDetailCaptureState {
 
     internal bool TryGetNextUnconsumedArrival(out PartyDetailPendingArrival arrival) {
         lock (_gate) {
-            if (!_hasLatestArrival || _latestArrival.Generation <= _latestConsumedGeneration) {
+            if (_arrivalQueue.Count == 0) {
                 arrival = default;
                 return false;
             }
 
+            var nextArrival = _arrivalQueue.Peek();
             arrival = new PartyDetailPendingArrival(
-                _latestArrival.Generation,
-                _latestArrival.Cycle,
-                CloneSnapshot(_latestArrival.Snapshot)
+                nextArrival.Generation,
+                nextArrival.Cycle,
+                CloneSnapshot(nextArrival.Snapshot)
             );
             return true;
         }
+    }
+
+    private static bool MatchesScannerArrival(
+        PartyDetailArrival arrival,
+        long requestSerial,
+        ulong listingId,
+        ulong contentId
+    ) {
+        var requestContentMatches = arrival.Cycle.ContentId == 0
+                                    || arrival.Cycle.ContentId == contentId;
+        var snapshotContentMatches = contentId == 0
+                                     || arrival.Snapshot.LeaderContentId == contentId;
+
+        return arrival.Cycle.RequestSerial == requestSerial
+               && arrival.Cycle.Owner == PartyDetailRequestOwner.Scanner
+               && arrival.Cycle.ListingId == listingId
+               && arrival.Snapshot.ListingId == listingId
+               && requestContentMatches
+               && snapshotContentMatches;
     }
 
     internal bool TryGetLatestDebugSnapshot(out PartyDetailLatestDebugSnapshot snapshot) {

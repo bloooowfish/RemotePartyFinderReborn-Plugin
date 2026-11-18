@@ -8,4 +8,5 @@ internal sealed record FFLogsBatchProcessResult(
     bool HadTransientFailure,
     bool HitRateLimitCooldown,
     TimeSpan CooldownRemaining,
-    bool ShouldAbandonRemainingLeases);
+    bool ShouldAbandonRemainingLeases,
+    IReadOnlyList<AbandonFflogsLease> AbandonedLeases = null);

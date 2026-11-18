@@ -1,6 +1,7 @@
 #nullable enable
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
@@ -101,12 +102,10 @@ internal sealed class EndpointsPageRenderer {
                                     }
                                 }
 
-                                if (!uploadUrl.IsDefault) {
+                                if (CanRemoveEndpoint(uploadUrls, uploadUrl)) {
                                     ImGui.SameLine();
                                     if (ImGuiComponents.IconButton($"##del_{uploadUrl.Id:N}", FontAwesomeIcon.Trash)) {
-                                        var removedId = uploadUrl.Id;
-                                        _configuration.UpdateUploadUrls(urls =>
-                                            urls.RemoveAll(candidate => candidate.Id == removedId));
+                                        RemoveEndpoint(_configuration, uploadUrl.Id);
                                         _configuration.Save();
                                     }
                                     if (ImGui.IsItemHovered()) {
@@ -231,5 +230,45 @@ internal sealed class EndpointsPageRenderer {
         _configuration.Save();
         _uploadUrlTempString = string.Empty;
         _uploadUrlError.Set(string.Empty, nowUtc, TimeSpan.Zero);
+    }
+
+    internal static bool CanRemoveEndpoint(IReadOnlyList<UploadUrl> uploadUrls, UploadUrl candidate) {
+        ArgumentNullException.ThrowIfNull(uploadUrls);
+        ArgumentNullException.ThrowIfNull(candidate);
+
+        if (uploadUrls.Count <= 1) {
+            return false;
+        }
+
+        if (!candidate.IsDefault) {
+            return true;
+        }
+
+        return uploadUrls.Any(other => other.Id != candidate.Id && other.IsEnabled);
+    }
+
+    internal static bool RemoveEndpoint(Configuration configuration, Guid removedId) {
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        var removed = false;
+        configuration.UpdateUploadUrls(urls => {
+            var target = urls.FirstOrDefault(candidate => candidate.Id == removedId);
+            if (target is null || !CanRemoveEndpoint(urls, target)) {
+                return urls;
+            }
+
+            var updated = urls.RemoveAll(candidate => candidate.Id == removedId);
+            if (updated.Count < urls.Count) {
+                removed = true;
+                if (updated.Count > 0 && !updated.Any(static candidate => candidate.IsDefault)) {
+                    var replacement = updated.FirstOrDefault(static candidate => candidate.IsEnabled) ?? updated[0];
+                    replacement.IsDefault = true;
+                }
+            }
+
+            return updated;
+        });
+
+        return removed;
     }
 }

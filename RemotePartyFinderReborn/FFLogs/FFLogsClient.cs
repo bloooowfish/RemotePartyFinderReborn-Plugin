@@ -45,7 +45,7 @@ public class FFLogsClient : IDisposable
         Action<ApiCredentialValidationState, string> credentialStatusChanged)
         : this(
             configuration,
-            new HttpClient(),
+            PluginHttpClientFactory.CreateExternalApiClient(),
             static () => DateTime.UtcNow,
             message => Plugin.Log.Info(message),
             message => Plugin.Log.Warning(message),
@@ -66,7 +66,7 @@ public class FFLogsClient : IDisposable
         Action<ApiCredentialValidationState, string> credentialStatusChanged = null)
         : this(
             configuration,
-            new HttpClient(messageHandler),
+            PluginHttpClientFactory.CreateClient(messageHandler, disposeHandler: true, timeout: PluginHttpClientFactory.ExternalApiTimeout),
             utcNow ?? (static () => DateTime.UtcNow),
             infoLog ?? (static _ => { }),
             warningLog ?? (static _ => { }),
@@ -428,6 +428,8 @@ public class FFLogsClient : IDisposable
         return outcome.Succeeded ? outcome.Value ?? [] : [];
     }
 
+    internal TimeSpan CandidateChunkDelay { get; init; } = TimeSpan.FromMilliseconds(250);
+
     internal async Task<OperationOutcome<Dictionary<string, CharacterFetchedData>>> FetchCharacterCandidateDataBatchOutcomeAsync(
         List<CandidateCharacterQuery> candidates,
         int zoneId,
@@ -444,6 +446,11 @@ public class FFLogsClient : IDisposable
 
         for (var offset = 0; offset < candidates.Count; offset += chunkSize)
         {
+            if (offset > 0 && CandidateChunkDelay > TimeSpan.Zero)
+            {
+                await Task.Delay(CandidateChunkDelay, cancellationToken).ConfigureAwait(false);
+            }
+
             var chunk = candidates.Skip(offset).Take(chunkSize).ToList();
 
             var query = FFLogsQueryBuilder.BuildCharacterCandidateDataBatchQuery(

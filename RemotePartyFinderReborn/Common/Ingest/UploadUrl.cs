@@ -9,7 +9,7 @@ public record UploadUrl(string Url)
     [Newtonsoft.Json.JsonIgnore]
     public Guid Id { get; } = Guid.NewGuid();
     public string Url { get; set; } = Url;
-    public bool IsDefault { get; init; }
+    public bool IsDefault { get; set; }
     public bool IsEnabled { get; set; } = true;
 
     [JsonIgnore]
@@ -32,8 +32,13 @@ public record UploadUrl(string Url)
     [JsonIgnore]
     public DateTime LastSecurityWarningTime { get; set; }
 
+    private volatile bool _detailBatchUnsupported;
+
     [JsonIgnore]
-    public bool DetailBatchUnsupported { get; set; }
+    public bool DetailBatchUnsupported {
+        get => _detailBatchUnsupported;
+        set => _detailBatchUnsupported = value;
+    }
 
     [JsonIgnore]
     private readonly object _capabilityLock = new();
@@ -79,6 +84,11 @@ public record UploadUrl(string Url)
     internal bool IsCircuitOpen(int failureThreshold, int breakDurationMinutes, DateTime utcNow)
     {
         return _circuitState.IsCircuitOpen(failureThreshold, breakDurationMinutes, utcNow);
+    }
+
+    internal bool PeekIsCircuitOpen(int failureThreshold, int breakDurationMinutes, DateTime utcNow)
+    {
+        return _circuitState.PeekIsCircuitOpen(failureThreshold, breakDurationMinutes, utcNow);
     }
 
     internal void ApplyIngestCapabilities(

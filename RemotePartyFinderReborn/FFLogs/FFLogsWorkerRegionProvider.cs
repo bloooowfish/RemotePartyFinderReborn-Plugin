@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using Dalamud.Plugin.Services;
 
@@ -106,9 +107,12 @@ internal sealed class DalamudFFLogsWorkerRegionProvider :
     IFFLogsWorkerRegionSnapshotState,
     IDisposable
 {
+    private static readonly TimeSpan RefreshInterval = TimeSpan.FromSeconds(1);
+
     private readonly IFramework _framework;
     private readonly IObjectTable _objectTable;
     private readonly CachedFFLogsWorkerRegionProvider _cache;
+    private readonly Stopwatch _refreshTimer = new();
 
     public DalamudFFLogsWorkerRegionProvider(
         IFramework framework,
@@ -134,6 +138,12 @@ internal sealed class DalamudFFLogsWorkerRegionProvider :
 
     private void OnFrameworkUpdate(IFramework framework)
     {
+        if (_refreshTimer.IsRunning && _refreshTimer.Elapsed < RefreshInterval)
+        {
+            return;
+        }
+
+        _refreshTimer.Restart();
         RefreshCurrentWorld();
     }
 

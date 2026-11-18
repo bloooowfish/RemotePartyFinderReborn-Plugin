@@ -36,7 +36,8 @@ internal sealed class PartyDetailUploadExecutor {
     }
 
     internal async Task<Dictionary<uint, DetailUploadOutcome>> UploadBatchToAllTargetsAsync(
-        IReadOnlyList<PendingDetailEntry> pendingBatch
+        IReadOnlyList<PendingDetailEntry> pendingBatch,
+        CancellationToken cancellationToken = default
     ) {
         var applied = new HashSet<uint>();
         var missing = new HashSet<uint>();
@@ -47,153 +48,170 @@ internal sealed class PartyDetailUploadExecutor {
         var attempted = new HashSet<uint>();
 
         foreach (var uploadTarget in _configuration.UploadUrls.Where(static candidate => candidate.IsEnabled)) {
+            cancellationToken.ThrowIfCancellationRequested();
+
             if (UploadAttemptRecorder.IsCircuitOpen(uploadTarget, _configuration, _utcNow())) {
                 continue;
             }
 
-            var candidates = pendingBatch
-                .Where(pending => !applied.Contains(pending.Detail.ListingId))
-                .Where(pending => !terminalRejected.ContainsKey(pending.Detail.ListingId))
-                .ToList();
+            var candidates = pendingBatch.ToList();
             if (candidates.Count == 0) {
                 break;
             }
 
-            if (uploadTarget.DetailBatchUnsupported) {
-                await UploadSinglesToTargetAsync(
-                    uploadTarget,
-                    candidates,
-                    applied,
-                    missing,
-                    terminalRejected,
-                    retryAfterByListing,
-                    attempted,
-                    deferred,
-                    retryableFailed
-                );
-                continue;
-            }
-
-            if (!IngestEndpointResolver.TryBuildEndpoint(uploadTarget, IngestRoutes.DetailBatch, out var endpoint)) {
-                continue;
-            }
-
-            var sendable = BuildSendableBatchItems(uploadTarget, candidates, new DateTimeOffset(_utcNow()));
-            if (sendable.Count == 0) {
-                continue;
-            }
-            foreach (var item in sendable) {
-                attempted.Add(item.Pending.Detail.ListingId);
-            }
+            var targetApplied = new HashSet<uint>();
+            var targetTerminalRejected = new Dictionary<uint, string>();
 
             try {
-                using var request = IngestRequestFactory.CreatePostJsonRequest(
-                    _configuration,
-                    endpoint,
-                    JsonConvert.SerializeObject(sendable.Select(static item => item.Payload)),
-                    capabilityToken: null
-                );
-                using var timeout = new CancellationTokenSource(
-                    TimeSpan.FromMilliseconds(PartyDetailUploadPolicy.NormalizeDetailUploadTimeoutMs(_configuration.DetailUploadTimeoutMs))
-                );
-                using var response = await _httpClient.SendAsync(request, timeout.Token);
-                var body = await response.Content.ReadAsStringAsync();
-
-                if (response.IsSuccessStatusCode) {
-                    if (DetailUploadResponseMapper.TryParseDetailBatchResponse(body, out var batchResponse) && batchResponse.Results.Count > 0) {
-                        var targetCapabilityForbidden = new HashSet<uint>();
-                        DetailUploadResponseMapper.ApplyBatchResponse(
-                            batchResponse,
-                            sendable.Select(static item => item.Pending.Detail.ListingId),
-                            applied,
-                            missing,
-                            terminalRejected,
-                            retryAfterByListing,
-                            targetCapabilityForbidden,
-                            retryableFailed
-                        );
-
-                        if (targetCapabilityForbidden.Count > 0) {
-                            uploadTarget.MarkDetailCapabilitiesRequired();
-                            foreach (var listingId in targetCapabilityForbidden) {
-                                uploadTarget.InvalidateDetailCapability(listingId);
-                                deferred.Add(listingId);
-                            }
-                        }
-
-                        // Keep endpoint failure state honest when every item in the batch was rejected for capability reasons.
-                        if (targetCapabilityForbidden.Count < sendable.Count) {
-                            UploadAttemptRecorder.RecordSuccess(uploadTarget);
-                        }
-                    } else {
-                        UploadAttemptRecorder.RecordSuccess(uploadTarget);
-                        foreach (var item in sendable) {
-                            retryableFailed.Add(item.Pending.Detail.ListingId);
-                        }
-                        _warningLog($"PartyDetailCollector: {endpoint.Url}: unexpected batch response without item results; retrying sent detail payloads");
-                    }
-
-                    _debugLog($"PartyDetailCollector: {endpoint.Url}: {response.StatusCode} {body}");
-                    continue;
-                }
-
-                if (response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.MethodNotAllowed) {
-                    uploadTarget.MarkDetailBatchUnsupported();
-                    _debugLog($"PartyDetailCollector: {endpoint.Url}: {response.StatusCode}; falling back to single detail uploads");
+                if (uploadTarget.DetailBatchUnsupported) {
                     await UploadSinglesToTargetAsync(
                         uploadTarget,
-                        sendable.Select(static item => item.Pending).ToList(),
-                        applied,
+                        candidates,
+                        targetApplied,
                         missing,
-                        terminalRejected,
+                        targetTerminalRejected,
                         retryAfterByListing,
                         attempted,
                         deferred,
-                        retryableFailed
+                        retryableFailed,
+                        cancellationToken
                     );
                     continue;
                 }
 
-                var isAuthFailure = response.StatusCode is HttpStatusCode.Forbidden or HttpStatusCode.Unauthorized;
-                if (isAuthFailure) {
-                    uploadTarget.MarkDetailCapabilitiesRequired();
-                    foreach (var item in sendable) {
-                        uploadTarget.InvalidateDetailCapability(item.Pending.Detail.ListingId);
-                        deferred.Add(item.Pending.Detail.ListingId);
+                if (!IngestEndpointResolver.TryBuildEndpoint(uploadTarget, IngestRoutes.DetailBatch, out var endpoint)) {
+                    continue;
+                }
+
+                var sendable = BuildSendableBatchItems(uploadTarget, candidates, new DateTimeOffset(_utcNow()));
+                if (sendable.Count == 0) {
+                    continue;
+                }
+                foreach (var item in sendable) {
+                    attempted.Add(item.Pending.Detail.ListingId);
+                }
+
+                try {
+                    using var request = IngestRequestFactory.CreatePostJsonRequest(
+                        _configuration,
+                        endpoint,
+                        JsonConvert.SerializeObject(sendable.Select(static item => item.Payload)),
+                        capabilityToken: null
+                    );
+                    using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    timeout.CancelAfter(
+                        TimeSpan.FromMilliseconds(PartyDetailUploadPolicy.NormalizeDetailUploadTimeoutMs(_configuration.DetailUploadTimeoutMs))
+                    );
+                    using var response = await _httpClient.SendAsync(request, timeout.Token);
+                    var body = await response.Content.ReadAsStringAsync(timeout.Token);
+
+                    if (response.IsSuccessStatusCode) {
+                        if (DetailUploadResponseMapper.TryParseDetailBatchResponse(body, out var batchResponse) && batchResponse.Results.Count > 0) {
+                            var targetCapabilityForbidden = new HashSet<uint>();
+                            DetailUploadResponseMapper.ApplyBatchResponse(
+                                batchResponse,
+                                sendable.Select(static item => item.Pending.Detail.ListingId),
+                                targetApplied,
+                                missing,
+                                targetTerminalRejected,
+                                retryAfterByListing,
+                                targetCapabilityForbidden,
+                                retryableFailed
+                            );
+
+                            if (targetCapabilityForbidden.Count > 0) {
+                                uploadTarget.MarkDetailCapabilitiesRequired();
+                                foreach (var listingId in targetCapabilityForbidden) {
+                                    uploadTarget.InvalidateDetailCapability(listingId);
+                                    deferred.Add(listingId);
+                                }
+                            }
+
+                            // Keep endpoint failure state honest when every item in the batch was rejected for capability reasons.
+                            if (targetCapabilityForbidden.Count < sendable.Count) {
+                                UploadAttemptRecorder.RecordSuccess(uploadTarget);
+                            }
+                        } else {
+                            UploadAttemptRecorder.RecordSuccess(uploadTarget);
+                            foreach (var item in sendable) {
+                                retryableFailed.Add(item.Pending.Detail.ListingId);
+                            }
+                            _warningLog($"PartyDetailCollector: {endpoint.Url}: unexpected batch response without item results; retrying sent detail payloads");
+                        }
+
+                        _debugLog($"PartyDetailCollector: {endpoint.Url}: {response.StatusCode} {body}");
+                        continue;
                     }
-                } else {
+
+                    if (response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.MethodNotAllowed) {
+                        uploadTarget.MarkDetailBatchUnsupported();
+                        _debugLog($"PartyDetailCollector: {endpoint.Url}: {response.StatusCode}; falling back to single detail uploads");
+                        await UploadSinglesToTargetAsync(
+                            uploadTarget,
+                            sendable.Select(static item => item.Pending).ToList(),
+                            targetApplied,
+                            missing,
+                            targetTerminalRejected,
+                            retryAfterByListing,
+                            attempted,
+                            deferred,
+                            retryableFailed,
+                            cancellationToken
+                        );
+                        continue;
+                    }
+
+                    var isAuthFailure = response.StatusCode is HttpStatusCode.Forbidden or HttpStatusCode.Unauthorized;
+                    if (isAuthFailure) {
+                        uploadTarget.MarkDetailCapabilitiesRequired();
+                        foreach (var item in sendable) {
+                            uploadTarget.InvalidateDetailCapability(item.Pending.Detail.ListingId);
+                            deferred.Add(item.Pending.Detail.ListingId);
+                        }
+                    } else {
+                        UploadAttemptRecorder.RecordFailure(uploadTarget, _utcNow());
+                        foreach (var item in sendable) {
+                            retryableFailed.Add(item.Pending.Detail.ListingId);
+                        }
+                    }
+
+                    if ((int)response.StatusCode == 429) {
+                        var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
+                        if (retryAfter.HasValue) {
+                            foreach (var item in sendable) {
+                                retryAfterByListing[item.Pending.Detail.ListingId] = MaxRetryAfterSeconds(
+                                    retryAfterByListing.GetValueOrDefault(item.Pending.Detail.ListingId),
+                                    retryAfter.Value
+                                );
+                            }
+                            _warningLog($"PartyDetailCollector: rate limited by {endpoint.Url}, retry_after={retryAfter.Value}s");
+                        }
+                    }
+
+                    _debugLog($"PartyDetailCollector: {endpoint.Url}: {response.StatusCode} {body}");
+                } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
+                    throw;
+                } catch (OperationCanceledException exception) {
                     UploadAttemptRecorder.RecordFailure(uploadTarget, _utcNow());
                     foreach (var item in sendable) {
                         retryableFailed.Add(item.Pending.Detail.ListingId);
                     }
-                }
-
-                if ((int)response.StatusCode == 429) {
-                    var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
-                    if (retryAfter.HasValue) {
-                        foreach (var item in sendable) {
-                            retryAfterByListing[item.Pending.Detail.ListingId] = MaxRetryAfterSeconds(
-                                retryAfterByListing.GetValueOrDefault(item.Pending.Detail.ListingId),
-                                retryAfter.Value
-                            );
-                        }
-                        _warningLog($"PartyDetailCollector: rate limited by {endpoint.Url}, retry_after={retryAfter.Value}s");
+                    _errorLog($"PartyDetailCollector batch upload timed out to {endpoint.Url}: {exception.Message}");
+                } catch (Exception exception) {
+                    UploadAttemptRecorder.RecordFailure(uploadTarget, _utcNow());
+                    foreach (var item in sendable) {
+                        retryableFailed.Add(item.Pending.Detail.ListingId);
                     }
+                    _errorLog($"PartyDetailCollector batch upload error to {endpoint.Url}: {exception.Message}");
+                }
+            } finally {
+                foreach (var listingId in targetApplied) {
+                    applied.Add(listingId);
                 }
 
-                _debugLog($"PartyDetailCollector: {endpoint.Url}: {response.StatusCode} {body}");
-            } catch (OperationCanceledException exception) {
-                UploadAttemptRecorder.RecordFailure(uploadTarget, _utcNow());
-                foreach (var item in sendable) {
-                    retryableFailed.Add(item.Pending.Detail.ListingId);
+                foreach (var rejected in targetTerminalRejected) {
+                    terminalRejected.TryAdd(rejected.Key, rejected.Value);
                 }
-                _errorLog($"PartyDetailCollector batch upload timed out to {endpoint.Url}: {exception.Message}");
-            } catch (Exception exception) {
-                UploadAttemptRecorder.RecordFailure(uploadTarget, _utcNow());
-                foreach (var item in sendable) {
-                    retryableFailed.Add(item.Pending.Detail.ListingId);
-                }
-                _errorLog($"PartyDetailCollector batch upload error to {endpoint.Url}: {exception.Message}");
             }
         }
 
@@ -233,15 +251,18 @@ internal sealed class PartyDetailUploadExecutor {
         Dictionary<uint, int?> retryAfterByListing,
         HashSet<uint> attempted,
         HashSet<uint> deferred,
-        HashSet<uint> retryableFailed
+        HashSet<uint> retryableFailed,
+        CancellationToken cancellationToken
     ) {
         foreach (var pending in pendingEntries) {
+            cancellationToken.ThrowIfCancellationRequested();
+
             var listingId = pending.Detail.ListingId;
             if (applied.Contains(listingId) || terminalRejected.ContainsKey(listingId)) {
                 continue;
             }
 
-            var outcome = await TryUploadSingleToTargetAsync(uploadTarget, pending.Detail);
+            var outcome = await TryUploadSingleToTargetAsync(uploadTarget, pending.Detail, cancellationToken);
             if (outcome == null) {
                 continue;
             }
@@ -286,9 +307,11 @@ internal sealed class PartyDetailUploadExecutor {
 
     private async Task<DetailUploadOutcome?> TryUploadSingleToTargetAsync(
         UploadUrl uploadTarget,
-        UploadablePartyDetail payload
+        UploadablePartyDetail payload,
+        CancellationToken cancellationToken
     ) {
-        if (UploadAttemptRecorder.IsCircuitOpen(uploadTarget, _configuration, _utcNow())) {
+        if (cancellationToken.IsCancellationRequested
+            || UploadAttemptRecorder.IsCircuitOpen(uploadTarget, _configuration, _utcNow())) {
             return null;
         }
 
@@ -311,11 +334,12 @@ internal sealed class PartyDetailUploadExecutor {
                 JsonConvert.SerializeObject(payload),
                 capabilityToken
             );
-            using var timeout = new CancellationTokenSource(
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(
                 TimeSpan.FromMilliseconds(PartyDetailUploadPolicy.NormalizeDetailUploadTimeoutMs(_configuration.DetailUploadTimeoutMs))
             );
             using var response = await _httpClient.SendAsync(request, timeout.Token);
-            var body = await response.Content.ReadAsStringAsync();
+            var body = await response.Content.ReadAsStringAsync(timeout.Token);
 
             if (response.IsSuccessStatusCode) {
                 UploadAttemptRecorder.RecordSuccess(uploadTarget);
@@ -356,6 +380,8 @@ internal sealed class PartyDetailUploadExecutor {
 
             _debugLog($"PartyDetailCollector: {endpoint.Url}: {response.StatusCode} {body}");
             return new DetailUploadOutcome(DetailUploadResult.RetryableFailure, retryAfterSeconds);
+        } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
+            throw;
         } catch (OperationCanceledException exception) {
             UploadAttemptRecorder.RecordFailure(uploadTarget, _utcNow());
             _errorLog($"PartyDetailCollector upload timed out to {endpoint.Url}: {exception.Message}");

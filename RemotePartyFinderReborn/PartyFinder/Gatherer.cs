@@ -13,19 +13,24 @@ using Newtonsoft.Json;
 namespace RemotePartyFinderReborn;
 
 internal sealed class Gatherer : IDisposable {
+    internal const int MaxRetainedListings = 200;
     private static readonly TimeSpan UploadInterval = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan UploadedListingIndexTtl = TimeSpan.FromMinutes(30);
     private static readonly TimeSpan UploadedListingGrace = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan ShutdownWaitTimeout = TimeSpan.FromSeconds(2);
 
     private readonly Plugin _plugin;
     private readonly object _batchesLock = new();
     private Dictionary<int, List<UploadableListing>> _batches = new();
     private readonly ConcurrentDictionary<uint, DateTime> _lastUploadedListingAtUtc = new();
     private readonly Stopwatch _uploadTimer = new();
-    private readonly HttpClient _httpClient = new();
+    private readonly HttpClient _httpClient = PluginHttpClientFactory.CreateIngestClient();
     private readonly CancellationTokenSource _disposeCts = new();
 
     private int _uploadWorkerRunning;
+    private Task _activeUploadTask = Task.CompletedTask;
+    private int _shutdownSignaled;
+    private int _disposed;
     private long _lastSuccessfulUploadAtUtcTicks;
     private long _lastSuccessfulUploadAckVersion;
 
@@ -49,12 +54,37 @@ internal sealed class Gatherer : IDisposable {
         _plugin.Framework.Update += OnUpdate;
     }
 
+    internal void BeginShutdown() {
+        if (Interlocked.Exchange(ref _shutdownSignaled, 1) != 0) {
+            return;
+        }
+
+        try {
+            _disposeCts.Cancel();
+        } catch (ObjectDisposedException) {
+        }
+    }
+
     public void Dispose() {
         _plugin.Framework.Update -= OnUpdate;
         _plugin.PartyFinderGui.ReceiveListing -= OnListing;
-        _disposeCts.Cancel();
-        _disposeCts.Dispose();
+        BeginShutdown();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) {
+            return;
+        }
+
+        Task activeTask;
+        lock (_batchesLock) {
+            activeTask = _activeUploadTask;
+        }
+
+        try {
+            activeTask.Wait(ShutdownWaitTimeout);
+        } catch (Exception) {
+        }
+
         _httpClient.Dispose();
+        _disposeCts.Dispose();
     }
 
     internal bool WasListingUploadedAfter(uint listingId, DateTime observedAtUtc) {
@@ -134,22 +164,23 @@ internal sealed class Gatherer : IDisposable {
     }
 
     private void TryStartUploadWorker() {
+        CancellationToken cancellationToken;
         lock (_batchesLock) {
-            if (_uploadWorkerRunning != 0 || _batches.Count == 0) {
+            if (_shutdownSignaled != 0 || _uploadWorkerRunning != 0 || _batches.Count == 0) {
                 return;
             }
 
+            cancellationToken = _disposeCts.Token;
             _uploadWorkerRunning = 1;
+            _activeUploadTask = ProcessPendingBatchesAsync(cancellationToken);
         }
-
-        _ = ProcessPendingBatchesAsync();
     }
 
-    private Task ProcessPendingBatchesAsync() {
+    private Task ProcessPendingBatchesAsync(CancellationToken cancellationToken) {
         return Task.Run(async () => {
             var exitedUnderLock = false;
             try {
-                while (!_disposeCts.IsCancellationRequested && _plugin.IsPluginOperational) {
+                while (!cancellationToken.IsCancellationRequested && _plugin.IsPluginOperational) {
                     var listingsToUpload = DrainBatchesOrExitWorker();
                     if (listingsToUpload.Count == 0) {
                         exitedUnderLock = true;
@@ -158,9 +189,13 @@ internal sealed class Gatherer : IDisposable {
 
                     var payload = JsonConvert.SerializeObject(listingsToUpload);
                     var uploadedListingIds = listingsToUpload.Select(static listing => listing.Id).Distinct().ToArray();
-                    var uploadSucceeded = await UploadBatchToEnabledEndpointsAsync(payload, listingsToUpload.Count);
+                    var uploadSucceeded = await UploadBatchToEnabledEndpointsAsync(payload, listingsToUpload.Count, cancellationToken);
 
                     if (!uploadSucceeded) {
+                        if (!cancellationToken.IsCancellationRequested && _plugin.IsPluginOperational) {
+                            RequeueFailedListings(listingsToUpload);
+                        }
+
                         return;
                     }
 
@@ -173,6 +208,7 @@ internal sealed class Gatherer : IDisposable {
                     Interlocked.Increment(ref _lastSuccessfulUploadAckVersion);
                     PruneUploadIndex(now);
                 }
+            } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
             } finally {
                 if (!exitedUnderLock) {
                     lock (_batchesLock) {
@@ -181,6 +217,52 @@ internal sealed class Gatherer : IDisposable {
                 }
             }
         });
+    }
+
+    private void RequeueFailedListings(IReadOnlyList<UploadableListing> failedListings) {
+        lock (_batchesLock) {
+            if (_shutdownSignaled != 0) {
+                return;
+            }
+
+            RetainFailedBatchListings(_batches, failedListings);
+        }
+    }
+
+    internal static void RetainFailedBatchListings(
+        Dictionary<int, List<UploadableListing>> batches,
+        IReadOnlyList<UploadableListing> failedListings,
+        int maxCount = MaxRetainedListings
+    ) {
+        ArgumentNullException.ThrowIfNull(batches);
+        ArgumentNullException.ThrowIfNull(failedListings);
+
+        if (maxCount <= 0) {
+            batches.Clear();
+            return;
+        }
+
+        var byId = new Dictionary<uint, UploadableListing>();
+        foreach (var listing in failedListings) {
+            byId[listing.Id] = listing;
+        }
+
+        foreach (var (_, list) in batches) {
+            foreach (var listing in list) {
+                byId[listing.Id] = listing;
+            }
+        }
+
+        batches.Clear();
+        if (byId.Count == 0) {
+            return;
+        }
+
+        batches[-1] = byId.Values
+            .OrderByDescending(static listing => listing.Id)
+            .Take(maxCount)
+            .OrderBy(static listing => listing.Id)
+            .ToList();
     }
 
     private List<UploadableListing> DrainBatchesOrExitWorker() {
@@ -203,10 +285,14 @@ internal sealed class Gatherer : IDisposable {
         return result;
     }
 
-    private async Task<bool> UploadBatchToEnabledEndpointsAsync(string jsonPayload, int listingCount) {
+    private async Task<bool> UploadBatchToEnabledEndpointsAsync(string jsonPayload, int listingCount, CancellationToken cancellationToken) {
         var anySuccess = false;
 
         foreach (var uploadUrl in _plugin.Configuration.UploadUrls.Where(static candidate => candidate.IsEnabled)) {
+            if (cancellationToken.IsCancellationRequested) {
+                break;
+            }
+
             if (UploadAttemptRecorder.IsCircuitOpen(uploadUrl, _plugin.Configuration, DateTime.UtcNow)) {
                 continue;
             }
@@ -214,7 +300,11 @@ internal sealed class Gatherer : IDisposable {
             if (!IngestEndpointResolver.TryBuildEndpoint(uploadUrl, IngestRoutes.ListingsMultiple, out var endpoint)) {
                 continue;
             }
-            var attempt = await TryUploadAsync(endpoint, jsonPayload);
+            var attempt = await TryUploadAsync(endpoint, jsonPayload, cancellationToken);
+
+            if (attempt.Canceled) {
+                break;
+            }
 
             if (attempt.Success) {
                 anySuccess = true;
@@ -239,15 +329,15 @@ internal sealed class Gatherer : IDisposable {
         return anySuccess;
     }
 
-    private async Task<UploadAttemptResult> TryUploadAsync(IngestEndpoint endpoint, string jsonPayload) {
+    private async Task<UploadAttemptResult> TryUploadAsync(IngestEndpoint endpoint, string jsonPayload, CancellationToken cancellationToken) {
         try {
             using var request = IngestRequestFactory.CreatePostJsonRequest(
                 _plugin.Configuration,
                 endpoint,
                 jsonPayload
             );
-            var response = await _httpClient.SendAsync(request);
-            var responseBody = await response.Content.ReadAsStringAsync();
+            using var response = await _httpClient.SendAsync(request, cancellationToken);
+            var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
 
             var retryAfterSeconds = (int)response.StatusCode == 429
                 ? IngestRequestFactory.ReadRetryAfterSeconds(response)
@@ -258,10 +348,13 @@ internal sealed class Gatherer : IDisposable {
                 (int)response.StatusCode,
                 retryAfterSeconds,
                 null,
-                responseBody
+                responseBody,
+                false
             );
+        } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
+            return new UploadAttemptResult(false, null, null, null, string.Empty, true);
         } catch (Exception ex) {
-            return new UploadAttemptResult(false, null, null, ex.Message, string.Empty);
+            return new UploadAttemptResult(false, null, null, ex.Message, string.Empty, false);
         }
     }
 
@@ -281,6 +374,7 @@ internal sealed class Gatherer : IDisposable {
         int? StatusCode,
         int? RetryAfterSeconds,
         string ErrorMessage,
-        string ResponseBody
+        string ResponseBody,
+        bool Canceled
     );
 }

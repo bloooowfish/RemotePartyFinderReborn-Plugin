@@ -11,6 +11,11 @@ using Newtonsoft.Json.Linq;
 
 namespace RemotePartyFinderReborn.Tomestone;
 
+internal readonly record struct TomestoneProgressionFetchResult(
+    OperationOutcome<TomestoneProgressData> Outcome,
+    bool PerformedHttpRequest
+);
+
 internal interface ITomestoneProgressionService
 {
     bool IsConfigured { get; }
@@ -23,6 +28,31 @@ internal interface ITomestoneProgressionService
         uint zoneId,
         uint encounterId,
         CancellationToken cancellationToken);
+    async Task<TomestoneProgressionFetchResult> FetchProgressionDataWithTelemetryAsync(
+        string name,
+        string server,
+        uint zoneId,
+        uint encounterId,
+        CancellationToken cancellationToken)
+    {
+        var outcome = await FetchProgressionDataAsync(
+            name,
+            server,
+            zoneId,
+            encounterId,
+            cancellationToken).ConfigureAwait(false);
+        return new TomestoneProgressionFetchResult(outcome, PerformedHttpRequest: true);
+    }
+    bool TryGetCachedProgressionData(
+        string name,
+        string server,
+        uint zoneId,
+        uint encounterId,
+        out OperationOutcome<TomestoneProgressData> outcome)
+    {
+        outcome = default;
+        return false;
+    }
     IReadOnlyDictionary<uint, TomestoneProgressData> TryGetCachedZoneSiblingProgress(
         string name,
         string server,
@@ -37,6 +67,10 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
         TomestoneRawResponse Response,
         JToken ParsedRoot);
 
+    private readonly record struct CachedProfileFetchResult(
+        OperationOutcome<CachedProfileEntry> Outcome,
+        bool PerformedHttpRequest);
+
     private static readonly object ShapeDiagnosticLock = new();
     private static readonly HashSet<string> LoggedShapeDiagnostics = new(StringComparer.Ordinal);
 
@@ -47,7 +81,7 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
     private readonly Func<DateTime> _utcNow;
     private readonly object _profileCacheLock = new();
     private readonly Dictionary<(string Path, string Credential), CachedProfileEntry> _profileCache = new();
-    private readonly ConcurrentDictionary<(string Path, string Credential), Lazy<Task<OperationOutcome<CachedProfileEntry>>>> _profileRequests = new();
+    private readonly ConcurrentDictionary<(string Path, string Credential), Lazy<Task<CachedProfileFetchResult>>> _profileRequests = new();
 
     internal TomestoneProgressionService(
         TomestoneApiClient client,
@@ -126,7 +160,60 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
         return merged;
     }
 
+    public bool TryGetCachedProgressionData(
+        string name,
+        string server,
+        uint zoneId,
+        uint encounterId,
+        out OperationOutcome<TomestoneProgressData> outcome)
+    {
+        if (!IsConfigured
+            || _client.TryGetRateLimitRemaining(out _)
+            || !TomestoneEncounterMapping.TryGetProgressionTarget(zoneId, encounterId, out var encounterParams))
+        {
+            outcome = default;
+            return false;
+        }
+
+        var profilePath = BuildCharacterProfilePath(name, server);
+        var key = (Path: profilePath, Credential: _configuration.TomestoneApiKey?.Trim() ?? string.Empty);
+        var now = _utcNow();
+        CachedProfileEntry cachedProfile = null;
+        lock (_profileCacheLock)
+        {
+            if (_profileCache.TryGetValue(key, out var cached) && cached.ExpiresAt > now)
+            {
+                cachedProfile = cached;
+            }
+        }
+
+        if (cachedProfile == null)
+        {
+            outcome = default;
+            return false;
+        }
+
+        var targetDescription = FormatTomestoneProgressTarget(zoneId, encounterId, encounterParams);
+        return TryResolveProfileEntryOutcome(cachedProfile, zoneId, encounterId, encounterParams, targetDescription, out outcome);
+    }
+
     public async Task<OperationOutcome<TomestoneProgressData>> FetchProgressionDataAsync(
+        string name,
+        string server,
+        uint zoneId,
+        uint encounterId,
+        CancellationToken cancellationToken)
+    {
+        var result = await FetchProgressionDataWithTelemetryAsync(
+            name,
+            server,
+            zoneId,
+            encounterId,
+            cancellationToken).ConfigureAwait(false);
+        return result.Outcome;
+    }
+
+    public async Task<TomestoneProgressionFetchResult> FetchProgressionDataWithTelemetryAsync(
         string name,
         string server,
         uint zoneId,
@@ -136,82 +223,53 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
         if (!IsConfigured)
         {
             _debugLog("Tomestone progress enrichment is disabled or missing an API key.");
-            return OperationOutcome<TomestoneProgressData>.Success(TomestoneProgressData.Skipped);
+            return new TomestoneProgressionFetchResult(
+                OperationOutcome<TomestoneProgressData>.Success(TomestoneProgressData.Skipped),
+                PerformedHttpRequest: false);
         }
 
         if (!TomestoneEncounterMapping.TryGetProgressionTarget(zoneId, encounterId, out var encounterParams))
         {
             _debugLog($"Tomestone progress skipped for unmapped encounter zone={zoneId}, encounter={encounterId}.");
-            return OperationOutcome<TomestoneProgressData>.Success(TomestoneProgressData.Skipped);
+            return new TomestoneProgressionFetchResult(
+                OperationOutcome<TomestoneProgressData>.Success(TomestoneProgressData.Skipped),
+                PerformedHttpRequest: false);
         }
 
         if (_client.TryGetRateLimitRemaining(out _))
         {
-            return OperationOutcome<TomestoneProgressData>.Failure(
-                transientFailure: true,
-                "Tomestone API rate-limit cooldown is active.");
+            return new TomestoneProgressionFetchResult(
+                OperationOutcome<TomestoneProgressData>.Failure(
+                    transientFailure: true,
+                    "Tomestone API rate-limit cooldown is active."),
+                PerformedHttpRequest: false);
         }
 
         var targetDescription = FormatTomestoneProgressTarget(zoneId, encounterId, encounterParams);
         var profilePath = BuildCharacterProfilePath(name, server);
-        var profileOutcome = await FetchProfileAsync(profilePath, cancellationToken).ConfigureAwait(false);
+        var profileFetch = await FetchProfileAsync(profilePath, cancellationToken).ConfigureAwait(false);
+        var performedHttp = profileFetch.PerformedHttpRequest;
+        var profileOutcome = profileFetch.Outcome;
         if (!profileOutcome.Succeeded)
         {
             _debugLog($"Tomestone profile returned no response for {targetDescription}.");
-            return OperationOutcome<TomestoneProgressData>.Failure(
-                profileOutcome.TransientFailure,
-                profileOutcome.ErrorMessage ?? "Tomestone profile returned no response.");
+            return new TomestoneProgressionFetchResult(
+                OperationOutcome<TomestoneProgressData>.Failure(
+                    profileOutcome.TransientFailure,
+                    profileOutcome.ErrorMessage ?? "Tomestone profile returned no response."),
+                performedHttp);
         }
 
         var cachedProfile = profileOutcome.Value!;
-        var profileResponse = cachedProfile.Response;
-        if (profileResponse.ActivityHidden)
+        if (TryResolveProfileEntryOutcome(cachedProfile, zoneId, encounterId, encounterParams, targetDescription, out var profileResolvedOutcome))
         {
-            _debugLog($"Tomestone profile activity is hidden for {targetDescription}.");
-            return OperationOutcome<TomestoneProgressData>.Success(TomestoneProgressData.Empty);
+            return new TomestoneProgressionFetchResult(profileResolvedOutcome, performedHttp);
         }
 
-        if (profileResponse.StatusCode == HttpStatusCode.NotFound)
-        {
-            _debugLog($"Tomestone profile not found for {targetDescription}.");
-            return OperationOutcome<TomestoneProgressData>.Success(TomestoneProgressData.Empty);
-        }
-
-        if (profileResponse.StatusCode == HttpStatusCode.NoContent)
-        {
-            _debugLog($"Tomestone profile had no content for {targetDescription}.");
-            return OperationOutcome<TomestoneProgressData>.Success(TomestoneProgressData.Empty);
-        }
-
-        if (profileResponse.StatusCode is < HttpStatusCode.OK or >= HttpStatusCode.MultipleChoices)
-        {
-            _warningLog($"Tomestone profile failed with {(int)profileResponse.StatusCode} for {targetDescription}.");
-            return OperationOutcome<TomestoneProgressData>.Failure(
-                IsTransientStatusCode(profileResponse.StatusCode),
-                $"Tomestone profile failed with {(int)profileResponse.StatusCode}.");
-        }
-
-        var profileRoot = cachedProfile.ParsedRoot;
-        if (profileRoot == null)
-        {
-            _warningLog($"Tomestone profile parse failed for {targetDescription}: profile JSON was invalid.");
-            return OperationOutcome<TomestoneProgressData>.Failure(
-                transientFailure: false,
-                "Tomestone profile parse failed.");
-        }
-
-        var profileProgress = TomestoneProgressParser.ParseProgress(profileRoot, encounterParams);
-        if (HasUsefulProgress(profileProgress, encounterParams.ProgressKind))
-        {
-            _debugLog(
-                $"Tomestone profile parsed {profileProgress.Phases.Count} phase(s), boss={profileProgress.BossPercentage?.ToString("0.##", CultureInfo.InvariantCulture) ?? "none"} for {targetDescription}.");
-            return OperationOutcome<TomestoneProgressData>.Success(profileProgress);
-        }
-
-        LogResponseShapeOnce("profile", zoneId, encounterId, targetDescription, profileResponse.Body);
+        LogResponseShapeOnce("profile", zoneId, encounterId, targetDescription, cachedProfile.Response.Body);
         _debugLog($"Tomestone profile had no target progress for {targetDescription}; falling back to encounter activity.");
 
-        return await FetchEncounterActivityAsync(
+        var activityOutcome = await FetchEncounterActivityAsync(
             name,
             server,
             zoneId,
@@ -219,6 +277,69 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
             encounterParams,
             targetDescription,
             cancellationToken).ConfigureAwait(false);
+        return new TomestoneProgressionFetchResult(activityOutcome, PerformedHttpRequest: true);
+    }
+
+    private bool TryResolveProfileEntryOutcome(
+        CachedProfileEntry cachedProfile,
+        uint zoneId,
+        uint encounterId,
+        TomestoneEncounterParams encounterParams,
+        string targetDescription,
+        out OperationOutcome<TomestoneProgressData> outcome)
+    {
+        var profileResponse = cachedProfile.Response;
+        if (profileResponse.ActivityHidden)
+        {
+            _debugLog($"Tomestone profile activity is hidden for {targetDescription}.");
+            outcome = OperationOutcome<TomestoneProgressData>.Success(TomestoneProgressData.Empty);
+            return true;
+        }
+
+        if (profileResponse.StatusCode == HttpStatusCode.NotFound)
+        {
+            _debugLog($"Tomestone profile not found for {targetDescription}.");
+            outcome = OperationOutcome<TomestoneProgressData>.Success(TomestoneProgressData.Empty);
+            return true;
+        }
+
+        if (profileResponse.StatusCode == HttpStatusCode.NoContent)
+        {
+            _debugLog($"Tomestone profile had no content for {targetDescription}.");
+            outcome = OperationOutcome<TomestoneProgressData>.Success(TomestoneProgressData.Empty);
+            return true;
+        }
+
+        if (profileResponse.StatusCode is < HttpStatusCode.OK or >= HttpStatusCode.MultipleChoices)
+        {
+            _warningLog($"Tomestone profile failed with {(int)profileResponse.StatusCode} for {targetDescription}.");
+            outcome = OperationOutcome<TomestoneProgressData>.Failure(
+                IsTransientStatusCode(profileResponse.StatusCode),
+                $"Tomestone profile failed with {(int)profileResponse.StatusCode}.");
+            return true;
+        }
+
+        var profileRoot = cachedProfile.ParsedRoot;
+        if (profileRoot == null)
+        {
+            _warningLog($"Tomestone profile parse failed for {targetDescription}: profile JSON was invalid.");
+            outcome = OperationOutcome<TomestoneProgressData>.Failure(
+                transientFailure: false,
+                "Tomestone profile parse failed.");
+            return true;
+        }
+
+        var profileProgress = TomestoneProgressParser.ParseProgress(profileRoot, encounterParams);
+        if (HasUsefulProgress(profileProgress, encounterParams.ProgressKind))
+        {
+            _debugLog(
+                $"Tomestone profile parsed {profileProgress.Phases.Count} phase(s), boss={profileProgress.BossPercentage?.ToString("0.##", CultureInfo.InvariantCulture) ?? "none"} for {targetDescription}.");
+            outcome = OperationOutcome<TomestoneProgressData>.Success(profileProgress);
+            return true;
+        }
+
+        outcome = default;
+        return false;
     }
 
     private async Task<OperationOutcome<TomestoneProgressData>> FetchEncounterActivityAsync(
@@ -300,12 +421,23 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
             _ => false,
         });
 
-    private async Task<OperationOutcome<CachedProfileEntry>> FetchProfileAsync(
+    private async Task<CachedProfileFetchResult> FetchProfileAsync(
         string path,
         CancellationToken cancellationToken)
     {
         var key = (Path: path, Credential: _configuration.TomestoneApiKey?.Trim() ?? string.Empty);
-        var request = _profileRequests.GetOrAdd(key, _ => new Lazy<Task<OperationOutcome<CachedProfileEntry>>>(
+        var now = _utcNow();
+        lock (_profileCacheLock)
+        {
+            if (_profileCache.TryGetValue(key, out var cached) && cached.ExpiresAt > now)
+            {
+                return new CachedProfileFetchResult(
+                    OperationOutcome<CachedProfileEntry>.Success(cached),
+                    PerformedHttpRequest: false);
+            }
+        }
+
+        var request = _profileRequests.GetOrAdd(key, _ => new Lazy<Task<CachedProfileFetchResult>>(
             () => FetchAndCacheProfileAsync(key, cancellationToken)));
         try
         {
@@ -315,12 +447,12 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
         {
             if (request.IsValueCreated && request.Value.IsCompleted)
             {
-                _profileRequests.TryRemove(new KeyValuePair<(string Path, string Credential), Lazy<Task<OperationOutcome<CachedProfileEntry>>>>(key, request));
+                _profileRequests.TryRemove(new KeyValuePair<(string Path, string Credential), Lazy<Task<CachedProfileFetchResult>>>(key, request));
             }
         }
     }
 
-    private async Task<OperationOutcome<CachedProfileEntry>> FetchAndCacheProfileAsync(
+    private async Task<CachedProfileFetchResult> FetchAndCacheProfileAsync(
         (string Path, string Credential) key,
         CancellationToken cancellationToken)
     {
@@ -329,16 +461,20 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
         {
             if (_profileCache.TryGetValue(key, out var cached) && cached.ExpiresAt > now)
             {
-                return OperationOutcome<CachedProfileEntry>.Success(cached);
+                return new CachedProfileFetchResult(
+                    OperationOutcome<CachedProfileEntry>.Success(cached),
+                    PerformedHttpRequest: false);
             }
         }
 
         var outcome = await _client.GetRawOutcomeAsync(key.Path, cancellationToken).ConfigureAwait(false);
         if (!outcome.Succeeded || outcome.Value is not { } response)
         {
-            return OperationOutcome<CachedProfileEntry>.Failure(
-                outcome.TransientFailure,
-                outcome.ErrorMessage);
+            return new CachedProfileFetchResult(
+                OperationOutcome<CachedProfileEntry>.Failure(
+                    outcome.TransientFailure,
+                    outcome.ErrorMessage),
+                PerformedHttpRequest: true);
         }
 
         JToken parsedRoot = null;
@@ -379,9 +515,11 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
                 }
                 catch (JsonException ex)
                 {
-                    return OperationOutcome<CachedProfileEntry>.Failure(
-                        transientFailure: false,
-                        $"Tomestone profile parse failed: {ex.Message}");
+                    return new CachedProfileFetchResult(
+                        OperationOutcome<CachedProfileEntry>.Failure(
+                            transientFailure: false,
+                            $"Tomestone profile parse failed: {ex.Message}"),
+                        PerformedHttpRequest: true);
                 }
             }
 
@@ -402,11 +540,15 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
                 _profileCache[key] = entry;
             }
 
-            return OperationOutcome<CachedProfileEntry>.Success(entry);
+            return new CachedProfileFetchResult(
+                OperationOutcome<CachedProfileEntry>.Success(entry),
+                PerformedHttpRequest: true);
         }
 
         var nonCachedEntry = new CachedProfileEntry(DateTime.MinValue, response, null);
-        return OperationOutcome<CachedProfileEntry>.Success(nonCachedEntry);
+        return new CachedProfileFetchResult(
+            OperationOutcome<CachedProfileEntry>.Success(nonCachedEntry),
+            PerformedHttpRequest: true);
     }
 
     private void LogResponseShapeOnce(
