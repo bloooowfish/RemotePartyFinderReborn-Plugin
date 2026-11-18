@@ -33,7 +33,12 @@ public sealed record TomestoneEncounterParams(
     string Category,
     string Encounter,
     TomestoneProgressKind ProgressKind = TomestoneProgressKind.PhaseProgress,
-    IReadOnlyList<string> TargetCanonicalNames = null);
+    IReadOnlyList<string> TargetCanonicalNames = null,
+    string ZoneSlug = null,
+    string ClearsCategory = null)
+{
+    public string EffectiveZoneSlug => string.IsNullOrWhiteSpace(ZoneSlug) ? Category : ZoneSlug;
+}
 
 public enum TomestoneChallengeKind
 {

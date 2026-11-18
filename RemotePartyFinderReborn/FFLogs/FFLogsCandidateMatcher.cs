@@ -139,12 +139,59 @@ internal sealed class FFLogsCandidateMatcher
                     .Where(e => e.ClearCount.HasValue && e.ClearCount.Value > 0)
                     .GroupBy(e => e.EncounterId)
                     .ToDictionary(g => g.Key, g => g.Max(x => x.ClearCount!.Value));
+
+                parseResult.FflogsQueriedEncounters = BuildQueriedEncounters(job, bestData);
             }
 
             resultsByContentId[job.ContentId] = parseResult;
         }
 
         return new FFLogsCandidateMatchResult(resultsByContentId, notFoundCandidateJobs, _missingIdentityJobs);
+    }
+
+    private static List<int> BuildQueriedEncounters(
+        ParseJob job,
+        FFLogsClient.CharacterFetchedData bestData)
+    {
+        var queried = new SortedSet<int>();
+        if (job.ZoneEncounters is { Count: > 0 })
+        {
+            foreach (var encounterId in job.ZoneEncounters)
+            {
+                if (encounterId > 0 && encounterId <= int.MaxValue)
+                {
+                    queried.Add((int)encounterId);
+                }
+            }
+        }
+
+        if (queried.Count == 0)
+        {
+            if (job.EncounterId > 0 && job.EncounterId <= int.MaxValue)
+            {
+                queried.Add((int)job.EncounterId);
+            }
+
+            if (job.SecondaryEncounterId is { } secondaryEncounterId
+                && secondaryEncounterId > 0
+                && secondaryEncounterId <= int.MaxValue)
+            {
+                queried.Add((int)secondaryEncounterId);
+            }
+        }
+
+        if (bestData.Parses is { Count: > 0 })
+        {
+            foreach (var parse in bestData.Parses)
+            {
+                if (parse.EncounterId > 0)
+                {
+                    queried.Add(parse.EncounterId);
+                }
+            }
+        }
+
+        return queried.ToList();
     }
 
     private static long ScoreCandidate(

@@ -43,6 +43,19 @@ internal interface ITomestoneProgressionService
             cancellationToken).ConfigureAwait(false);
         return new TomestoneProgressionFetchResult(outcome, PerformedHttpRequest: true);
     }
+    Task<TomestoneProgressionFetchResult> FetchProgressionDataWithTelemetryAsync(
+        string name,
+        string server,
+        uint zoneId,
+        uint encounterId,
+        TomestoneEncounterParams encounterParams,
+        CancellationToken cancellationToken)
+        => FetchProgressionDataWithTelemetryAsync(
+            name,
+            server,
+            zoneId,
+            encounterId,
+            cancellationToken);
     bool TryGetCachedProgressionData(
         string name,
         string server,
@@ -53,6 +66,19 @@ internal interface ITomestoneProgressionService
         outcome = default;
         return false;
     }
+    bool TryGetCachedProgressionData(
+        string name,
+        string server,
+        uint zoneId,
+        uint encounterId,
+        TomestoneEncounterParams encounterParams,
+        out OperationOutcome<TomestoneProgressData> outcome)
+        => TryGetCachedProgressionData(
+            name,
+            server,
+            zoneId,
+            encounterId,
+            out outcome);
     IReadOnlyDictionary<uint, TomestoneProgressData> TryGetCachedZoneSiblingProgress(
         string name,
         string server,
@@ -166,10 +192,25 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
         uint zoneId,
         uint encounterId,
         out OperationOutcome<TomestoneProgressData> outcome)
+        => TryGetCachedProgressionData(
+            name,
+            server,
+            zoneId,
+            encounterId,
+            encounterParams: null,
+            out outcome);
+
+    public bool TryGetCachedProgressionData(
+        string name,
+        string server,
+        uint zoneId,
+        uint encounterId,
+        TomestoneEncounterParams encounterParams,
+        out OperationOutcome<TomestoneProgressData> outcome)
     {
         if (!IsConfigured
             || _client.TryGetRateLimitRemaining(out _)
-            || !TomestoneEncounterMapping.TryGetProgressionTarget(zoneId, encounterId, out var encounterParams))
+            || (encounterParams is null && !TomestoneEncounterMapping.TryGetProgressionTarget(zoneId, encounterId, out encounterParams)))
         {
             outcome = default;
             return false;
@@ -213,11 +254,26 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
         return result.Outcome;
     }
 
+    public Task<TomestoneProgressionFetchResult> FetchProgressionDataWithTelemetryAsync(
+        string name,
+        string server,
+        uint zoneId,
+        uint encounterId,
+        CancellationToken cancellationToken)
+        => FetchProgressionDataWithTelemetryAsync(
+            name,
+            server,
+            zoneId,
+            encounterId,
+            encounterParams: null,
+            cancellationToken);
+
     public async Task<TomestoneProgressionFetchResult> FetchProgressionDataWithTelemetryAsync(
         string name,
         string server,
         uint zoneId,
         uint encounterId,
+        TomestoneEncounterParams encounterParams,
         CancellationToken cancellationToken)
     {
         if (!IsConfigured)
@@ -228,7 +284,8 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
                 PerformedHttpRequest: false);
         }
 
-        if (!TomestoneEncounterMapping.TryGetProgressionTarget(zoneId, encounterId, out var encounterParams))
+        if (encounterParams is null
+            && !TomestoneEncounterMapping.TryGetProgressionTarget(zoneId, encounterId, out encounterParams))
         {
             _debugLog($"Tomestone progress skipped for unmapped encounter zone={zoneId}, encounter={encounterId}.");
             return new TomestoneProgressionFetchResult(
@@ -266,7 +323,7 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
             return new TomestoneProgressionFetchResult(profileResolvedOutcome, performedHttp);
         }
 
-        LogResponseShapeOnce("profile", zoneId, encounterId, targetDescription, cachedProfile.Response.Body);
+        LogResponseShapeOnce("profile", zoneId, encounterId, targetDescription, cachedProfile.Response.Body, encounterParams);
         _debugLog($"Tomestone profile had no target progress for {targetDescription}; falling back to encounter activity.");
 
         var activityOutcome = await FetchEncounterActivityAsync(
@@ -394,7 +451,7 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
             var progress = TomestoneProgressParser.ParseEncounterActivityProgress(activityRoot, encounterParams);
             if (!HasUsefulProgress(progress, encounterParams.ProgressKind))
             {
-                LogResponseShapeOnce("activity", zoneId, encounterId, targetDescription, response.Body);
+                LogResponseShapeOnce("activity", zoneId, encounterId, targetDescription, response.Body, encounterParams);
             }
 
             _debugLog(
@@ -556,7 +613,8 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
         uint zoneId,
         uint encounterId,
         string targetDescription,
-        string body)
+        string body,
+        TomestoneEncounterParams encounterParams = null)
     {
         var key = $"{endpoint}:{zoneId}:{encounterId}";
         lock (ShapeDiagnosticLock)
@@ -567,11 +625,11 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
             }
         }
 
-        var shape = TomestoneProgressParser.DescribeResponseShape(
-            body,
-            TomestoneEncounterMapping.TryGetProgressionTarget(zoneId, encounterId, out var target)
+        var resolvedTarget = encounterParams
+            ?? (TomestoneEncounterMapping.TryGetProgressionTarget(zoneId, encounterId, out var target)
                 ? target
                 : null);
+        var shape = TomestoneProgressParser.DescribeResponseShape(body, resolvedTarget);
         _debugLog($"Tomestone response shape endpoint={endpoint} for {targetDescription}: {shape}.");
     }
 
@@ -591,7 +649,7 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
         return
             $"zone={zoneId}, encounter={encounterId}; "
             + $"tomestone expansion={encounterParams.Expansion}, "
-            + $"zone={encounterParams.Category}, "
+            + $"zone={encounterParams.EffectiveZoneSlug}, "
             + $"encounter={encounterParams.Encounter}, "
             + $"kind={encounterParams.ProgressKind}";
     }
@@ -607,7 +665,7 @@ internal sealed class TomestoneProgressionService : ITomestoneProgressionService
         return
             $"character/activity/{Encode(server)}/{Encode(name)}"
             + $"?expansion={Encode(encounterParams.Expansion)}"
-            + $"&zone={Encode(encounterParams.Category)}"
+            + $"&zone={Encode(encounterParams.EffectiveZoneSlug)}"
             + $"&encounter={Encode(encounterParams.Encounter)}";
     }
 

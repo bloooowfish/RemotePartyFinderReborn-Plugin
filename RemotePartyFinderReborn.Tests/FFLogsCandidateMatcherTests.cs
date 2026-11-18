@@ -192,6 +192,77 @@ public sealed class FFLogsCandidateMatcherTests
         Assert.Equal(64.2, parse.Encounters[88], 3);
     }
 
+    [Fact]
+    public void Non_hidden_match_populates_fflogs_queried_encounters_from_zone_encounters_and_observed_parses()
+    {
+        var job = CreateJob(contentId: 106, secondaryEncounterId: 89);
+        job.ZoneEncounters = [90, 88, 91];
+        var matcher = CreateMatcher([job]);
+        var query = Assert.Single(matcher.BuildCandidateQueries());
+
+        var result = matcher.MatchFetchedCandidates(new Dictionary<string, FFLogsClient.CharacterFetchedData>
+        {
+            [query.Key] = new FFLogsClient.CharacterFetchedData
+            {
+                Hidden = false,
+                Parses =
+                [
+                    new FFLogsClient.CharacterEncounterParse { EncounterId = 89, Percentile = 50.0 },
+                    new FFLogsClient.CharacterEncounterParse { EncounterId = 88, Percentile = 75.0 },
+                ],
+            },
+        });
+
+        var parse = Assert.Single(result.ResultsByContentId.Values);
+        Assert.Equal([88, 89, 90, 91], parse.FflogsQueriedEncounters);
+    }
+
+    [Fact]
+    public void Non_hidden_zone_match_with_empty_zone_encounters_falls_back_to_primary_and_secondary()
+    {
+        var job = CreateJob(contentId: 107, secondaryEncounterId: 99);
+        var matcher = CreateMatcher([job]);
+        var query = Assert.Single(matcher.BuildCandidateQueries());
+
+        var result = matcher.MatchFetchedCandidates(new Dictionary<string, FFLogsClient.CharacterFetchedData>
+        {
+            [query.Key] = new FFLogsClient.CharacterFetchedData
+            {
+                Hidden = false,
+                Parses = [],
+            },
+        });
+
+        var parse = Assert.Single(result.ResultsByContentId.Values);
+        Assert.Empty(parse.Encounters);
+        Assert.Equal([88, 99], parse.FflogsQueriedEncounters);
+    }
+
+    [Fact]
+    public void Hidden_match_does_not_populate_fflogs_queried_encounters()
+    {
+        var job = CreateJob(contentId: 108, secondaryEncounterId: 99);
+        job.ZoneEncounters = [88, 99, 100];
+        var matcher = CreateMatcher([job]);
+        var query = Assert.Single(matcher.BuildCandidateQueries());
+
+        var result = matcher.MatchFetchedCandidates(new Dictionary<string, FFLogsClient.CharacterFetchedData>
+        {
+            [query.Key] = new FFLogsClient.CharacterFetchedData
+            {
+                Hidden = true,
+                Parses =
+                [
+                    new FFLogsClient.CharacterEncounterParse { EncounterId = 88, Percentile = 95.0 },
+                ],
+            },
+        });
+
+        var parse = Assert.Single(result.ResultsByContentId.Values);
+        Assert.True(parse.IsHidden);
+        Assert.Empty(parse.FflogsQueriedEncounters);
+    }
+
     private static FFLogsCandidateMatcher CreateMatcher(IReadOnlyList<ParseJob> jobs)
         => new(jobs, zoneId: 77, difficultyId: 5);
 

@@ -116,6 +116,7 @@ internal sealed class TomestoneBatchProcessor
                     item.Job.Server.Trim(),
                     target.ZoneId,
                     target.EncounterId,
+                    target.EncounterParams,
                     out _)));
 
             if (hasExecutedAnyQuery && waveRequiresHttpRequest && requestIntervalMs > 0)
@@ -199,6 +200,7 @@ internal sealed class TomestoneBatchProcessor
                     job.Server.Trim(),
                     target.ZoneId,
                     target.EncounterId,
+                    target.EncounterParams,
                     out var cachedOutcome))
             {
                 outcome = cachedOutcome;
@@ -233,6 +235,7 @@ internal sealed class TomestoneBatchProcessor
                         job.Server.Trim(),
                         target.ZoneId,
                         target.EncounterId,
+                        target.EncounterParams,
                         cancellationToken).ConfigureAwait(false);
                     outcome = fetchResult.Outcome;
                     performedHttpRequest |= fetchResult.PerformedHttpRequest;

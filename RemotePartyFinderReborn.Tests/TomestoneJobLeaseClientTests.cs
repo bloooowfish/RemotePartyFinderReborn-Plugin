@@ -92,6 +92,68 @@ public sealed class TomestoneJobLeaseClientTests
         Assert.Equal("exact-only", Assert.Single(capturedRequest.Headers.GetValues("X-RPF-Tomestone-Job-Mode")));
         Assert.Equal("JP", Assert.Single(capturedRequest.Headers.GetValues("X-RPF-Tomestone-Worker-Region")));
         Assert.True(capturedRequest.Headers.Contains("X-RPF-Signature"));
+        Assert.Equal("v2", Assert.Single(capturedRequest.Headers.GetValues("X-RPF-Signature-Version")));
+        Assert.Equal("upload.example", Assert.Single(capturedRequest.Headers.GetValues("X-RPF-Target-Host")));
+    }
+
+    [Fact]
+    public async Task Lease_client_deserializes_server_manifest_tomestone_routing_metadata()
+    {
+        var sender = new StubFFLogsIngestHttpSender
+        {
+            OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    """
+                    [
+                      {
+                        "content_id": 555555,
+                        "name": "Future Raider",
+                        "server": "Tonberry",
+                        "region": "JP",
+                        "zone_id": 999,
+                        "difficulty_id": 101,
+                        "encounter_id": 9901,
+                        "secondary_encounter_id": 9902,
+                        "zone_encounters": [9900, 9901, 9902],
+                        "tomestone_expansion": "dawntrail",
+                        "tomestone_category": "raids",
+                        "tomestone_clears_category": "savage",
+                        "tomestone_zone_slug": "aac-future-savage",
+                        "tomestone_encounter_slug": "future-p1",
+                        "tomestone_encounter_names": ["future-p1"],
+                        "tomestone_secondary_encounter_slug": "future-p2",
+                        "tomestone_secondary_encounter_names": ["future-p2"],
+                        "tomestone_progress_kind": "boss_percentage",
+                        "lease_token": "ts-future-1"
+                      }
+                    ]
+                    """,
+                    Encoding.UTF8,
+                    "application/json"),
+            }),
+        };
+        var seams = TomestoneCollector.CreateSeams(
+            sender,
+            new StubTomestoneProgressionService(),
+            new ManualFFLogsTimeProvider { UtcNow = new DateTime(2026, 5, 12, 0, 0, 0, DateTimeKind.Utc) });
+        var client = new TomestoneJobLeaseClient(seams);
+
+        var attempt = await client.TryAcquireSessionAsync(
+            CreateConfiguration("https://upload.example/"),
+            CancellationToken.None);
+
+        var job = Assert.Single(attempt.Session!.Jobs);
+        Assert.Equal([9900u, 9901u, 9902u], job.ZoneEncounters);
+        Assert.Equal("dawntrail", job.TomestoneExpansion);
+        Assert.Equal("raids", job.TomestoneCategory);
+        Assert.Equal("savage", job.TomestoneClearsCategory);
+        Assert.Equal("aac-future-savage", job.TomestoneZoneSlug);
+        Assert.Equal("future-p1", job.TomestoneEncounterSlug);
+        Assert.Equal(["future-p1"], job.TomestoneEncounterNames);
+        Assert.Equal("future-p2", job.TomestoneSecondaryEncounterSlug);
+        Assert.Equal(["future-p2"], job.TomestoneSecondaryEncounterNames);
+        Assert.Equal("boss_percentage", job.TomestoneProgressKind);
     }
 
     [Theory]

@@ -24,6 +24,8 @@ public sealed class IngestRouteTests {
         Assert.Equal(IngestRoutes.Detail, endpoint.Route);
         Assert.Equal(IngestRoutes.Detail.Path, request.RequestUri!.AbsolutePath);
         Assert.True(request.Headers.Contains("X-RPF-Signature"));
+        Assert.Equal("v2", Assert.Single(request.Headers.GetValues("X-RPF-Signature-Version")));
+        Assert.Equal("upload.example", Assert.Single(request.Headers.GetValues("X-RPF-Target-Host")));
     }
 
     [Fact]
@@ -44,6 +46,8 @@ public sealed class IngestRouteTests {
         Assert.Equal(IngestRoutes.FflogsJobs, endpoint.Route);
         Assert.Equal(IngestRoutes.FflogsJobs.Path, request.RequestUri!.AbsolutePath);
         Assert.True(request.Headers.Contains("X-RPF-Signature"));
+        Assert.Equal("v2", Assert.Single(request.Headers.GetValues("X-RPF-Signature-Version")));
+        Assert.Equal("upload.example", Assert.Single(request.Headers.GetValues("X-RPF-Target-Host")));
     }
 
     [Fact]

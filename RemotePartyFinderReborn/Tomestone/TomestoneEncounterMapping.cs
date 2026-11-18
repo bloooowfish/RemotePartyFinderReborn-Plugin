@@ -98,6 +98,36 @@ public static class TomestoneEncounterMapping
         return false;
     }
 
+    public static bool TryGetProgressionTarget(
+        ParseJob job,
+        uint encounterId,
+        out TomestoneEncounterParams encounterParams)
+    {
+        if (job == null || encounterId == 0)
+        {
+            encounterParams = null;
+            return false;
+        }
+
+        if (TryBuildServerProgressionTarget(job, encounterId, out encounterParams))
+        {
+            return true;
+        }
+
+        if (TryGetProgressionTarget(job.ZoneId, encounterId, out encounterParams))
+        {
+            return true;
+        }
+
+        if (job.ZoneId == 0 && TryGetProgressionTargetByEncounterId(encounterId, out _, out encounterParams))
+        {
+            return true;
+        }
+
+        encounterParams = null;
+        return false;
+    }
+
     public static bool TryGetUltimateParamsByEncounterId(
         uint encounterId,
         out uint zoneId,
@@ -151,10 +181,10 @@ public static class TomestoneEncounterMapping
     }
 
     /// <summary>
-    /// Resolves the Tomestone progression targets for a <see cref="TomestoneJob"/>,
-    /// including a distinct mapped <see cref="TomestoneJob.SecondaryEncounterId"/> for split-boss fights.
+    /// Resolves the Tomestone progression targets for a <see cref="ParseJob"/> (including <see cref="TomestoneJob"/>),
+    /// preferring server-supplied manifest metadata and falling back to the static table when omitted.
     /// </summary>
-    public static IReadOnlyList<(uint ZoneId, uint EncounterId, TomestoneEncounterParams EncounterParams)> ResolveJobTargets(TomestoneJob job)
+    public static IReadOnlyList<(uint ZoneId, uint EncounterId, TomestoneEncounterParams EncounterParams)> ResolveJobTargets(ParseJob job)
     {
         ArgumentNullException.ThrowIfNull(job);
         if (job.EncounterId == 0)
@@ -163,26 +193,32 @@ public static class TomestoneEncounterMapping
         }
 
         var resolved = new List<(uint ZoneId, uint EncounterId, TomestoneEncounterParams EncounterParams)>(2);
-        TryAppendTarget(job.ZoneId, job.EncounterId, resolved);
+        TryAppendTarget(job, job.EncounterId, resolved);
 
         if (job.SecondaryEncounterId is { } secondaryEncounterId
             && secondaryEncounterId != 0
             && secondaryEncounterId != job.EncounterId)
         {
-            TryAppendTarget(job.ZoneId, secondaryEncounterId, resolved);
+            TryAppendTarget(job, secondaryEncounterId, resolved);
         }
 
         return resolved;
     }
 
     private static void TryAppendTarget(
-        uint zoneId,
+        ParseJob job,
         uint encounterId,
         List<(uint ZoneId, uint EncounterId, TomestoneEncounterParams EncounterParams)> resolved)
     {
-        if (TryGetProgressionTarget(zoneId, encounterId, out var encounterParams))
+        if (TryBuildServerProgressionTarget(job, encounterId, out var serverParams))
         {
-            resolved.Add((zoneId, encounterId, encounterParams));
+            resolved.Add((job.ZoneId, encounterId, serverParams));
+            return;
+        }
+
+        if (TryGetProgressionTarget(job.ZoneId, encounterId, out var encounterParams))
+        {
+            resolved.Add((job.ZoneId, encounterId, encounterParams));
             return;
         }
 
@@ -190,5 +226,95 @@ public static class TomestoneEncounterMapping
         {
             resolved.Add((mappedZoneId, encounterId, encounterParams));
         }
+    }
+
+    private static bool TryBuildServerProgressionTarget(
+        ParseJob job,
+        uint encounterId,
+        out TomestoneEncounterParams encounterParams)
+    {
+        encounterParams = null;
+        if (string.IsNullOrWhiteSpace(job.TomestoneExpansion)
+            || string.IsNullOrWhiteSpace(job.TomestoneCategory)
+            || string.IsNullOrWhiteSpace(job.TomestoneZoneSlug))
+        {
+            return false;
+        }
+
+        string encounterSlug;
+        IReadOnlyList<string> rawNames;
+        if (encounterId == job.EncounterId)
+        {
+            encounterSlug = job.TomestoneEncounterSlug;
+            rawNames = job.TomestoneEncounterNames;
+        }
+        else if (job.SecondaryEncounterId is { } secondaryId
+            && secondaryId != 0
+            && encounterId == secondaryId)
+        {
+            encounterSlug = job.TomestoneSecondaryEncounterSlug;
+            rawNames = job.TomestoneSecondaryEncounterNames;
+        }
+        else
+        {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(encounterSlug))
+        {
+            return false;
+        }
+
+        var trimmedSlug = encounterSlug.Trim();
+        var canonicalNames = rawNames?
+            .Where(static name => !string.IsNullOrWhiteSpace(name))
+            .Select(static name => name.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (canonicalNames is null || canonicalNames.Length == 0)
+        {
+            canonicalNames = [trimmedSlug];
+        }
+
+        var progressKind = ParseProgressKind(job);
+        var clearsCategory = string.IsNullOrWhiteSpace(job.TomestoneClearsCategory)
+            ? null
+            : job.TomestoneClearsCategory.Trim();
+
+        encounterParams = new TomestoneEncounterParams(
+            job.TomestoneExpansion.Trim(),
+            job.TomestoneCategory.Trim(),
+            trimmedSlug,
+            progressKind,
+            canonicalNames,
+            ZoneSlug: job.TomestoneZoneSlug.Trim(),
+            ClearsCategory: clearsCategory);
+        return true;
+    }
+
+    private static TomestoneProgressKind ParseProgressKind(ParseJob job)
+    {
+        var normalized = (job.TomestoneProgressKind ?? string.Empty).Trim()
+            .Replace("_", string.Empty, StringComparison.Ordinal)
+            .Replace("-", string.Empty, StringComparison.Ordinal);
+
+        if (string.Equals(normalized, "PhaseProgress", StringComparison.OrdinalIgnoreCase))
+        {
+            return TomestoneProgressKind.PhaseProgress;
+        }
+
+        if (string.Equals(normalized, "BossPercentage", StringComparison.OrdinalIgnoreCase))
+        {
+            return TomestoneProgressKind.BossPercentage;
+        }
+
+        if (string.Equals(job.TomestoneClearsCategory?.Trim(), "ultimate", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(job.TomestoneCategory?.Trim(), "ultimates", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(job.TomestoneZoneSlug?.Trim(), "ultimates", StringComparison.OrdinalIgnoreCase))
+        {
+            return TomestoneProgressKind.PhaseProgress;
+        }
+
+        return TomestoneProgressKind.BossPercentage;
     }
 }

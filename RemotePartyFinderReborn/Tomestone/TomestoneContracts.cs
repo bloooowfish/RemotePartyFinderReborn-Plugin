@@ -9,17 +9,8 @@ namespace RemotePartyFinderReborn.Tomestone;
 
 [Serializable]
 [JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
-public class TomestoneJob
+public class TomestoneJob : ParseJob
 {
-    public ulong ContentId { get; set; }
-    public string Name { get; set; } = "";
-    public string Server { get; set; } = "";
-    public string Region { get; set; } = "";
-    public uint ZoneId { get; set; }
-    public int DifficultyId { get; set; }
-    public uint EncounterId { get; set; }
-    public uint? SecondaryEncounterId { get; set; }
-    public string LeaseToken { get; set; } = "";
 }
 
 [Serializable]

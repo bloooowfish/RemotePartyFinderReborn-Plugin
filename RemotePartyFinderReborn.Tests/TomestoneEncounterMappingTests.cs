@@ -188,4 +188,79 @@ public sealed class TomestoneEncounterMappingTests
         Assert.Equal(2, fallbackBoth.Count);
         Assert.All(fallbackBoth, t => Assert.Equal(73u, t.ZoneId));
     }
+
+    [Fact]
+    public void TryGetProgressionTarget_with_ParseJob_prefers_server_manifest_metadata_over_static_table()
+    {
+        var newPatchJob = new ParseJob
+        {
+            ZoneId = 999,
+            EncounterId = 8801,
+            SecondaryEncounterId = 8802,
+            TomestoneExpansion = "dawntrail",
+            TomestoneCategory = "raids",
+            TomestoneClearsCategory = "savage",
+            TomestoneZoneSlug = "aac-future-savage",
+            TomestoneEncounterSlug = "future-boss-p1",
+            TomestoneEncounterNames = ["future-boss-p1", "future-boss-alias"],
+            TomestoneSecondaryEncounterSlug = "future-boss-p2",
+            TomestoneSecondaryEncounterNames = ["future-boss-p2"],
+            TomestoneProgressKind = "boss_percentage",
+        };
+
+        Assert.True(TomestoneEncounterMapping.TryGetProgressionTarget(newPatchJob, 8801, out var primary));
+        Assert.Equal("dawntrail", primary.Expansion);
+        Assert.Equal("raids", primary.Category);
+        Assert.Equal("aac-future-savage", primary.ZoneSlug);
+        Assert.Equal("aac-future-savage", primary.EffectiveZoneSlug);
+        Assert.Equal("savage", primary.ClearsCategory);
+        Assert.Equal("future-boss-p1", primary.Encounter);
+        Assert.Equal(TomestoneProgressKind.BossPercentage, primary.ProgressKind);
+        Assert.Equal(["future-boss-p1", "future-boss-alias"], primary.TargetCanonicalNames);
+
+        Assert.True(TomestoneEncounterMapping.TryGetProgressionTarget(newPatchJob, 8802, out var secondary));
+        Assert.Equal("future-boss-p2", secondary.Encounter);
+        Assert.Equal(["future-boss-p2"], secondary.TargetCanonicalNames);
+
+        var targets = TomestoneEncounterMapping.ResolveJobTargets(newPatchJob);
+        Assert.Equal(2, targets.Count);
+        Assert.Equal((999u, 8801u), (targets[0].ZoneId, targets[0].EncounterId));
+        Assert.Equal((999u, 8802u), (targets[1].ZoneId, targets[1].EncounterId));
+    }
+
+    [Fact]
+    public void TryGetProgressionTarget_with_ParseJob_parses_phase_progress_and_falls_back_when_metadata_omitted()
+    {
+        var ultimateJob = new ParseJob
+        {
+            ZoneId = 998,
+            EncounterId = 9901,
+            TomestoneExpansion = "dawntrail",
+            TomestoneCategory = "ultimates",
+            TomestoneClearsCategory = "ultimate",
+            TomestoneZoneSlug = "ultimates",
+            TomestoneEncounterSlug = "future-ultimate",
+            TomestoneProgressKind = "phase_progress",
+        };
+
+        Assert.True(TomestoneEncounterMapping.TryGetProgressionTarget(ultimateJob, 9901, out var ultTarget));
+        Assert.Equal(TomestoneProgressKind.PhaseProgress, ultTarget.ProgressKind);
+        Assert.Equal(["future-ultimate"], ultTarget.TargetCanonicalNames);
+
+        var staticFallbackJob = new ParseJob
+        {
+            ZoneId = 73,
+            EncounterId = 101,
+        };
+        Assert.True(TomestoneEncounterMapping.TryGetProgressionTarget(staticFallbackJob, 101, out var staticTarget));
+        Assert.Equal("vamp-fatale", staticTarget.Encounter);
+        Assert.Equal("aac-heavyweight-savage", staticTarget.EffectiveZoneSlug);
+
+        var wrongZoneStaticJob = new ParseJob
+        {
+            ZoneId = 68,
+            EncounterId = 101,
+        };
+        Assert.False(TomestoneEncounterMapping.TryGetProgressionTarget(wrongZoneStaticJob, 101, out _));
+    }
 }

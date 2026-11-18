@@ -608,6 +608,87 @@ public sealed class TomestoneBatchProcessorTests
         Assert.Equal([104, 105], submitted.TomestoneQueriedEncounters);
     }
 
+    [Fact]
+    public async Task Batch_processor_routes_unmapped_patch_encounter_using_server_manifest_metadata()
+    {
+        var requestedUris = new List<string>();
+        var handler = new ManifestDrivenActivityHandler(uri => requestedUris.Add(uri));
+        var config = new Configuration
+        {
+            EnableTomestoneProgressEnrichment = true,
+            TomestoneApiKey = "secret-token",
+            TomestoneMaxConcurrency = 1,
+            TomestoneRequestIntervalMs = 0,
+            BypassTomestonePacingClampDebug = true,
+        };
+        using var apiClient = new TomestoneApiClient(config, handler);
+        var service = new TomestoneProgressionService(apiClient, config);
+        var seams = TomestoneCollector.CreateSeams(
+            new StubFFLogsIngestHttpSender(),
+            service,
+            new ManualFFLogsTimeProvider(),
+            config,
+            new ApiCredentialStatusStore(),
+            static (_, _) => Task.CompletedTask);
+        var processor = new TomestoneBatchProcessor(seams);
+        var session = new TomestoneLeaseSession(
+            new UploadUrl("https://upload.example/"),
+            [
+                new TomestoneJob
+                {
+                    ContentId = 88001,
+                    ZoneId = 999,
+                    DifficultyId = 101,
+                    EncounterId = 9901,
+                    Name = "Future Raider",
+                    Server = "Tonberry",
+                    Region = "JP",
+                    TomestoneExpansion = "dawntrail",
+                    TomestoneCategory = "raids",
+                    TomestoneClearsCategory = "savage",
+                    TomestoneZoneSlug = "aac-future-savage",
+                    TomestoneEncounterSlug = "future-boss",
+                    TomestoneEncounterNames = ["future-boss"],
+                    TomestoneProgressKind = "boss_percentage",
+                    LeaseToken = "lease-future-88001",
+                },
+            ]);
+
+        var result = await processor.ProcessLeaseSessionAsync(session, CancellationToken.None);
+
+        Assert.False(result.HadTransientFailure);
+        Assert.Empty(result.AbandonedLeases);
+        var submitted = Assert.Single(result.ProcessedResults);
+        Assert.Equal(9901u, submitted.EncounterId);
+        Assert.Equal(14.7, submitted.BossPercentages[9901], 1);
+        Assert.Equal([9901], submitted.TomestoneQueriedEncounters);
+        Assert.Contains(
+            requestedUris,
+            uri => uri.Contains("/api/character/activity/Tonberry/Future%20Raider?expansion=dawntrail&zone=aac-future-savage&encounter=future-boss", StringComparison.Ordinal));
+    }
+
+    private sealed class ManifestDrivenActivityHandler(Action<string> onRequestUri) : System.Net.Http.HttpMessageHandler
+    {
+        protected override Task<System.Net.Http.HttpResponseMessage> SendAsync(
+            System.Net.Http.HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            var uri = request.RequestUri!.AbsoluteUri;
+            onRequestUri(uri);
+            var body = uri.Contains("/profile/", StringComparison.Ordinal)
+                ? "{}"
+                : """
+                  {"data":{"paginator":{"data":[
+                    {"activity":{"bestPercent":"14.7%","killsCount":0,"encounter":{"canonical_name":"future-boss"}}}
+                  ]}}}
+                  """;
+            return Task.FromResult(new System.Net.Http.HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new System.Net.Http.StringContent(body),
+            });
+        }
+    }
+
     private sealed class SplitBossProfileHandler(Action onRequest) : System.Net.Http.HttpMessageHandler
     {
         protected override Task<System.Net.Http.HttpResponseMessage> SendAsync(

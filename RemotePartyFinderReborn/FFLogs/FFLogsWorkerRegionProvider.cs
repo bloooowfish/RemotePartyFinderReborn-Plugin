@@ -162,7 +162,7 @@ internal static class FFLogsWorkerRegionResolver
         {
             "Elemental" or "Gaia" or "Mana" or "Meteor" => "JP",
             "Aether" or "Primal" or "Crystal" or "Dynamis" => "NA",
-            "Chaos" or "Light" => "EU",
+            "Chaos" or "Light" or "Shadow" => "EU",
             "Materia" => "OC",
             _ => null,
         };
@@ -184,9 +184,9 @@ internal static class FFLogsWorkerRegionResolver
                 or 74 or 75 or 77 or 78 or 79 or 81 or 91 or 93 or 95 or 99 or 404 or 405 or 406
                 or 407 or 408 or 409 or 410 or 411 => "NA",
 
-            // EU: Chaos, Light
+            // EU: Chaos, Light, Shadow
             33 or 36 or 39 or 42 or 56 or 66 or 67 or 71 or 80 or 83 or 85 or 97 or 400 or 401
-                or 402 or 403 => "EU",
+                or 402 or 403 or 412 or 413 or 414 or 415 => "EU",
 
             // OC: Materia
             21 or 22 or 86 or 87 or 88 => "OC",

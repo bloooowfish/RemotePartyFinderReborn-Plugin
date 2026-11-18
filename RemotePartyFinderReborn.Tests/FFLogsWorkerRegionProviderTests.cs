@@ -15,6 +15,7 @@ public sealed class FFLogsWorkerRegionProviderTests
     [InlineData("Dynamis", "NA")]
     [InlineData("Chaos", "EU")]
     [InlineData("Light", "EU")]
+    [InlineData("Shadow", "EU")]
     [InlineData("Materia", "OC")]
     public void Data_center_name_maps_to_fflogs_worker_region(string dataCenterName, string expected)
     {
@@ -33,6 +34,10 @@ public sealed class FFLogsWorkerRegionProviderTests
     [InlineData(23, "JP")]
     [InlineData(73, "NA")]
     [InlineData(402, "EU")]
+    [InlineData(412, "EU")]
+    [InlineData(413, "EU")]
+    [InlineData(414, "EU")]
+    [InlineData(415, "EU")]
     [InlineData(21, "OC")]
     public void World_id_maps_to_fflogs_worker_region(ushort worldId, string expected)
     {
