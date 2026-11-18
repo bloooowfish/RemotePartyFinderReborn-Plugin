@@ -65,11 +65,91 @@ public sealed class PartyDetailEnqueueTests {
             LeaderContentId = 111UL,
             LeaderName = "Leader",
             HomeWorld = 77,
+            CreatedWorld = 77,
             MemberContentIds = [0UL, 0UL],
             MemberJobs = [19, 24],
             SlotFlags = ["0x0", "0x0"],
         };
 
         Assert.False(PartyDetailUploadPolicy.IsSnapshotReadyForEnqueue(payload));
+    }
+
+    [Theory]
+    [InlineData((ushort)0, false)]
+    [InlineData((ushort)1, true)]
+    [InlineData((ushort)77, true)]
+    [InlineData((ushort)999, true)]
+    [InlineData((ushort)1000, false)]
+    [InlineData((ushort)65535, false)]
+    public void SnapshotValidity_requires_valid_created_world(ushort createdWorld, bool expectedValid) {
+        var payload = new UploadablePartyDetail {
+            ListingId = 9001U,
+            LeaderContentId = 111UL,
+            LeaderName = "Leader",
+            HomeWorld = 77,
+            CreatedWorld = createdWorld,
+            MemberContentIds = [111UL, 0UL],
+            MemberJobs = [19, 24],
+            SlotFlags = ["0x0", "0x0"],
+        };
+
+        Assert.Equal(expectedValid, PartyDetailUploadPolicy.IsSnapshotReadyForEnqueue(payload));
+    }
+
+    [Fact]
+    public void ComputeFingerprint_includes_leader_and_world_metadata() {
+        var baseline = new UploadablePartyDetail {
+            ListingId = 9001U,
+            LeaderContentId = 111UL,
+            LeaderName = "Leader Alpha",
+            HomeWorld = 77,
+            CreatedWorld = 74,
+            MemberContentIds = [111UL, 222UL],
+            MemberJobs = [19, 24],
+            SlotFlags = ["0x1", "0x2"],
+        };
+
+        var baselineHash = PartyDetailUploadPolicy.ComputeFingerprint(baseline);
+
+        Assert.NotEqual(baselineHash, PartyDetailUploadPolicy.ComputeFingerprint(new UploadablePartyDetail {
+            ListingId = baseline.ListingId,
+            LeaderContentId = 999UL,
+            LeaderName = baseline.LeaderName,
+            HomeWorld = baseline.HomeWorld,
+            CreatedWorld = baseline.CreatedWorld,
+            MemberContentIds = baseline.MemberContentIds,
+            MemberJobs = baseline.MemberJobs,
+            SlotFlags = baseline.SlotFlags,
+        }));
+        Assert.NotEqual(baselineHash, PartyDetailUploadPolicy.ComputeFingerprint(new UploadablePartyDetail {
+            ListingId = baseline.ListingId,
+            LeaderContentId = baseline.LeaderContentId,
+            LeaderName = "Leader Beta",
+            HomeWorld = baseline.HomeWorld,
+            CreatedWorld = baseline.CreatedWorld,
+            MemberContentIds = baseline.MemberContentIds,
+            MemberJobs = baseline.MemberJobs,
+            SlotFlags = baseline.SlotFlags,
+        }));
+        Assert.NotEqual(baselineHash, PartyDetailUploadPolicy.ComputeFingerprint(new UploadablePartyDetail {
+            ListingId = baseline.ListingId,
+            LeaderContentId = baseline.LeaderContentId,
+            LeaderName = baseline.LeaderName,
+            HomeWorld = 78,
+            CreatedWorld = baseline.CreatedWorld,
+            MemberContentIds = baseline.MemberContentIds,
+            MemberJobs = baseline.MemberJobs,
+            SlotFlags = baseline.SlotFlags,
+        }));
+        Assert.NotEqual(baselineHash, PartyDetailUploadPolicy.ComputeFingerprint(new UploadablePartyDetail {
+            ListingId = baseline.ListingId,
+            LeaderContentId = baseline.LeaderContentId,
+            LeaderName = baseline.LeaderName,
+            HomeWorld = baseline.HomeWorld,
+            CreatedWorld = 75,
+            MemberContentIds = baseline.MemberContentIds,
+            MemberJobs = baseline.MemberJobs,
+            SlotFlags = baseline.SlotFlags,
+        }));
     }
 }

@@ -301,8 +301,8 @@ public sealed class WorkstreamThreeRegressionTests
 
         var queue = new PendingDetailQueue();
         var t0 = new DateTime(2026, 5, 12, 6, 0, 0, DateTimeKind.Utc);
-        queue.Enqueue(new UploadablePartyDetail { ListingId = 1, LeaderContentId = 11, HomeWorld = 23 }, 111UL, t0, PartyDetailRequestOwner.Manual);
-        queue.Enqueue(new UploadablePartyDetail { ListingId = 2, LeaderContentId = 22, HomeWorld = 23 }, 222UL, t0, PartyDetailRequestOwner.Scanner);
+        queue.Enqueue(new UploadablePartyDetail { ListingId = 1, LeaderContentId = 11, HomeWorld = 23, CreatedWorld = 77 }, 111UL, t0, PartyDetailRequestOwner.Manual);
+        queue.Enqueue(new UploadablePartyDetail { ListingId = 2, LeaderContentId = 22, HomeWorld = 23, CreatedWorld = 77 }, 222UL, t0, PartyDetailRequestOwner.Scanner);
 
         var pruned = queue.PruneExpiredManualEntries(t0.AddSeconds(31), TimeSpan.FromSeconds(30));
 

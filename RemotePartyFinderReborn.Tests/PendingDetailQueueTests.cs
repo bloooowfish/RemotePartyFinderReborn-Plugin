@@ -115,12 +115,49 @@ public sealed class PendingDetailQueueTests {
         Assert.Equal(200UL, pending.Fingerprint);
     }
 
+    [Fact]
+    public void Enqueue_promotes_manual_to_scanner_even_when_fingerprint_is_unchanged() {
+        var now = new DateTime(2026, 5, 10, 10, 0, 0, DateTimeKind.Utc);
+        var queue = new PendingDetailQueue();
+        var manual = CreateDetail(slotFlag: "0x1");
+        var scanner = CreateDetail(slotFlag: "0x1");
+
+        queue.Enqueue(manual, fingerprint: 100UL, now, PartyDetailRequestOwner.Manual);
+        Assert.True(queue.TryGet(9001U, out var beforePromotion));
+        Assert.Equal(PartyDetailRequestOwner.Manual, beforePromotion.Owner);
+
+        queue.Enqueue(scanner, fingerprint: 100UL, now.AddSeconds(1), PartyDetailRequestOwner.Scanner);
+        Assert.True(queue.TryGet(9001U, out var afterPromotion));
+        Assert.Equal(PartyDetailRequestOwner.Scanner, afterPromotion.Owner);
+        Assert.Equal(100UL, afterPromotion.Fingerprint);
+    }
+
+    [Fact]
+    public void Enqueue_preserves_scanner_owner_when_manual_arrives_later() {
+        var now = new DateTime(2026, 5, 10, 10, 0, 0, DateTimeKind.Utc);
+        var queue = new PendingDetailQueue();
+        var scanner = CreateDetail(slotFlag: "0x1");
+        var manualSame = CreateDetail(slotFlag: "0x1");
+        var manualChanged = CreateDetail(slotFlag: "0x2");
+
+        queue.Enqueue(scanner, fingerprint: 100UL, now, PartyDetailRequestOwner.Scanner);
+        queue.Enqueue(manualSame, fingerprint: 100UL, now.AddSeconds(1), PartyDetailRequestOwner.Manual);
+        Assert.True(queue.TryGet(9001U, out var afterSame));
+        Assert.Equal(PartyDetailRequestOwner.Scanner, afterSame.Owner);
+
+        queue.Enqueue(manualChanged, fingerprint: 200UL, now.AddSeconds(2), PartyDetailRequestOwner.Manual);
+        Assert.True(queue.TryGet(9001U, out var afterChanged));
+        Assert.Equal(PartyDetailRequestOwner.Scanner, afterChanged.Owner);
+        Assert.Equal(200UL, afterChanged.Fingerprint);
+    }
+
     private static UploadablePartyDetail CreateDetail(uint listingId = 9001U, string slotFlag = "0x1") {
         return new UploadablePartyDetail {
             ListingId = listingId,
             LeaderContentId = 44UL,
             LeaderName = "Leader",
             HomeWorld = 77,
+            CreatedWorld = 77,
             MemberContentIds = [44UL],
             MemberJobs = [19],
             SlotFlags = [slotFlag],

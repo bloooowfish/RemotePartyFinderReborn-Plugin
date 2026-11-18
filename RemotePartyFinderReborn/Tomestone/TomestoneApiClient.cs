@@ -296,23 +296,17 @@ public sealed class TomestoneApiClient : IDisposable
 
     private static HttpClient CreateDefaultHttpClient()
     {
-        var handler = new HttpClientHandler
-        {
-            AllowAutoRedirect = false,
-        };
-        return new HttpClient(handler, disposeHandler: true)
-        {
-            Timeout = DefaultTimeout,
-        };
+        return PluginHttpClientFactory.CreateExternalApiClient(
+            allowAutoRedirect: false,
+            timeout: DefaultTimeout);
     }
 
     private static HttpClient CreateHttpClientWithTimeout(HttpMessageHandler messageHandler)
     {
-        ArgumentNullException.ThrowIfNull(messageHandler);
-        return new HttpClient(messageHandler)
-        {
-            Timeout = DefaultTimeout,
-        };
+        return PluginHttpClientFactory.CreateClient(
+            messageHandler,
+            disposeHandler: true,
+            timeout: DefaultTimeout);
     }
 
     private void ActivateRateLimitCooldown(string source, TimeSpan duration)

@@ -26,63 +26,103 @@ internal sealed class PlayerCollector : IDisposable {
         DefaultValueHandling = DefaultValueHandling.Include
     };
 
+    private static readonly TimeSpan ShutdownWaitTimeout = TimeSpan.FromSeconds(2);
+
     private readonly Plugin _plugin;
     private readonly PlayerLocalDatabase _database;
-    private readonly HttpClient _httpClient = new();
+    private readonly HttpClient _httpClient = PluginHttpClientFactory.CreateIngestClient();
+    private readonly CancellationTokenSource _disposeCts = new();
     private readonly Stopwatch _scanTimer = new();
     private readonly PlayerObservationWriter _observationWriter;
     private readonly PlayerPendingCountCache _pendingCountCache;
+    private readonly object _taskLock = new();
+    private readonly Task _initialRefreshTask;
 
-    private volatile bool _uploadInProgress;
+    private Task _activeUploadTask = Task.CompletedTask;
+    private int _uploadState;
+    private int _shutdownSignaled;
+    private int _disposed;
 
     internal int PendingCount => _pendingCountCache.Value;
-    internal bool IsUploadInProgress => _uploadInProgress;
+    internal bool IsUploadInProgress => Volatile.Read(ref _uploadState) != 0;
 
     internal PlayerCollector(Plugin plugin, PlayerLocalDatabase database) {
         _plugin = plugin;
         _database = database;
         _pendingCountCache = new PlayerPendingCountCache(() => _database.PendingCount);
         _observationWriter = new PlayerObservationWriter(database.UpsertObservedPlayers, onUpsertSucceeded: RefreshPendingCount);
-        _ = Task.Run(RefreshPendingCount);
+        var disposeToken = _disposeCts.Token;
+        _initialRefreshTask = Task.Run(() => {
+            if (!disposeToken.IsCancellationRequested) {
+                RefreshPendingCount();
+            }
+        });
         _scanTimer.Start();
         _plugin.Framework.Update += OnUpdate;
     }
 
-    public void Dispose() {
-        _plugin.Framework.Update -= OnUpdate;
-        _observationWriter.Dispose();
-        _httpClient.Dispose();
-    }
-
-    internal void TriggerManualUploadNow() {
-        if (!_plugin.IsPluginOperational) {
+    internal void BeginShutdown() {
+        if (Interlocked.Exchange(ref _shutdownSignaled, 1) != 0) {
             return;
         }
 
-        if (_uploadInProgress) {
+        try {
+            _disposeCts.Cancel();
+        } catch (ObjectDisposedException) {
+        }
+    }
+
+    public void Dispose() {
+        _plugin.Framework.Update -= OnUpdate;
+        BeginShutdown();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) {
+            return;
+        }
+
+        _observationWriter.Dispose();
+
+        Task activeUploadTask;
+        lock (_taskLock) {
+            activeUploadTask = _activeUploadTask;
+        }
+
+        try {
+            Task.WhenAll(activeUploadTask, _initialRefreshTask).Wait(ShutdownWaitTimeout);
+        } catch (Exception) {
+        }
+
+        _httpClient.Dispose();
+        _disposeCts.Dispose();
+    }
+
+    internal void TriggerManualUploadNow() {
+        if (!_plugin.IsPluginOperational || _shutdownSignaled != 0) {
+            return;
+        }
+
+        if (!TryStartUpload(out var cancellationToken)) {
             Plugin.Log.Warning($"PlayerCollector: Manual upload requested while upload is already in progress. Pending={PendingCount}");
             return;
         }
 
-        _uploadInProgress = true;
         Plugin.Log.Information($"PlayerCollector: Manual upload requested. Pending={PendingCount}");
-        _ = UploadPendingBatchAsync();
+        TrackUploadTask(UploadPendingBatchAsync(cancellationToken));
     }
 
     internal int TriggerManualFullResyncUploadNow() {
-        if (!_plugin.IsPluginOperational) {
+        if (!_plugin.IsPluginOperational || _shutdownSignaled != 0) {
             return 0;
         }
 
         var requeued = _database.MarkAllPlayersDirty();
+        RefreshPendingCount();
         Plugin.Log.Information($"PlayerCollector: Manual full player-cache resync requested. Requeued={requeued} Pending={PendingCount}");
-        _ = Task.Run(RefreshPendingCount);
         TriggerManualUploadNow();
         return requeued;
     }
 
     private void OnUpdate(IFramework framework) {
-        if (!_plugin.IsPluginOperational) {
+        if (!_plugin.IsPluginOperational || _shutdownSignaled != 0) {
             return;
         }
 
@@ -96,16 +136,40 @@ internal sealed class PlayerCollector : IDisposable {
             _observationWriter.Enqueue(observedPlayers);
         }
 
-        if (_uploadInProgress) {
-            return;
-        }
-
         if (PendingCount <= 0) {
             return;
         }
 
-        _uploadInProgress = true;
-        _ = UploadPendingBatchAsync();
+        if (TryStartUpload(out var cancellationToken)) {
+            TrackUploadTask(UploadPendingBatchAsync(cancellationToken));
+        }
+    }
+
+    private bool TryStartUpload(out CancellationToken cancellationToken) {
+        cancellationToken = CancellationToken.None;
+        lock (_taskLock) {
+            if (_shutdownSignaled != 0) {
+                return false;
+            }
+
+            if (Interlocked.CompareExchange(ref _uploadState, 1, 0) != 0) {
+                return false;
+            }
+
+            try {
+                cancellationToken = _disposeCts.Token;
+                return !cancellationToken.IsCancellationRequested;
+            } catch (ObjectDisposedException) {
+                Interlocked.Exchange(ref _uploadState, 0);
+                return false;
+            }
+        }
+    }
+
+    private void TrackUploadTask(Task uploadTask) {
+        lock (_taskLock) {
+            _activeUploadTask = uploadTask;
+        }
     }
 
     private unsafe List<UploadablePlayer> CollectObservedPlayers() {
@@ -152,13 +216,17 @@ internal sealed class PlayerCollector : IDisposable {
 #endif
     }
 
-    private Task UploadPendingBatchAsync() {
+    private Task UploadPendingBatchAsync(CancellationToken cancellationToken) {
         return Task.Run(async () => {
 #if DEBUG
             var uploadStartedAt = DebugPerformanceDiagnostics.Begin();
             var uploadedUnits = 0;
 #endif
             try {
+                if (cancellationToken.IsCancellationRequested || !_plugin.IsPluginOperational) {
+                    return;
+                }
+
                 var batch = _database.TakePendingBatch();
 #if DEBUG
                 uploadedUnits = batch.Count;
@@ -172,41 +240,54 @@ internal sealed class PlayerCollector : IDisposable {
                 var anySuccess = false;
 
                 foreach (var uploadTarget in _plugin.Configuration.UploadUrls.Where(static candidate => candidate.IsEnabled)) {
-                    if (UploadAttemptRecorder.IsCircuitOpen(uploadTarget, _plugin.Configuration, DateTime.UtcNow)) {
-                        continue;
+                    if (cancellationToken.IsCancellationRequested) {
+                        break;
                     }
 
                     if (!IngestEndpointResolver.TryBuildEndpoint(uploadTarget, IngestRoutes.Players, out var endpoint)) {
                         continue;
                     }
-                    try {
-                        using var request = IngestRequestFactory.CreatePostJsonRequest(
-                            _plugin.Configuration,
-                            endpoint,
-                            jsonPayload
-                        );
-                        var response = await _httpClient.SendAsync(request);
-                        var responseBody = await response.Content.ReadAsStringAsync();
 
-                        if (response.IsSuccessStatusCode) {
-                            anySuccess = true;
-                            UploadAttemptRecorder.RecordSuccess(uploadTarget);
-                            IngestResponseParser.CapturePlayersResponse(uploadTarget, responseBody);
-                        } else {
-                            UploadAttemptRecorder.RecordFailure(uploadTarget, DateTime.UtcNow);
-                            if ((int)response.StatusCode == 429) {
-                                var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
-                                if (retryAfter.HasValue) {
-                                    Plugin.Log.Warning($"PlayerCollector: server rate limited {endpoint.Url}, retry_after={retryAfter.Value}s");
+                    if (!UploadAttemptRecorder.TryBeginAttempt(uploadTarget, _plugin.Configuration, DateTime.UtcNow, out var attemptLease)) {
+                        continue;
+                    }
+
+                    using (attemptLease) {
+                        try {
+                            using var request = IngestRequestFactory.CreatePostJsonRequest(
+                                _plugin.Configuration,
+                                endpoint,
+                                jsonPayload
+                            );
+                            using var response = await _httpClient.SendAsync(request, cancellationToken);
+                            var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
+
+                            if (response.IsSuccessStatusCode) {
+                                anySuccess = true;
+                                attemptLease.RecordSuccess();
+                                IngestResponseParser.CapturePlayersResponse(uploadTarget, responseBody);
+                            } else {
+                                attemptLease.RecordFailure(DateTime.UtcNow);
+                                if ((int)response.StatusCode == 429) {
+                                    var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
+                                    if (retryAfter.HasValue) {
+                                        Plugin.Log.Warning($"PlayerCollector: server rate limited {endpoint.Url}, retry_after={retryAfter.Value}s");
+                                    }
                                 }
                             }
-                        }
 
-                        Plugin.Log.Debug($"PlayerCollector: {endpoint.Url}: {response.StatusCode} ({batch.Count} players)");
-                    } catch (Exception exception) {
-                        UploadAttemptRecorder.RecordFailure(uploadTarget, DateTime.UtcNow);
-                        Plugin.Log.Error($"PlayerCollector upload error to {endpoint.Url}: {exception.Message}");
+                            Plugin.Log.Debug($"PlayerCollector: {endpoint.Url}: {response.StatusCode} ({batch.Count} players)");
+                        } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
+                            break;
+                        } catch (Exception exception) {
+                            attemptLease.RecordFailure(DateTime.UtcNow);
+                            Plugin.Log.Error($"PlayerCollector upload error to {endpoint.Url}: {exception.Message}");
+                        }
                     }
+                }
+
+                if (cancellationToken.IsCancellationRequested) {
+                    return;
                 }
 
                 if (anySuccess) {
@@ -215,13 +296,14 @@ internal sealed class PlayerCollector : IDisposable {
                 } else {
                     Plugin.Log.Warning($"PlayerCollector: Upload failed, {batch.Count} players remain pending. Total pending: {PendingCount}");
                 }
+            } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
             } catch (Exception exception) {
                 Plugin.Log.Error($"PlayerCollector upload error: {exception.Message}");
             } finally {
 #if DEBUG
                 DebugPerformanceDiagnostics.RecordDuration(DebugPerformancePath.PlayerUpload, uploadStartedAt, uploadedUnits);
 #endif
-                _uploadInProgress = false;
+                Interlocked.Exchange(ref _uploadState, 0);
             }
         });
     }

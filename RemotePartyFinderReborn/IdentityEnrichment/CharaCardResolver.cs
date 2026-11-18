@@ -98,6 +98,8 @@ internal readonly record struct GameUiMessageModel(
 internal sealed class CharaCardResolver : IDisposable {
     private static readonly TimeSpan DefaultRequestTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan DefaultIdentityUploadAttemptTimeout = TimeSpan.FromSeconds(5);
+    internal static readonly TimeSpan MinDispatchInterval = TimeSpan.FromMilliseconds(350);
+    internal const int MaxDispatchJitterMs = 100;
     internal static IReadOnlySet<uint> PlateFailureMessageIds => GameLogMessageCatalog.CharaCardFailureMessageIds;
     internal static readonly AddonEvent[] SelectOkSuppressionEvents = [
         AddonEvent.PreSetup,
@@ -122,6 +124,7 @@ internal sealed class CharaCardResolver : IDisposable {
     private readonly PlateFailureSuppressionState _plateFailureSuppressionState = new();
     private readonly Func<ushort, string?> _worldNameResolver;
     private readonly Func<DateTime> _utcNow;
+    private readonly Func<int, int, int> _nextJitterMs;
     private readonly Action<CharacterIdentitySnapshot> _persistResolvedIdentity;
     private readonly TimeSpan _requestTimeout;
     private readonly Action<string>? _debugSink;
@@ -134,6 +137,8 @@ internal sealed class CharaCardResolver : IDisposable {
     private readonly Dictionary<ulong, PendingProjection> _pendingProjections = new();
     private readonly object _sync = new();
     private CharaCardResolverDebugSnapshot? _latestDebugSnapshot;
+    private DateTime _nextDispatchAllowedAtUtc = DateTime.MinValue;
+    private int _shutdownSignaled;
     private bool _disposed;
 
     internal CharaCardResolver(
@@ -176,7 +181,8 @@ internal sealed class CharaCardResolver : IDisposable {
         Func<IReadOnlyList<CharacterIdentityUploadPayload>, CancellationToken, Task<bool>>? uploadResolvedIdentitiesAsync = null,
         HttpClient? identityUploadHttpClient = null,
         ISelectOkDialogSuppressionRuntime? selectOkDialogSuppressionRuntime = null,
-        Func<bool>? isOperational = null
+        Func<bool>? isOperational = null,
+        Func<int, int, int>? nextJitterMs = null
     ) {
         _database = database ?? throw new ArgumentNullException(nameof(database));
         _debugSink = debugSink;
@@ -186,11 +192,12 @@ internal sealed class CharaCardResolver : IDisposable {
         _selectOkDialogSuppressionRuntime = selectOkDialogSuppressionRuntime;
         _worldNameResolver = worldNameResolver ?? ResolveWorldName;
         _utcNow = utcNow ?? (() => DateTime.UtcNow);
+        _nextJitterMs = nextJitterMs ?? (static (min, max) => Random.Shared.Next(min, max));
         _persistResolvedIdentity = persistResolvedIdentity ?? _database.UpsertResolvedIdentity;
         _queue = new ContentIdResolveQueue(maxAttempts: ResolveMaxAttemptsFromRetryCount(configuration?.CharaCardResolveRetryCount ?? 1));
         _requestTimeout = requestTimeout ?? DefaultRequestTimeout;
         var resolvedIdentityUploadAttemptTimeout = identityUploadAttemptTimeout ?? DefaultIdentityUploadAttemptTimeout;
-        _identityUploadHttpClient = identityUploadHttpClient ?? new HttpClient();
+        _identityUploadHttpClient = identityUploadHttpClient ?? PluginHttpClientFactory.CreateIngestClient();
         _ownsIdentityUploadHttpClient = identityUploadHttpClient is null;
         var resolvedIdentityUploader = uploadResolvedIdentitiesAsync
             ?? (configuration is null
@@ -308,6 +315,10 @@ internal sealed class CharaCardResolver : IDisposable {
 
         ResolveRequestStatus request;
         lock (_sync) {
+            if (nowUtc < _nextDispatchAllowedAtUtc) {
+                return;
+            }
+
             if (!_queue.TryStartNext(nowUtc, out request)) {
                 return;
             }
@@ -325,6 +336,10 @@ internal sealed class CharaCardResolver : IDisposable {
 
             lock (_sync) {
                 var observedAtUtc = _utcNow();
+                var jitterMs = Math.Clamp(_nextJitterMs(0, MaxDispatchJitterMs + 1), 0, MaxDispatchJitterMs);
+                _nextDispatchAllowedAtUtc = observedAtUtc
+                    + MinDispatchInterval
+                    + TimeSpan.FromMilliseconds(jitterMs);
                 _plateFailureSuppressionState.ArmDispatchedRequestSuppression(observedAtUtc);
                 _plateFailureSuppressionState.TrackSelectOkDialogBudget(request.ContentId, observedAtUtc);
             }
@@ -398,16 +413,28 @@ internal sealed class CharaCardResolver : IDisposable {
         return true;
     }
 
+    internal void BeginShutdown() {
+        if (Interlocked.Exchange(ref _shutdownSignaled, 1) != 0) {
+            return;
+        }
+
+        IsEnabled = false;
+        try {
+            _disposeCts.Cancel();
+        } catch (ObjectDisposedException) {
+        }
+    }
+
     public void Dispose() {
+        BeginShutdown();
         if (_disposed) {
             return;
         }
 
         _disposed = true;
-        IsEnabled = false;
-        _disposeCts.Cancel();
         _selectOkDialogSuppressionRuntime?.Dispose();
         _runtime.Dispose();
+        _identityUploadPump?.WaitForActiveWorker(TimeSpan.FromSeconds(2));
         _disposeCts.Dispose();
         if (_ownsIdentityUploadHttpClient) {
             _identityUploadHttpClient.Dispose();
@@ -644,7 +671,7 @@ internal sealed class CharaCardResolver : IDisposable {
     }
 
     private bool ShouldSuppressAddonOrGameLogSource(string source) {
-        if (source.StartsWith("Toast.", StringComparison.Ordinal)) {
+        if (string.Equals(source, "Toast.Error", StringComparison.Ordinal)) {
             return ShouldSuppressGameUiText(source);
         }
 
@@ -801,46 +828,48 @@ internal sealed class CharaCardResolver : IDisposable {
         var anySuccess = false;
 
         foreach (var uploadTarget in configuration.UploadUrls.Where(static candidate => candidate.IsEnabled)) {
-            if (UploadAttemptRecorder.IsCircuitOpen(uploadTarget, configuration, DateTime.UtcNow)) {
-                continue;
-            }
-
             if (!IngestEndpointResolver.TryBuildEndpoint(uploadTarget, IngestRoutes.CharacterIdentity, out var endpoint)) {
                 continue;
             }
 
-            try {
-                using var request = IngestRequestFactory.CreatePostJsonRequest(
-                    configuration,
-                    endpoint,
-                    jsonPayload
-                );
-                using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                attemptCts.CancelAfter(attemptTimeout);
-                using var response = await httpClient.SendAsync(request, attemptCts.Token).ConfigureAwait(false);
+            if (!UploadAttemptRecorder.TryBeginAttempt(uploadTarget, configuration, DateTime.UtcNow, out var attemptLease)) {
+                continue;
+            }
 
-                if (response.IsSuccessStatusCode) {
-                    anySuccess = true;
-                    UploadAttemptRecorder.RecordSuccess(uploadTarget);
-                    continue;
-                }
+            using (attemptLease) {
+                try {
+                    using var request = IngestRequestFactory.CreatePostJsonRequest(
+                        configuration,
+                        endpoint,
+                        jsonPayload
+                    );
+                    using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                    attemptCts.CancelAfter(attemptTimeout);
+                    using var response = await httpClient.SendAsync(request, attemptCts.Token).ConfigureAwait(false);
 
-                UploadAttemptRecorder.RecordFailure(uploadTarget, DateTime.UtcNow);
-
-                if ((int)response.StatusCode == 429) {
-                        var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
-                        if (retryAfter.HasValue) {
-                            warningSink?.Invoke($"CharaCardResolver: rate limited by {endpoint.Url}, retry_after={retryAfter.Value}s");
-                        }
+                    if (response.IsSuccessStatusCode) {
+                        anySuccess = true;
+                        attemptLease.RecordSuccess();
+                        continue;
                     }
-            } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
-                throw;
-            } catch (OperationCanceledException) {
-                UploadAttemptRecorder.RecordFailure(uploadTarget, DateTime.UtcNow);
-                warningSink?.Invoke($"CharaCardResolver: identity upload timed out for {endpoint.Url} after {attemptTimeout.TotalMilliseconds:0}ms.");
-            } catch (Exception exception) {
-                UploadAttemptRecorder.RecordFailure(uploadTarget, DateTime.UtcNow);
-                warningSink?.Invoke($"CharaCardResolver: identity upload error to {endpoint.Url}. {exception.Message}");
+
+                    attemptLease.RecordFailure(DateTime.UtcNow);
+
+                    if ((int)response.StatusCode == 429) {
+                            var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
+                            if (retryAfter.HasValue) {
+                                warningSink?.Invoke($"CharaCardResolver: rate limited by {endpoint.Url}, retry_after={retryAfter.Value}s");
+                            }
+                        }
+                } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
+                    throw;
+                } catch (OperationCanceledException) {
+                    attemptLease.RecordFailure(DateTime.UtcNow);
+                    warningSink?.Invoke($"CharaCardResolver: identity upload timed out for {endpoint.Url} after {attemptTimeout.TotalMilliseconds:0}ms.");
+                } catch (Exception exception) {
+                    attemptLease.RecordFailure(DateTime.UtcNow);
+                    warningSink?.Invoke($"CharaCardResolver: identity upload error to {endpoint.Url}. {exception.Message}");
+                }
             }
         }
 

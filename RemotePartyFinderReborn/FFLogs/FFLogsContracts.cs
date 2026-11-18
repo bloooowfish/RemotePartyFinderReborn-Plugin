@@ -20,6 +20,16 @@ public class ParseJob
     public int DifficultyId { get; set; }
     public uint EncounterId { get; set; }
     public uint? SecondaryEncounterId { get; set; }
+    public List<uint> ZoneEncounters { get; set; } = new();
+    public string? TomestoneExpansion { get; set; }
+    public string? TomestoneCategory { get; set; }
+    public string? TomestoneClearsCategory { get; set; }
+    public string? TomestoneZoneSlug { get; set; }
+    public string? TomestoneEncounterSlug { get; set; }
+    public List<string> TomestoneEncounterNames { get; set; } = new();
+    public string? TomestoneSecondaryEncounterSlug { get; set; }
+    public List<string> TomestoneSecondaryEncounterNames { get; set; } = new();
+    public string? TomestoneProgressKind { get; set; }
     public string LeaseToken { get; set; } = "";
 }
 
@@ -40,6 +50,7 @@ public class ParseResult
     public int DifficultyId { get; set; }
     public Dictionary<int, double> Encounters { get; set; } = new();
     public Dictionary<int, int> ClearCounts { get; set; } = new();
+    public List<int> FflogsQueriedEncounters { get; set; } = new();
     public bool IsHidden { get; set; }
     public bool IsEstimated { get; set; }
     public string MatchedServer { get; set; } = "";

@@ -130,72 +130,122 @@ internal sealed class DebugPageRenderer {
                     UiTheme.DrawColoredWrappedText(UiTheme.Info, _detailUploadStatus);
                 }
             });
-    }
 
-    private void DrawAutoScannerTab() {
+        ImGui.Dummy(new Vector2(0f, 6f));
+
         UiTheme.DrawCard(
-            "DebugScannerControlsCard",
-            "Scanner Controls & Live State",
-            "Scanner runs only from current-page snapshots or collected listings.",
+            "DebugTomestonePacingOverrideCard",
+            "Tomestone Pacing Override",
+            "Bypasses safe anti-burst clamping for Tomestone API requests until the plugin reloads.",
             () => {
-                var manualCollectionEnabled = _configuration.EnableManualPageCollectionDebug;
-                if (ImGui.Checkbox("Manual Page Collection (Deferred Batch)", ref manualCollectionEnabled)) {
-                    _configuration.EnableManualPageCollectionDebug = manualCollectionEnabled;
-                    _configuration.Save();
+                var bypassClamp = _configuration.BypassTomestonePacingClampDebug;
+                if (ImGui.Checkbox("Bypass Tomestone Pacing Clamp (Session Only)##debugBypassTomestoneClamp", ref bypassClamp)) {
+                    _configuration.BypassTomestonePacingClampDebug = bypassClamp;
                 }
                 if (ImGui.IsItemHovered()) {
-                    ImGui.SetTooltip("When enabled, listings seen while you manually turn PF pages are collected for a later one-click batch detail run.");
+                    ImGui.SetTooltip("Unlocks <1000 ms interval and >1 concurrency in Advanced -> Tomestone Request Pacing for the current session only. Not saved to disk.");
                 }
 
                 ImGui.Spacing();
 
+                var effectiveConcurrency = _configuration.GetEffectiveTomestoneMaxConcurrency();
+                var effectiveIntervalMs = _configuration.GetEffectiveTomestoneRequestIntervalMs();
+                UiTheme.DrawKeyValueTable("TomestonePacingEffectiveTable", () => {
+                    UiTheme.DrawKeyValueRow(
+                        "Clamp Mode",
+                        bypassClamp ? "Bypassed (Session Only)" : "Safe Clamped (Max Concurrency 1, >= 1000 ms)");
+                    UiTheme.DrawKeyValueRow(
+                        "Effective Pacing",
+                        $"concurrency={effectiveConcurrency}, interval={effectiveIntervalMs} ms (configured={_configuration.TomestoneMaxConcurrency}, {_configuration.TomestoneRequestIntervalMs} ms)");
+                });
+
+                if (bypassClamp) {
+                    ImGui.Spacing();
+                    UiTheme.DrawColoredWrappedText(
+                        UiTheme.Warning,
+                        "Anti-burst clamping is bypassed for this session. Tomestone rate-limit or Cloudflare 429 bursts may occur.");
+                }
+            });
+    }
+
+    private void DrawAutoScannerTab() {
+        var scanner = _plugin.DebugPfScanner;
+        var detailQueue = _plugin.DetailUploadQueueDebugState;
+        var collectedCount = scanner.CollectedListingCount;
+        var pageBatchCount = scanner.CollectedPageBatchCount;
+
+        UiTheme.DrawCard(
+            "DebugAutoScannerCard",
+            "Auto Scanner",
+            "Automatically collects current and paged high-end Party Finder listings, then scans and uploads party details in one click.",
+            () => {
                 UiTheme.DrawKeyValueTable("ScannerStateTable", () => {
-                    UiTheme.DrawKeyValueRow("State", _plugin.DebugPfScanner.StateName);
-                    UiTheme.DrawKeyValueRow("Target Listing", _plugin.DebugPfScanner.CurrentTargetListingId.ToString());
                     UiTheme.DrawKeyValueRow(
-                        "Visible / Pending",
-                        $"{_plugin.DebugPfScanner.VisibleListingCount} / {_plugin.DebugPfScanner.PendingCount}");
-                    UiTheme.DrawKeyValueRow("Collected Listings", _plugin.DebugPfScanner.CollectedListingCount.ToString());
+                        "Collection",
+                        !_plugin.IsPluginOperational
+                            ? "Blocked (FFLogs API required)"
+                            : scanner.IsPartyFinderOpen
+                                ? "Active (PF Open)"
+                                : "Standing By (Open PF to collect)");
                     UiTheme.DrawKeyValueRow(
-                        "Processed / Failures",
-                        $"{_plugin.DebugPfScanner.ProcessedCount} / {_plugin.DebugPfScanner.ConsecutiveFailures}");
+                        "Collected Ready",
+                        $"{collectedCount} listing(s) across {pageBatchCount} page batch(es)");
+                    UiTheme.DrawKeyValueRow(
+                        "Scanner",
+                        scanner.IsRunning
+                            ? $"{scanner.StateName} (target={scanner.CurrentTargetListingId}, pending={scanner.PendingCount})"
+                            : scanner.StateName);
+                    UiTheme.DrawKeyValueRow(
+                        "Progress",
+                        $"processed={scanner.ProcessedCount}, failures={scanner.ConsecutiveFailures}");
+                    UiTheme.DrawKeyValueRow(
+                        "Detail Upload",
+                        $"pending={detailQueue.PendingCount}, in-flight={detailQueue.InFlightCount}, workers={detailQueue.ActiveWorkerCount}");
                     UiTheme.DrawKeyValueRow(
                         "Last Attempt",
-                        $"listing={_plugin.DebugPfScanner.LastAttemptListingId}, success={_plugin.DebugPfScanner.LastAttemptSuccess}, reason={_plugin.DebugPfScanner.LastAttemptReason}");
+                        scanner.LastAttemptListingId == 0
+                            ? "none"
+                            : $"listing={scanner.LastAttemptListingId}, success={scanner.LastAttemptSuccess}, reason={scanner.LastAttemptReason}");
                 });
 
                 ImGui.Spacing();
 
-                // Row 1
-                if (ImGui.Button("Collect Page Snapshot##scannerCollect")) {
-                    var added = _plugin.DebugPfScanner.CollectCurrentPageSnapshot();
-                    _scannerCollectionStatus = $"[{DateTime.Now:HH:mm:ss}] Collected current-page snapshot (+{added}).";
+                if (scanner.IsRunning) {
+                    if (ImGui.Button("Stop Scan##scannerStop")) {
+                        scanner.StopScan();
+                        _scannerCollectionStatus = $"[{DateTime.Now:HH:mm:ss}] Scan stopped; remaining unscanned listings kept.";
+                    }
+                } else {
+                    var canStart = _plugin.IsPluginOperational && scanner.IsPartyFinderOpen && collectedCount > 0;
+                    using (ImRaii.Disabled(!canStart)) {
+                        if (ImGui.Button($"Scan & Upload Details ({collectedCount})##scannerStart")) {
+                            var ok = scanner.StartScan(out var status);
+                            _scannerCollectionStatus = $"[{DateTime.Now:HH:mm:ss}] {(ok ? "OK" : "FAIL")}: {status}";
+                        }
+                    }
+                    if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled)) {
+                        ImGui.SetTooltip("Flushes pending listing summaries, opens each collected high-end listing in PF to capture party details, and uploads them immediately.");
+                    }
                 }
 
                 ImGui.SameLine();
-                if (ImGui.Button("Run Current Page##scannerRunCurrent")) {
-                    _plugin.DebugPfScanner.StartCurrentPageRun();
-                    _scannerCollectionStatus = $"[{DateTime.Now:HH:mm:ss}] Scheduled current-page detail-click run.";
+                using (ImRaii.Disabled(collectedCount == 0 && !scanner.IsRunning)) {
+                    if (ImGui.Button("Clear##scannerClear")) {
+                        var removed = scanner.ClearCollectedListings();
+                        _scannerCollectionStatus = $"[{DateTime.Now:HH:mm:ss}] Cleared {removed} collected listing(s).";
+                    }
                 }
 
-                ImGui.SameLine();
-                if (ImGui.Button("Run Collected Batch##scannerRunBatch")) {
-                    var ok = _plugin.DebugPfScanner.StartCollectedBatchRun(out var status);
-                    _scannerCollectionStatus = $"[{DateTime.Now:HH:mm:ss}] {(ok ? "OK" : "FAIL")}: {status}";
-                }
-
-                // Row 2
-                if (ImGui.Button("Clear Collected##scannerClear")) {
-                    var removed = _plugin.DebugPfScanner.ClearCollectedListings();
-                    _scannerCollectionStatus = $"[{DateTime.Now:HH:mm:ss}] Cleared collected listings ({removed}).";
-                }
-
-                ImGui.SameLine();
-                if (ImGui.Button("Stop & Reset Session##scannerReset")) {
-                    _configuration.EnableAutoDetailScanDebug = false;
-                    _configuration.Save();
-                    _plugin.DebugPfScanner.ResetSession();
-                    _scannerCollectionStatus = $"[{DateTime.Now:HH:mm:ss}] Scanner stopped and session reset.";
+                if (!_plugin.IsPluginOperational) {
+                    ImGui.Spacing();
+                    UiTheme.DrawColoredWrappedText(
+                        UiTheme.Warning,
+                        "FFLogs API registration is required before listings can be collected or scanned.");
+                } else if (!scanner.IsPartyFinderOpen) {
+                    ImGui.Spacing();
+                    UiTheme.DrawColoredWrappedText(
+                        UiTheme.Muted,
+                        "Open Party Finder in-game and browse pages to auto-collect high-end listings.");
                 }
 
                 if (!string.IsNullOrEmpty(_scannerCollectionStatus)) {
@@ -207,98 +257,66 @@ internal sealed class DebugPageRenderer {
         ImGui.Dummy(new Vector2(0f, 6f));
 
         UiTheme.DrawCard(
-            "DebugScannerTimingCard",
-            "Scanner Timing & Limits",
-            "Tuning parameters for automated PF detail inspection.",
+            "DebugScannerSpeedCard",
+            "Scanner Speed & Retry",
+            "Pacing between single-flight PF detail requests, timeout, and retry budget.",
             () => {
-                UiTheme.DrawFormTable("ScannerTimingForm", () => {
-                    UiTheme.FormRow("Action Interval", null, () => {
-                        var actionInterval = Configuration.NormalizeScanActionIntervalMs(
-                            _configuration.AutoDetailScanActionIntervalMs);
-                        if (ImGui.SliderInt("##scanActionInterval", ref actionInterval, 100, 2000, "%d ms")) {
-                            _configuration.AutoDetailScanActionIntervalMs =
-                                Configuration.NormalizeScanActionIntervalMs(actionInterval);
-                            _configuration.Save();
-                        }
-                    });
-
-                    UiTheme.FormRow("Detail Timeout", null, () => {
-                        var detailTimeout = Configuration.NormalizeScanDetailTimeoutMs(
-                            _configuration.AutoDetailScanDetailTimeoutMs);
-                        if (ImGui.SliderInt("##scanDetailTimeout", ref detailTimeout, 500, 10000, "%d ms")) {
-                            _configuration.AutoDetailScanDetailTimeoutMs =
-                                Configuration.NormalizeScanDetailTimeoutMs(detailTimeout);
-                            _configuration.Save();
-                        }
-                    });
-
-                    UiTheme.FormRow("Min Detail Dwell", null, () => {
-                        var minDwell = Configuration.NormalizeScanMinDwellMs(
-                            _configuration.AutoDetailScanMinDwellMs);
-                        if (ImGui.SliderInt("##scanMinDwell", ref minDwell, 100, 3000, "%d ms")) {
-                            _configuration.AutoDetailScanMinDwellMs =
-                                Configuration.NormalizeScanMinDwellMs(minDwell);
-                            _configuration.Save();
-                        }
-                    });
-
-                    UiTheme.FormRow("Post Listing Cooldown", null, () => {
-                        var postCooldown = Configuration.NormalizeScanPostCooldownMs(
-                            _configuration.AutoDetailScanPostListingCooldownMs);
-                        if (ImGui.SliderInt("##scanPostCooldown", ref postCooldown, 50, 3000, "%d ms")) {
-                            _configuration.AutoDetailScanPostListingCooldownMs =
-                                Configuration.NormalizeScanPostCooldownMs(postCooldown);
-                            _configuration.Save();
-                        }
-                    });
-
-                    UiTheme.FormRow("Dedup TTL", null, () => {
-                        var dedupTtl = Configuration.NormalizeScanDedupTtlSeconds(
-                            _configuration.AutoDetailScanDedupTtlSeconds);
-                        if (ImGui.SliderInt("##scanDedupTtl", ref dedupTtl, 30, 3600, "%d s")) {
-                            _configuration.AutoDetailScanDedupTtlSeconds =
-                                Configuration.NormalizeScanDedupTtlSeconds(dedupTtl);
-                            _configuration.Save();
-                        }
-                    });
-
-                    UiTheme.FormRow("Max Consecutive Failures", null, () => {
-                        var maxFailures = Configuration.NormalizeScanMaxFailures(
-                            _configuration.AutoDetailScanMaxConsecutiveFailures);
-                        if (ImGui.SliderInt("##scanMaxFailures", ref maxFailures, 1, 20, "%d")) {
-                            _configuration.AutoDetailScanMaxConsecutiveFailures =
-                                Configuration.NormalizeScanMaxFailures(maxFailures);
-                            _configuration.Save();
-                        }
-                    });
-
+                UiTheme.DrawFormTable("DebugScannerSpeedForm", () => {
                     UiTheme.FormRow(
-                        "Max Listings Per Run",
-                        "Maximum listings scanned per run (0 = unlimited).",
+                        "Action Interval",
+                        "Minimum time between consecutive PF detail open requests.",
                         () => {
-                            var maxPerRun = Configuration.NormalizeScanMaxPerRun(
-                                _configuration.AutoDetailScanMaxPerRun);
-                            if (ImGui.SliderInt("##scanMaxPerRun", ref maxPerRun, 0, 500, "%d")) {
-                                _configuration.AutoDetailScanMaxPerRun =
-                                    Configuration.NormalizeScanMaxPerRun(maxPerRun);
+                            var actionInterval = Configuration.NormalizeScanActionIntervalMs(_configuration.AutoDetailScanActionIntervalMs);
+                            if (ImGui.SliderInt("##scanActionInterval", ref actionInterval, 50, 2000, "%d ms")) {
+                                _configuration.AutoDetailScanActionIntervalMs = Configuration.NormalizeScanActionIntervalMs(actionInterval);
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
                                 _configuration.Save();
                             }
                         });
 
                     UiTheme.FormRow(
-                        "Auto Scanner Retries",
-                        "Additional retries after the initial PF auto scanner interaction attempt.",
+                        "Post Cooldown",
+                        "Pause after each completed listing before advancing (0 ms chains immediately).",
                         () => {
-                            var autoDetailScanRetryCount = _configuration.AutoDetailScanRetryCount;
-                            if (ImGui.SliderInt("##scanRetries", ref autoDetailScanRetryCount, 0, 5, "%d")) {
-                                _configuration.AutoDetailScanRetryCount = autoDetailScanRetryCount;
+                            var postCooldown = Configuration.NormalizeScanPostCooldownMs(_configuration.AutoDetailScanPostListingCooldownMs);
+                            if (ImGui.SliderInt("##scanPostCooldown", ref postCooldown, 0, 2000, "%d ms")) {
+                                _configuration.AutoDetailScanPostListingCooldownMs = Configuration.NormalizeScanPostCooldownMs(postCooldown);
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
+                                _configuration.Save();
+                            }
+                        });
+
+                    UiTheme.FormRow(
+                        "Detail Timeout",
+                        "Maximum wait for PF detail data before retrying or skipping.",
+                        () => {
+                            var detailTimeout = Configuration.NormalizeScanDetailTimeoutMs(_configuration.AutoDetailScanDetailTimeoutMs);
+                            if (ImGui.SliderInt("##scanDetailTimeout", ref detailTimeout, 500, 10000, "%d ms")) {
+                                _configuration.AutoDetailScanDetailTimeoutMs = Configuration.NormalizeScanDetailTimeoutMs(detailTimeout);
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
+                                _configuration.Save();
+                            }
+                        });
+
+                    UiTheme.FormRow(
+                        "Retry Count",
+                        "Additional open attempts for transient PF retrieval failures or timeouts.",
+                        () => {
+                            var retryCount = Configuration.NormalizeScanRetryCount(_configuration.AutoDetailScanRetryCount);
+                            if (ImGui.SliderInt("##scanRetryCount", ref retryCount, 0, 5, "%d")) {
+                                _configuration.AutoDetailScanRetryCount = Configuration.NormalizeScanRetryCount(retryCount);
+                            }
+                            if (ImGui.IsItemDeactivatedAfterEdit()) {
                                 _configuration.Save();
                             }
                         });
                 });
             },
             headerRight: () => {
-                if (ImGui.Button("Reset Defaults##scannerDefaults")) {
+                if (ImGui.Button("Reset Defaults##scannerSpeedReset")) {
                     _configuration.ResetScannerDefaults();
                     _configuration.Save();
                 }

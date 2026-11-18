@@ -1,6 +1,8 @@
 #nullable enable
 
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -24,14 +26,20 @@ internal readonly record struct PluginActivationSnapshot(
 );
 
 internal sealed class FFLogsActivationGate : IDisposable {
+    private static readonly TimeSpan DefaultShutdownWaitTimeout = TimeSpan.FromSeconds(2);
+
     private readonly Configuration _configuration;
     private readonly ApiCredentialStatusStore _credentialStatusStore;
     private readonly Action _saveConfiguration;
     private readonly object _gate = new();
     private readonly SemaphoreSlim _verifyLock = new(1, 1);
+    private readonly CancellationTokenSource _shutdownCts = new();
+    private readonly HashSet<Task> _activeVerificationTasks = new();
 
     private string _lastAcceptedFingerprint = string.Empty;
     private int _verificationInFlightCount;
+    private int _shutdownSignaled;
+    private int _disposed;
 
     internal FFLogsActivationGate(
         Configuration configuration,
@@ -45,8 +53,43 @@ internal sealed class FFLogsActivationGate : IDisposable {
 
     internal bool IsVerificationInFlight => Volatile.Read(ref _verificationInFlightCount) > 0;
 
+    internal void BeginShutdown() {
+        if (Interlocked.Exchange(ref _shutdownSignaled, 1) != 0) {
+            return;
+        }
+
+        try {
+            _shutdownCts.Cancel();
+        } catch (ObjectDisposedException) {
+        }
+    }
+
+    internal void WaitForPendingVerifications(TimeSpan? timeout = null) {
+        Task[] activeTasks;
+        lock (_gate) {
+            activeTasks = _activeVerificationTasks.ToArray();
+        }
+
+        if (activeTasks.Length == 0) {
+            return;
+        }
+
+        try {
+            Task.WhenAll(activeTasks).Wait(timeout ?? DefaultShutdownWaitTimeout);
+        } catch (Exception) {
+            // Cancellation/timeout during shutdown is expected; callers have already signaled shutdown.
+        }
+    }
+
     public void Dispose() {
+        BeginShutdown();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) {
+            return;
+        }
+
+        WaitForPendingVerifications(DefaultShutdownWaitTimeout);
         _verifyLock.Dispose();
+        _shutdownCts.Dispose();
     }
 
     internal static string ComputeCredentialFingerprint(string? clientId, string? clientSecret) {
@@ -186,20 +229,75 @@ internal sealed class FFLogsActivationGate : IDisposable {
         }
     }
 
-    internal async Task<OperationOutcome<bool>> VerifyAsync(
+    internal Task<OperationOutcome<bool>> VerifyAsync(
         Func<CancellationToken, Task<OperationOutcome<bool>>> verifyAsync,
         CancellationToken cancellationToken = default
     ) {
         ArgumentNullException.ThrowIfNull(verifyAsync);
 
-        await _verifyLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-        Interlocked.Increment(ref _verificationInFlightCount);
+        lock (_gate) {
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+            if (Volatile.Read(ref _shutdownSignaled) != 0) {
+                return cancellationToken.IsCancellationRequested
+                    ? Task.FromCanceled<OperationOutcome<bool>>(cancellationToken)
+                    : Task.FromResult(OperationOutcome<bool>.Failure(false, "Plugin is shutting down."));
+            }
+
+            var task = VerifyCoreAsync(verifyAsync, cancellationToken);
+            if (!task.IsCompleted) {
+                _activeVerificationTasks.Add(task);
+                _ = task.ContinueWith(
+                    static (completed, state) => {
+                        var owner = (FFLogsActivationGate)state!;
+                        lock (owner._gate) {
+                            owner._activeVerificationTasks.Remove(completed);
+                        }
+                    },
+                    this,
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            }
+
+            return task;
+        }
+    }
+
+    private async Task<OperationOutcome<bool>> VerifyCoreAsync(
+        Func<CancellationToken, Task<OperationOutcome<bool>>> verifyAsync,
+        CancellationToken cancellationToken
+    ) {
+        CancellationTokenSource linkedCts;
         try {
-            _credentialStatusStore.ResetFFLogs();
-            return await verifyAsync(cancellationToken).ConfigureAwait(false);
-        } finally {
-            Interlocked.Decrement(ref _verificationInFlightCount);
-            _verifyLock.Release();
+            linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _shutdownCts.Token);
+        } catch (ObjectDisposedException) {
+            return OperationOutcome<bool>.Failure(false, "Plugin is shutting down.");
+        }
+
+        using (linkedCts) {
+            var lockAcquired = false;
+            try {
+                await _verifyLock.WaitAsync(linkedCts.Token).ConfigureAwait(false);
+                lockAcquired = true;
+                Interlocked.Increment(ref _verificationInFlightCount);
+                try {
+                    _credentialStatusStore.ResetFFLogs();
+                    return await verifyAsync(linkedCts.Token).ConfigureAwait(false);
+                } finally {
+                    Interlocked.Decrement(ref _verificationInFlightCount);
+                }
+            } catch (OperationCanceledException) when (Volatile.Read(ref _shutdownSignaled) != 0 && !cancellationToken.IsCancellationRequested) {
+                return OperationOutcome<bool>.Failure(false, "Plugin is shutting down.");
+            } catch (ObjectDisposedException) when (Volatile.Read(ref _disposed) != 0) {
+                return OperationOutcome<bool>.Failure(false, "Plugin is shutting down.");
+            } finally {
+                if (lockAcquired) {
+                    try {
+                        _verifyLock.Release();
+                    } catch (ObjectDisposedException) when (Volatile.Read(ref _disposed) != 0) {
+                    }
+                }
+            }
         }
     }
 

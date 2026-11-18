@@ -285,16 +285,8 @@ public sealed class PartyDetailCaptureStateTests {
         var queue = new DebugPfListingQueue();
         var stateMachine = new DebugPfScanStateMachine(queue);
         var target = new DebugPfListingCandidate(9001U, 44UL, nowUtc, 1);
-        stateMachine.UpsertVisibleCandidate(target);
 
-        _ = stateMachine.SyncQueue(
-            nowUtc,
-            [],
-            hasIncomingListings: false,
-            maxPerRun: 0,
-            dedupTtlSeconds: 600,
-            runFromCollectedListings: false
-        );
+        _ = stateMachine.SyncQueue(nowUtc, [target], dedupTtlSeconds: 600);
 
         stateMachine.HandleOpenAttemptResult(
             nowUtc,
@@ -317,16 +309,8 @@ public sealed class PartyDetailCaptureStateTests {
         var queue = new DebugPfListingQueue();
         var stateMachine = new DebugPfScanStateMachine(queue);
         var target = new DebugPfListingCandidate(api15ListingId, 44UL, nowUtc, 1);
-        stateMachine.UpsertVisibleCandidate(target);
 
-        _ = stateMachine.SyncQueue(
-            nowUtc,
-            [],
-            hasIncomingListings: false,
-            maxPerRun: 0,
-            dedupTtlSeconds: 600,
-            runFromCollectedListings: false
-        );
+        _ = stateMachine.SyncQueue(nowUtc, [target], dedupTtlSeconds: 600);
 
         Assert.Equal(api15ListingId, stateMachine.CurrentTargetListingId);
     }
@@ -337,16 +321,8 @@ public sealed class PartyDetailCaptureStateTests {
         var queue = new DebugPfListingQueue();
         var stateMachine = new DebugPfScanStateMachine(queue);
         var target = new DebugPfListingCandidate(9101U, 55UL, nowUtc, 1);
-        stateMachine.UpsertVisibleCandidate(target);
 
-        _ = stateMachine.SyncQueue(
-            nowUtc,
-            [],
-            hasIncomingListings: false,
-            maxPerRun: 0,
-            dedupTtlSeconds: 600,
-            runFromCollectedListings: false
-        );
+        _ = stateMachine.SyncQueue(nowUtc, [target], dedupTtlSeconds: 600);
 
         stateMachine.HandleOpenAttemptResult(
             nowUtc,
@@ -359,7 +335,6 @@ public sealed class PartyDetailCaptureStateTests {
         stateMachine.HandleDetailReadyState(
             nowUtc.AddMilliseconds(10),
             new DebugPfDetailSnapshot(target.ListingId, target.ContentId, NonZeroMembers: 4, TotalSlots: 8),
-            minDwellMs: 800,
             detailReadyTimeoutMs: 3500,
             configuredRetries: 0,
             postListingCooldownMs: 300
@@ -367,7 +342,6 @@ public sealed class PartyDetailCaptureStateTests {
         stateMachine.HandleDetailReadyState(
             nowUtc.AddMilliseconds(20),
             new DebugPfDetailSnapshot(target.ListingId, target.ContentId, NonZeroMembers: 4, TotalSlots: 8),
-            minDwellMs: 800,
             detailReadyTimeoutMs: 3500,
             configuredRetries: 0,
             postListingCooldownMs: 300
@@ -499,11 +473,40 @@ public sealed class PartyDetailCaptureStateTests {
         Assert.Equal(44UL, afterConsumed.Snapshot.Members[0].ContentId);
     }
 
+    [Fact]
+    public void Arrival_snapshot_clone_preserves_created_world_restart_and_observed_timestamp() {
+        var state = new PartyDetailCaptureState();
+        var cycle = state.BeginRequest(PartyDetailRequestOwner.Manual, 9001U, 44UL);
+        var snapshot = new UploadablePartyDetail {
+            ListingId = 9001U,
+            LeaderContentId = 44UL,
+            LeaderName = "Leader",
+            HomeWorld = 77,
+            CreatedWorld = 74,
+            LastServerRestart = 1700000123U,
+            ObservedAtUnixMs = 1770000000456L,
+            MemberContentIds = [44UL],
+            MemberJobs = [19],
+            SlotFlags = ["0x0000000000000001"],
+        };
+
+        Assert.True(state.TryRecordArrival(cycle.RequestSerial, snapshot));
+        snapshot.CreatedWorld = 0;
+        snapshot.LastServerRestart = 0;
+        snapshot.ObservedAtUnixMs = 0;
+
+        Assert.True(state.TryGetNextUnconsumedArrival(out var arrival));
+        Assert.Equal((ushort)74, arrival.Payload.CreatedWorld);
+        Assert.Equal(1700000123U, arrival.Payload.LastServerRestart);
+        Assert.Equal(1770000000456L, arrival.Payload.ObservedAtUnixMs);
+    }
+
     private static UploadablePartyDetail CreateSnapshot(uint listingId, ulong leaderContentId) {
         return new UploadablePartyDetail {
             ListingId = listingId,
             LeaderContentId = leaderContentId,
             HomeWorld = 77,
+            CreatedWorld = 77,
             MemberContentIds = new List<ulong> { leaderContentId },
             MemberJobs = new List<byte> { 19 },
             SlotFlags = new List<string> { "0x0000000000000001" },

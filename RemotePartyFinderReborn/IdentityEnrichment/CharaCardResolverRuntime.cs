@@ -39,12 +39,11 @@ internal sealed class DalamudSelectOkDialogSuppressionRuntime : ISelectOkDialogS
     private readonly IAddonLifecycle _addonLifecycle;
     private readonly IChatGui _chatGui;
     private readonly IToastGui _toastGui;
+    private readonly HashSet<string> _charaCardErrorToastTexts;
     private readonly Action<string>? _warningSink;
     private readonly Action<string>? _debugSink;
     private readonly IAddonLifecycle.AddonEventDelegate _addonEventHandler;
     private readonly IChatGui.OnLogMessageDelegate _logMessageHandler;
-    private readonly IToastGui.OnNormalToastDelegate _normalToastHandler;
-    private readonly IToastGui.OnQuestToastDelegate _questToastHandler;
     private readonly IToastGui.OnErrorToastDelegate _errorToastHandler;
     private readonly List<AddonEvent> _registeredAddonEvents = [];
     private Func<string, bool>? _selectOkHandler;
@@ -54,18 +53,35 @@ internal sealed class DalamudSelectOkDialogSuppressionRuntime : ISelectOkDialogS
         IAddonLifecycle addonLifecycle,
         IChatGui chatGui,
         IToastGui toastGui,
+        IDataManager? dataManager = null,
+        Action<string>? warningSink = null,
+        Action<string>? debugSink = null
+    ) : this(
+        addonLifecycle,
+        chatGui,
+        toastGui,
+        LoadCharaCardErrorToastTexts(dataManager, warningSink),
+        warningSink,
+        debugSink
+    ) {
+    }
+
+    internal DalamudSelectOkDialogSuppressionRuntime(
+        IAddonLifecycle addonLifecycle,
+        IChatGui chatGui,
+        IToastGui toastGui,
+        IEnumerable<string>? charaCardErrorToastTexts,
         Action<string>? warningSink = null,
         Action<string>? debugSink = null
     ) {
         _addonLifecycle = addonLifecycle ?? throw new ArgumentNullException(nameof(addonLifecycle));
         _chatGui = chatGui ?? throw new ArgumentNullException(nameof(chatGui));
         _toastGui = toastGui ?? throw new ArgumentNullException(nameof(toastGui));
+        _charaCardErrorToastTexts = NormalizeErrorToastTexts(charaCardErrorToastTexts);
         _warningSink = warningSink;
         _debugSink = debugSink;
         _addonEventHandler = OnSelectOkAddonEvent;
         _logMessageHandler = OnLogMessage;
-        _normalToastHandler = OnNormalToast;
-        _questToastHandler = OnQuestToast;
         _errorToastHandler = OnErrorToast;
     }
 
@@ -79,10 +95,8 @@ internal sealed class DalamudSelectOkDialogSuppressionRuntime : ISelectOkDialogS
         }
 
         _chatGui.LogMessage += _logMessageHandler;
-        _toastGui.Toast += _normalToastHandler;
-        _toastGui.QuestToast += _questToastHandler;
         _toastGui.ErrorToast += _errorToastHandler;
-        _debugSink?.Invoke("CharaCardResolver: SelectOk addon/chat/toast suppression runtime initialized.");
+        _debugSink?.Invoke("CharaCardResolver: SelectOk addon/chat/error-toast suppression runtime initialized.");
     }
 
     public void Dispose() {
@@ -92,8 +106,6 @@ internal sealed class DalamudSelectOkDialogSuppressionRuntime : ISelectOkDialogS
 
         _disposed = true;
         _chatGui.LogMessage -= _logMessageHandler;
-        _toastGui.Toast -= _normalToastHandler;
-        _toastGui.QuestToast -= _questToastHandler;
         _toastGui.ErrorToast -= _errorToastHandler;
 
         foreach (var eventType in _registeredAddonEvents) {
@@ -124,34 +136,59 @@ internal sealed class DalamudSelectOkDialogSuppressionRuntime : ISelectOkDialogS
         }
     }
 
-    private void OnNormalToast(ref Dalamud.Game.Text.SeStringHandling.SeString message, ref ToastOptions options, ref bool isHandled) {
-        try {
-            if (_selectOkHandler?.Invoke("Toast.Normal") == true) {
-                isHandled = true;
-            }
-        } catch (Exception exception) {
-            _warningSink?.Invoke($"CharaCardResolver: failed to process normal toast suppression event. {exception.Message}");
-        }
-    }
-
-    private void OnQuestToast(ref Dalamud.Game.Text.SeStringHandling.SeString message, ref QuestToastOptions options, ref bool isHandled) {
-        try {
-            if (_selectOkHandler?.Invoke("Toast.Quest") == true) {
-                isHandled = true;
-            }
-        } catch (Exception exception) {
-            _warningSink?.Invoke($"CharaCardResolver: failed to process quest toast suppression event. {exception.Message}");
-        }
-    }
-
     private void OnErrorToast(ref Dalamud.Game.Text.SeStringHandling.SeString message, ref bool isHandled) {
         try {
-            if (_selectOkHandler?.Invoke("Toast.Error") == true) {
+            if (TryShouldSuppressErrorToast(message?.TextValue)) {
                 isHandled = true;
             }
         } catch (Exception exception) {
             _warningSink?.Invoke($"CharaCardResolver: failed to process error toast suppression event. {exception.Message}");
         }
+    }
+
+    internal bool TryShouldSuppressErrorToast(string? rawToastText) {
+        if (_charaCardErrorToastTexts.Count == 0) {
+            return false;
+        }
+
+        var text = rawToastText?.Trim();
+        if (string.IsNullOrWhiteSpace(text) || !_charaCardErrorToastTexts.Contains(text)) {
+            return false;
+        }
+
+        return _selectOkHandler?.Invoke("Toast.Error") == true;
+    }
+
+    internal static HashSet<string> LoadCharaCardErrorToastTexts(
+        IDataManager? dataManager,
+        Action<string>? warningSink = null
+    ) {
+        if (dataManager is null) {
+            return new HashSet<string>(StringComparer.Ordinal);
+        }
+
+        try {
+            return GameLogMessageCatalog.ResolveCharaCardFailureTexts(new LuminaLogMessageLookup(dataManager));
+        } catch (Exception exception) {
+            warningSink?.Invoke($"CharaCardResolver: failed to load localized CharaCard error toast texts. {exception.Message}");
+            return new HashSet<string>(StringComparer.Ordinal);
+        }
+    }
+
+    private static HashSet<string> NormalizeErrorToastTexts(IEnumerable<string>? texts) {
+        var normalized = new HashSet<string>(StringComparer.Ordinal);
+        if (texts is null) {
+            return normalized;
+        }
+
+        foreach (var text in texts) {
+            var trimmed = text?.Trim();
+            if (!string.IsNullOrWhiteSpace(trimmed)) {
+                normalized.Add(trimmed);
+            }
+        }
+
+        return normalized;
     }
 }
 
@@ -495,15 +532,27 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
     }
 
     private AtkValue* SelectOkStateTransitionDetour(AgentCharaCard* thisPtr, AtkValue* returnValue, AtkValue* values, uint valueCount, ulong eventKind) {
+        if (!IsValidPointer(thisPtr)) {
+            return returnValue;
+        }
+
+        var expectedAgent = AgentCharaCard.Instance();
+        if (expectedAgent == null || thisPtr != expectedAgent) {
+            return _selectOkStateTransitionHook is { } mismatchedHook
+                ? mismatchedHook.Original(thisPtr, returnValue, values, valueCount, eventKind)
+                : returnValue;
+        }
+
         try {
-            var storage = thisPtr == null ? null : thisPtr->Data;
-            if (storage != null && !_loggedSelectOkStateTransitionDetourHit) {
+            var storage = thisPtr->Data;
+            var hasValidStorage = IsValidPointer(storage);
+            if (hasValidStorage && !_loggedSelectOkStateTransitionDetourHit) {
                 _loggedSelectOkStateTransitionDetourHit = true;
                 _debugSink?.Invoke(
                     $"CharaCardResolver: hit SelectOk state transition detour eventKind={eventKind} contentId={storage->ContentId}."
                 );
             }
-            if (storage != null
+            if (hasValidStorage
                 && _selectOkStateTransitionHandler?.Invoke(new SelectOkStateTransitionModel(
                     storage->ContentId,
                     unchecked((int)eventKind),
@@ -512,7 +561,7 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
                     storage->WasResetDueToFantasia
                 )) == false) {
                 storage->SelectOkAddonId = 0;
-                if (returnValue != null) {
+                if (IsValidPointer(returnValue)) {
                     returnValue->SetBool(false);
                 }
 
@@ -528,15 +577,25 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
     }
 
     private uint CreateSelectOkDialogDetour(AgentCharaCard* thisPtr, uint messageId, uint variant) {
+        if (!IsValidPointer(thisPtr)) {
+            return 0;
+        }
+
+        var expectedAgent = AgentCharaCard.Instance();
+        if (expectedAgent == null || thisPtr != expectedAgent) {
+            return _createSelectOkDialogHook?.Original(thisPtr, messageId, variant) ?? 0;
+        }
+
         try {
-            var storage = thisPtr == null ? null : thisPtr->Data;
-            if (storage != null && !_loggedFinalSelectOkDialogDetourHit) {
+            var storage = thisPtr->Data;
+            var hasValidStorage = IsValidPointer(storage);
+            if (hasValidStorage && !_loggedFinalSelectOkDialogDetourHit) {
                 _loggedFinalSelectOkDialogDetourHit = true;
                 _debugSink?.Invoke(
                     $"CharaCardResolver: hit final SelectOk dialog detour messageId=0x{messageId:X} variant={variant} contentId={storage->ContentId}."
                 );
             }
-            if (storage != null
+            if (hasValidStorage
                 && _selectOkDialogHandler?.Invoke(new SelectOkDialogRequestModel(
                     storage->ContentId,
                     messageId,
@@ -587,7 +646,7 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
     }
 
     private static bool IsValidPointer(void* pointer) {
-        return (nuint)pointer >= 0x10000;
+        return NativePointerValidator.IsValidUserPointer(pointer);
     }
 
     internal static string DecodeNullTerminatedUtf8(ReadOnlySpan<byte> bytes) {

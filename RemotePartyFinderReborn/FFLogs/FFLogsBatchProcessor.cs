@@ -22,6 +22,7 @@ internal sealed class FFLogsBatchProcessor
         ArgumentNullException.ThrowIfNull(leaseSession);
 
         var results = new List<ParseResult>();
+        var abandonedLeases = new List<AbandonFflogsLease>();
         var jobsByZone = leaseSession.Jobs.GroupBy(j => new { j.ZoneId, j.DifficultyId });
 
         var hitRateLimitCooldown = false;
@@ -33,15 +34,26 @@ internal sealed class FFLogsBatchProcessor
             var zoneId = group.Key.ZoneId;
             var difficultyId = group.Key.DifficultyId == 0 ? (int?)null : group.Key.DifficultyId;
             var candidateMatcher = new FFLogsCandidateMatcher(group.ToList(), zoneId, group.Key.DifficultyId);
-            var jobs = candidateMatcher.Jobs;
+
+            foreach (var missingJob in candidateMatcher.MissingIdentityJobs)
+            {
+                if (!string.IsNullOrWhiteSpace(missingJob.LeaseToken))
+                {
+                    abandonedLeases.Add(FFLogsLeaseAbandoner.CreateJobAbandonment(missingJob, "fflogs_missing_identity"));
+                }
+            }
+
+            var candidateQueries = candidateMatcher.BuildCandidateQueries();
+            if (candidateQueries.Count == 0)
+            {
+                continue;
+            }
 
             if (_seams.ApiClient.TryGetRateLimitRemaining(out cooldownRemaining))
             {
                 hitRateLimitCooldown = true;
                 break;
             }
-
-            var candidateQueries = candidateMatcher.BuildCandidateQueries();
 
             var fetchedOutcome = await _seams.ApiClient.FetchCharacterCandidateDataBatchAsync(
                 candidateQueries,
@@ -60,6 +72,13 @@ internal sealed class FFLogsBatchProcessor
 
             var candidateMatch = candidateMatcher.MatchFetchedCandidates(fetchedByKey);
             var resultsByContentId = candidateMatch.ResultsByContentId;
+            foreach (var notFoundJob in candidateMatch.NotFoundCandidateJobs)
+            {
+                if (!string.IsNullOrWhiteSpace(notFoundJob.LeaseToken))
+                {
+                    abandonedLeases.Add(FFLogsLeaseAbandoner.CreateJobAbandonment(notFoundJob, "fflogs_not_found"));
+                }
+            }
 
             if (_seams.ApiClient.TryGetRateLimitRemaining(out cooldownRemaining))
             {
@@ -77,7 +96,8 @@ internal sealed class FFLogsBatchProcessor
             HadTransientFailure: hadTransientFailure,
             HitRateLimitCooldown: hitRateLimitCooldown,
             CooldownRemaining: cooldownRemaining,
-            ShouldAbandonRemainingLeases: hitRateLimitCooldown);
+            ShouldAbandonRemainingLeases: hitRateLimitCooldown,
+            AbandonedLeases: abandonedLeases);
     }
 
     private bool TryCaptureCooldown(out TimeSpan cooldownRemaining)

@@ -29,6 +29,7 @@ internal sealed class IdentityUploadPump {
     private int _identityUploadFailureCount;
     private DateTime _nextIdentityUploadAttemptAtUtc = DateTime.MinValue;
     private DateTime _nextQueueCheckAtUtc = DateTime.MinValue;
+    private Task _activeWorkerTask = Task.CompletedTask;
     private long _queueWakeVersion;
 
     internal IdentityUploadPump(
@@ -78,6 +79,10 @@ internal sealed class IdentityUploadPump {
     }
 
     internal void PumpPendingIdentityUploads() {
+        if (_disposeToken.IsCancellationRequested) {
+            return;
+        }
+
         var nowUtc = _utcNow();
         lock (_sync) {
             if (nowUtc < _nextIdentityUploadAttemptAtUtc || nowUtc < _nextQueueCheckAtUtc) {
@@ -90,21 +95,22 @@ internal sealed class IdentityUploadPump {
         }
 
         var wakeVersion = Interlocked.Read(ref _queueWakeVersion);
+        var disposeToken = _disposeToken;
 
         // The database probe and all later DB operations stay off the framework thread.
         // Do not pass the dispose token to Task.Run: if it is canceled before scheduling,
         // the delegate (and the busy-flag cleanup) would never execute.
-        _ = Task.Run(async () => {
+        var workerTask = Task.Run(async () => {
             var attempt = new UploadAttemptResult(false, false);
             try {
-                attempt = await DrainPendingIdentityUploadsWithResultAsync(_disposeToken).ConfigureAwait(false);
-            } catch (OperationCanceledException) when (_disposeToken.IsCancellationRequested) {
+                attempt = await DrainPendingIdentityUploadsWithResultAsync(disposeToken).ConfigureAwait(false);
+            } catch (OperationCanceledException) when (disposeToken.IsCancellationRequested) {
             } catch (Exception exception) {
                 _warningSink?.Invoke($"CharaCardResolver: identity upload worker failed. {exception.Message}");
             } finally {
-                if (!_disposeToken.IsCancellationRequested && attempt.HasWork) {
+                if (!disposeToken.IsCancellationRequested && attempt.HasWork) {
                     RecordIdentityUploadAttempt(attempt.Succeeded, _utcNow());
-                } else if (!_disposeToken.IsCancellationRequested) {
+                } else if (!disposeToken.IsCancellationRequested) {
                     lock (_sync) {
                         _nextQueueCheckAtUtc = Interlocked.Read(ref _queueWakeVersion) == wakeVersion
                             ? _utcNow().Add(_idlePollInterval)
@@ -115,6 +121,22 @@ internal sealed class IdentityUploadPump {
                 Interlocked.Exchange(ref _identityUploadWorkerBusy, 0);
             }
         });
+
+        lock (_sync) {
+            _activeWorkerTask = workerTask;
+        }
+    }
+
+    internal void WaitForActiveWorker(TimeSpan timeout) {
+        Task activeTask;
+        lock (_sync) {
+            activeTask = _activeWorkerTask;
+        }
+
+        try {
+            activeTask.Wait(timeout);
+        } catch (Exception) {
+        }
     }
 
     internal void NotifyPendingIdentityChanged() {
@@ -125,7 +147,8 @@ internal sealed class IdentityUploadPump {
     }
 
     internal async Task<bool> DrainPendingIdentityUploadsOnceAsync(CancellationToken cancellationToken) {
-        var result = await DrainPendingIdentityUploadsWithResultAsync(cancellationToken).ConfigureAwait(false);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeToken);
+        var result = await DrainPendingIdentityUploadsWithResultAsync(linkedCts.Token).ConfigureAwait(false);
         return result.Succeeded;
     }
 

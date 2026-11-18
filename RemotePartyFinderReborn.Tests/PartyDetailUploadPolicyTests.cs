@@ -390,19 +390,23 @@ public sealed class PartyDetailUploadPolicyTests {
         collector.EnqueuePendingDetailForTesting(CreateDetail(9003U), now);
         await collector.ProcessNextDueUploadForTestingAsync();
 
-        Assert.Equal(1, collector.PendingQueueCount);
+        Assert.Equal(2, collector.PendingQueueCount);
         Assert.Null(collector.GetPendingDetailForTesting(9001U));
-        Assert.Null(collector.GetPendingDetailForTesting(9002U));
+        var missing = collector.GetPendingDetailForTesting(9002U).GetValueOrDefault();
+        Assert.Equal(0, missing.AttemptCount);
+        Assert.Equal(1, missing.DeferredCount);
+        Assert.Equal(now.AddSeconds(4), missing.NextAttemptAtUtc);
         var failed = collector.GetPendingDetailForTesting(9003U).GetValueOrDefault();
         Assert.Equal(1, failed.AttemptCount);
         Assert.Equal(now.AddSeconds(2), failed.NextAttemptAtUtc);
         Assert.Equal(1, collector.LastSuccessfulUploadAckVersion);
-        Assert.Equal(1, collector.LastTerminalUploadAckVersion);
+        Assert.Equal(0, collector.LastTerminalUploadAckVersion);
     }
 
     [Fact]
-    public async Task Invalid_and_forbidden_batch_results_are_terminal_without_retry() {
+    public async Task Invalid_batch_result_is_terminal_while_forbidden_capability_result_is_deferred() {
         var now = new DateTime(2026, 5, 10, 8, 0, 0, DateTimeKind.Utc);
+        var uploadUrl = new UploadUrl("https://upload.example");
         var handler = new StubHttpMessageHandler();
         handler.Enqueue((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) {
             Content = new StringContent("""
@@ -413,15 +417,27 @@ public sealed class PartyDetailUploadPolicyTests {
                 """),
         }));
         using var httpClient = new HttpClient(handler);
-        var collector = CreateCollector(httpClient, () => now, static (_, _) => 0, batchSize: 2);
+        var collector = CreateCollector(
+            httpClient,
+            () => now,
+            static (_, _) => 0,
+            batchSize: 2,
+            uploadUrls: ImmutableList.Create(uploadUrl)
+        );
 
         collector.EnqueuePendingDetailForTesting(CreateDetail(9001U), now);
         collector.EnqueuePendingDetailForTesting(CreateDetail(9002U), now);
         await collector.ProcessNextDueUploadForTestingAsync();
 
-        Assert.Equal(0, collector.PendingQueueCount);
+        Assert.Equal(1, collector.PendingQueueCount);
+        Assert.Null(collector.GetPendingDetailForTesting(9001U));
+        var deferred = collector.GetPendingDetailForTesting(9002U).GetValueOrDefault();
+        Assert.Equal(0, deferred.AttemptCount);
+        Assert.Equal(1, deferred.DeferredCount);
+        Assert.Equal(now.AddSeconds(4), deferred.NextAttemptAtUtc);
+        Assert.True(uploadUrl.ShouldDeferDetailRequest(9002U, new DateTimeOffset(now)));
         Assert.Equal(0, collector.LastSuccessfulUploadAckVersion);
-        Assert.Equal(2, collector.LastTerminalUploadAckVersion);
+        Assert.Equal(1, collector.LastTerminalUploadAckVersion);
     }
 
     [Fact]
@@ -555,7 +571,7 @@ public sealed class PartyDetailUploadPolicyTests {
         Assert.Null(collector.GetPendingDetailForTesting(9001U));
         var skipped = collector.GetPendingDetailForTesting(9002U).GetValueOrDefault();
         Assert.Equal(0, skipped.AttemptCount);
-        Assert.Equal(now.AddSeconds(2), skipped.NextAttemptAtUtc);
+        Assert.Equal(now.AddSeconds(4), skipped.NextAttemptAtUtc);
         Assert.Equal(1, collector.PendingQueueCount);
         Assert.Equal(1, handler.StartedCount);
     }
@@ -585,7 +601,7 @@ public sealed class PartyDetailUploadPolicyTests {
     }
 
     [Fact]
-    public async Task Manual_capability_deferred_detail_is_dropped_instead_of_persisting_pending_queue() {
+    public async Task Manual_capability_deferred_detail_is_retained_and_rescheduled_up_to_cap() {
         var now = new DateTime(2026, 5, 10, 9, 15, 0, DateTimeKind.Utc);
         var uploadUrl = new UploadUrl("https://upload.example");
         uploadUrl.MarkDetailCapabilitiesRequired();
@@ -598,12 +614,95 @@ public sealed class PartyDetailUploadPolicyTests {
             uploadUrls: ImmutableList.Create(uploadUrl)
         );
 
+        // ConfiguredRetries=2 -> max deferrals = max(2, 2+1) = 3.
         collector.EnqueuePendingDetailForTesting(CreateDetail(9001U), now, PartyDetailRequestOwner.Manual);
 
         await collector.ProcessNextDueUploadForTestingAsync();
+        var afterFirst = collector.GetPendingDetailForTesting(9001U);
+        Assert.NotNull(afterFirst);
+        Assert.Equal(1, afterFirst.Value.DeferredCount);
+        Assert.Equal(now.AddSeconds(4), afterFirst.Value.NextAttemptAtUtc);
 
+        now = now.AddSeconds(4);
+        await collector.ProcessNextDueUploadForTestingAsync();
+        var afterSecond = collector.GetPendingDetailForTesting(9001U);
+        Assert.NotNull(afterSecond);
+        Assert.Equal(2, afterSecond.Value.DeferredCount);
+        Assert.Equal(now.AddSeconds(8), afterSecond.Value.NextAttemptAtUtc);
+
+        now = now.AddSeconds(8);
+        await collector.ProcessNextDueUploadForTestingAsync();
+        var afterThird = collector.GetPendingDetailForTesting(9001U);
+        Assert.NotNull(afterThird);
+        Assert.Equal(3, afterThird.Value.DeferredCount);
+        Assert.Equal(now.AddSeconds(15), afterThird.Value.NextAttemptAtUtc);
+
+        now = now.AddSeconds(15);
+        await collector.ProcessNextDueUploadForTestingAsync();
         Assert.Equal(0, collector.PendingQueueCount);
         Assert.Equal(0, handler.StartedCount);
+    }
+
+    [Fact]
+    public async Task Manual_listing_missing_retains_for_4s_and_applies_once_listing_lands() {
+        var now = new DateTime(2026, 5, 10, 9, 16, 0, DateTimeKind.Utc);
+        var handler = new StubHttpMessageHandler();
+        handler.Enqueue((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) {
+            Content = new StringContent("""
+                {"status":"partial","requested":1,"accepted":1,"applied":0,"missing":1,"failed":0,"results":[
+                    {"listing_id":9001,"status":"missing","matched_count":0,"modified_count":0}
+                ]}
+                """),
+        }));
+        handler.Enqueue(CreateBatchAppliedResponseForRequestAsync);
+        using var httpClient = new HttpClient(handler);
+        var collector = CreateCollector(httpClient, () => now, static (_, _) => 0);
+
+        collector.EnqueuePendingDetailForTesting(CreateDetail(9001U), now, PartyDetailRequestOwner.Manual);
+
+        await collector.ProcessNextDueUploadForTestingAsync();
+        var pending = collector.GetPendingDetailForTesting(9001U);
+        Assert.NotNull(pending);
+        Assert.Equal(1, pending.Value.DeferredCount);
+        Assert.Equal(now.AddSeconds(4), pending.Value.NextAttemptAtUtc);
+        Assert.Equal(0, collector.LastTerminalUploadAckVersion);
+
+        now = now.AddSeconds(4);
+        await collector.ProcessNextDueUploadForTestingAsync();
+        Assert.Equal(0, collector.PendingQueueCount);
+        Assert.Equal(1, collector.LastSuccessfulUploadAckVersion);
+        Assert.Equal(2, handler.StartedCount);
+    }
+
+    [Fact]
+    public async Task Manual_listing_missing_drops_and_records_terminal_after_deferral_cap() {
+        var now = new DateTime(2026, 5, 10, 9, 16, 30, DateTimeKind.Utc);
+        var handler = new StubHttpMessageHandler();
+        for (var i = 0; i < 4; i++) {
+            handler.Enqueue((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) {
+                Content = new StringContent("""
+                    {"status":"partial","requested":1,"accepted":1,"applied":0,"missing":1,"failed":0,"results":[
+                        {"listing_id":9001,"status":"missing","matched_count":0,"modified_count":0}
+                    ]}
+                    """),
+            }));
+        }
+        using var httpClient = new HttpClient(handler);
+        var collector = CreateCollector(httpClient, () => now, static (_, _) => 0);
+
+        collector.EnqueuePendingDetailForTesting(CreateDetail(9001U), now, PartyDetailRequestOwner.Manual);
+
+        await collector.ProcessNextDueUploadForTestingAsync();
+        now = now.AddSeconds(4);
+        await collector.ProcessNextDueUploadForTestingAsync();
+        now = now.AddSeconds(8);
+        await collector.ProcessNextDueUploadForTestingAsync();
+        now = now.AddSeconds(15);
+        await collector.ProcessNextDueUploadForTestingAsync();
+
+        Assert.Equal(0, collector.PendingQueueCount);
+        Assert.Equal(1, collector.LastTerminalUploadAckVersion);
+        Assert.Equal(4, handler.StartedCount);
     }
 
     [Fact]
@@ -699,6 +798,81 @@ public sealed class PartyDetailUploadPolicyTests {
         Assert.Equal(2, handler.StartedCount);
     }
 
+    [Fact]
+    public async Task Open_circuit_does_not_drop_queued_details_within_break_window_and_delivers_on_half_open_probe() {
+        var startNow = new DateTime(2026, 5, 10, 10, 30, 0, DateTimeKind.Utc);
+        var now = startNow;
+        var uploadUrl = new UploadUrl("https://upload.example");
+        var configuration = new Configuration {
+            CircuitBreakerFailureThreshold = 1,
+            CircuitBreakerBreakDurationMinutes = 1,
+            DetailUploadBatchSize = 10,
+            DetailUploadRetryCount = 1,
+            DetailUploadTimeoutMs = 1000,
+            IngestClientId = Guid.NewGuid().ToString("N"),
+            UploadUrls = ImmutableList.Create(uploadUrl),
+        };
+        UploadAttemptRecorder.RecordFailure(uploadUrl, startNow);
+
+        var handler = new StubHttpMessageHandler();
+        handler.Enqueue(async (request, cancellationToken) => {
+            var body = await request.Content!.ReadAsStringAsync(cancellationToken);
+            var ids = JArray.Parse(body).Select(item => item.Value<uint>("listing_id")).ToArray();
+            var results = new JArray(ids.Select(id => new JObject {
+                ["listing_id"] = id,
+                ["status"] = "ok",
+                ["matched_count"] = 1,
+                ["modified_count"] = 1,
+            }));
+            var payload = new JObject {
+                ["status"] = "ok",
+                ["requested"] = ids.Length,
+                ["accepted"] = ids.Length,
+                ["applied"] = ids.Length,
+                ["missing"] = 0,
+                ["failed"] = 0,
+                ["results"] = results,
+            };
+            return new HttpResponseMessage(HttpStatusCode.OK) {
+                Content = new StringContent(payload.ToString()),
+            };
+        });
+        using var httpClient = new HttpClient(handler);
+        var collector = new PartyDetailCollector(
+            new PartyDetailCaptureState(),
+            configuration,
+            httpClient,
+            () => now,
+            static (_, _) => 0
+        );
+
+        collector.EnqueuePendingDetailForTesting(CreateDetail(9001U), startNow, PartyDetailRequestOwner.Manual);
+        collector.EnqueuePendingDetailForTesting(CreateDetail(9002U), startNow, PartyDetailRequestOwner.Scanner);
+
+        // Repeatedly process while circuit is open (<60s); neither item may burn attempts/deferrals or be dropped.
+        for (var elapsedSeconds = 0; elapsedSeconds <= 45; elapsedSeconds += 15) {
+            now = startNow.AddSeconds(elapsedSeconds);
+            await collector.ProcessNextDueUploadForTestingAsync();
+            var manualState = collector.GetPendingDetailForTesting(9001U);
+            var scannerState = collector.GetPendingDetailForTesting(9002U);
+            Assert.NotNull(manualState);
+            Assert.NotNull(scannerState);
+            Assert.Equal(0, manualState!.Value.AttemptCount);
+            Assert.Equal(0, manualState.Value.DeferredCount);
+            Assert.Equal(0, scannerState!.Value.AttemptCount);
+            Assert.Equal(0, scannerState.Value.DeferredCount);
+            Assert.True(manualState.Value.NextAttemptAtUtc > now);
+        }
+
+        // Advance to exact 60s circuit expiry -> Half-Open probe runs and delivers both items.
+        now = startNow.AddMinutes(1);
+        await collector.ProcessNextDueUploadForTestingAsync();
+
+        Assert.Equal(0, collector.PendingQueueCount);
+        Assert.Equal(1, handler.StartedCount);
+        Assert.Equal(2, collector.LastSuccessfulUploadAckVersion);
+    }
+
     private static PartyDetailCollector CreateCollector(
         HttpClient httpClient,
         Func<DateTime> utcNow,
@@ -732,6 +906,7 @@ public sealed class PartyDetailUploadPolicyTests {
             LeaderContentId = 44UL,
             LeaderName = "Leader",
             HomeWorld = 77,
+            CreatedWorld = 77,
             MemberContentIds = [44UL],
             MemberJobs = [19],
             SlotFlags = [slotFlag],

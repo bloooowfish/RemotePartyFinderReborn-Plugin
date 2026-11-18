@@ -57,7 +57,9 @@ internal static class DetailUploadResponseMapper {
         HashSet<uint> applied,
         HashSet<uint> missing,
         Dictionary<uint, string> terminalRejected,
-        Dictionary<uint, int?> retryAfterByListing
+        Dictionary<uint, int?> retryAfterByListing,
+        HashSet<uint>? capabilityForbidden = null,
+        HashSet<uint>? retryableFailed = null
     ) {
         var sendableByListingId = sendableListingIds.ToHashSet();
         var seen = new HashSet<uint>();
@@ -78,12 +80,42 @@ internal static class DetailUploadResponseMapper {
                 continue;
             }
 
+            if (IsCapabilityForbiddenBatchItem(status, result.Message)) {
+                capabilityForbidden?.Add(result.ListingId);
+                continue;
+            }
+
             if (status is "invalid" or "forbidden") {
                 terminalRejected[result.ListingId] = string.IsNullOrWhiteSpace(result.Message)
                     ? status
                     : result.Message.Trim();
+                continue;
+            }
+
+            retryableFailed?.Add(result.ListingId);
+        }
+
+        if (retryableFailed is not null) {
+            foreach (var listingId in sendableByListingId) {
+                if (!seen.Contains(listingId)) {
+                    retryableFailed.Add(listingId);
+                }
             }
         }
+    }
+
+    internal static bool IsCapabilityForbiddenBatchItem(string status, string? message) {
+        if (!string.Equals(status, "forbidden", StringComparison.OrdinalIgnoreCase)) {
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(message)) {
+            return true;
+        }
+
+        return message.Contains("capability", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("token", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("forbidden", StringComparison.OrdinalIgnoreCase);
     }
 
     internal static void MergeUploadOutcome(
@@ -92,7 +124,9 @@ internal static class DetailUploadResponseMapper {
         HashSet<uint> applied,
         HashSet<uint> missing,
         Dictionary<uint, string> terminalRejected,
-        Dictionary<uint, int?> retryAfterByListing
+        Dictionary<uint, int?> retryAfterByListing,
+        HashSet<uint>? deferred = null,
+        HashSet<uint>? retryableFailed = null
     ) {
         switch (outcome.Result) {
             case DetailUploadResult.Applied:
@@ -105,8 +139,10 @@ internal static class DetailUploadResponseMapper {
                 terminalRejected[listingId] = outcome.Message ?? "terminal detail upload rejection";
                 break;
             case DetailUploadResult.Deferred:
+                deferred?.Add(listingId);
                 break;
             default:
+                retryableFailed?.Add(listingId);
                 retryAfterByListing[listingId] = MaxRetryAfterSeconds(
                     retryAfterByListing.GetValueOrDefault(listingId),
                     outcome.RetryAfterSeconds
@@ -160,7 +196,9 @@ internal sealed record ContributeDetailBatchItemResponse {
 internal readonly record struct DetailUploadOutcome(
     DetailUploadResult Result,
     int? RetryAfterSeconds = null,
-    string? Message = null
+    string? Message = null,
+    IReadOnlyCollection<Guid>? ResolvedTargetIds = null,
+    bool HasAppliedTarget = false
 );
 
 internal enum DetailUploadResult {
@@ -169,4 +207,5 @@ internal enum DetailUploadResult {
     TerminalRejected,
     Deferred,
     RetryableFailure,
+    CircuitBlocked,
 }

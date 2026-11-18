@@ -6,6 +6,18 @@ namespace RemotePartyFinderReborn;
 
 [Serializable]
 public class Configuration : IPluginConfiguration {
+    public const int SafeMinTomestoneRequestIntervalMs = 1000;
+    public const int SafeMaxTomestoneRequestIntervalMs = 60_000;
+    public const int SafeMaxTomestoneConcurrency = 1;
+    public const int DebugMinTomestoneRequestIntervalMs = 0;
+    public const int DebugMaxTomestoneRequestIntervalMs = 60_000;
+    public const int DebugMaxTomestoneConcurrency = 10;
+
+    public const int DefaultScanActionIntervalMs = 150;
+    public const int DefaultScanPostListingCooldownMs = 50;
+    public const int DefaultScanDetailTimeoutMs = 1500;
+    public const int DefaultScanRetryCount = 1;
+
     public int Version { get; set; } = 1;
     public bool AdvancedSettingsEnabled = false;
     
@@ -17,10 +29,11 @@ public class Configuration : IPluginConfiguration {
     public int DetailUploadMaxConcurrency { get; set; } = 2;
     public int DetailUploadBatchSize { get; set; } = 8;
     public int CharaCardResolveRetryCount { get; set; } = 1;
-    public int AutoDetailScanRetryCount { get; set; } = 1;
     
     [Newtonsoft.Json.JsonIgnore]
     private readonly object _uploadUrlsSync = new();
+    [Newtonsoft.Json.JsonIgnore]
+    private readonly object _saveSync = new();
     private ImmutableList<UploadUrl> _uploadUrls = DefaultUploadUrls();
 
     public ImmutableList<UploadUrl> UploadUrls {
@@ -58,25 +71,23 @@ public class Configuration : IPluginConfiguration {
     [Newtonsoft.Json.JsonConverter(typeof(DpapiProtectedStringJsonConverter))]
     public string TomestoneApiKey { get; set; } = string.Empty;
     public bool EnableTomestoneProgressEnrichment { get; set; } = false;
-    public int TomestoneRequestIntervalMs { get; set; } = 750;
-    public int TomestoneMaxConcurrency { get; set; } = 1;
+    public int TomestoneRequestIntervalMs { get; set; } = SafeMinTomestoneRequestIntervalMs;
+    public int TomestoneMaxConcurrency { get; set; } = SafeMaxTomestoneConcurrency;
+
+    [Newtonsoft.Json.JsonIgnore]
+    internal bool BypassTomestonePacingClampDebug { get; set; }
+
+    // Auto Scanner Speed & Retry Settings
+    public int AutoDetailScanActionIntervalMs { get; set; } = DefaultScanActionIntervalMs;
+    public int AutoDetailScanPostListingCooldownMs { get; set; } = DefaultScanPostListingCooldownMs;
+    public int AutoDetailScanDetailTimeoutMs { get; set; } = DefaultScanDetailTimeoutMs;
+    public int AutoDetailScanRetryCount { get; set; } = DefaultScanRetryCount;
 
     // Ingest security metadata
     public string IngestClientId { get; set; } = string.Empty;
 
     [Newtonsoft.Json.JsonConverter(typeof(DpapiProtectedStringJsonConverter))]
     public string IngestSharedSecret { get; set; } = "rpf-reborn-public-ingest-v1";
-
-    // Debug scanner: auto-open PF detail windows
-    public bool EnableAutoDetailScanDebug { get; set; } = false;
-    public bool EnableManualPageCollectionDebug { get; set; } = false;
-    public int AutoDetailScanActionIntervalMs { get; set; } = 400;
-    public int AutoDetailScanDetailTimeoutMs { get; set; } = 3500;
-    public int AutoDetailScanMinDwellMs { get; set; } = 800;
-    public int AutoDetailScanPostListingCooldownMs { get; set; } = 300;
-    public int AutoDetailScanDedupTtlSeconds { get; set; } = 600;
-    public int AutoDetailScanMaxConsecutiveFailures { get; set; } = 5;
-    public int AutoDetailScanMaxPerRun { get; set; } = 0;
     
     internal ImmutableList<UploadUrl> GetUploadUrlsSnapshot() {
         lock (_uploadUrlsSync) {
@@ -118,19 +129,15 @@ public class Configuration : IPluginConfiguration {
     }
 
     internal void ResetTomestoneAdvancedDefaults() {
-        TomestoneRequestIntervalMs = 750;
-        TomestoneMaxConcurrency = 1;
+        TomestoneRequestIntervalMs = SafeMinTomestoneRequestIntervalMs;
+        TomestoneMaxConcurrency = SafeMaxTomestoneConcurrency;
     }
 
     internal void ResetScannerDefaults() {
-        AutoDetailScanActionIntervalMs = 400;
-        AutoDetailScanDetailTimeoutMs = 3500;
-        AutoDetailScanMinDwellMs = 800;
-        AutoDetailScanPostListingCooldownMs = 300;
-        AutoDetailScanDedupTtlSeconds = 600;
-        AutoDetailScanMaxConsecutiveFailures = 5;
-        AutoDetailScanRetryCount = 1;
-        AutoDetailScanMaxPerRun = 0;
+        AutoDetailScanActionIntervalMs = DefaultScanActionIntervalMs;
+        AutoDetailScanPostListingCooldownMs = DefaultScanPostListingCooldownMs;
+        AutoDetailScanDetailTimeoutMs = DefaultScanDetailTimeoutMs;
+        AutoDetailScanRetryCount = DefaultScanRetryCount;
     }
 
     [System.Runtime.Serialization.OnDeserializing]
@@ -147,34 +154,39 @@ public class Configuration : IPluginConfiguration {
         new("http://127.0.0.1:8000") { IsDefault = true }
     ];
 
-    internal static int NormalizeTomestoneRequestIntervalMs(int configured)
-        => Math.Clamp(configured, 0, 60_000);
+    internal int GetEffectiveTomestoneRequestIntervalMs()
+        => NormalizeTomestoneRequestIntervalMs(TomestoneRequestIntervalMs, BypassTomestonePacingClampDebug);
 
-    internal static int NormalizeTomestoneMaxConcurrency(int configured)
-        => Math.Clamp(configured <= 0 ? 1 : configured, 1, 3);
+    internal int GetEffectiveTomestoneMaxConcurrency()
+        => NormalizeTomestoneMaxConcurrency(TomestoneMaxConcurrency, BypassTomestonePacingClampDebug);
+
+    internal static int NormalizeTomestoneRequestIntervalMs(int configured, bool bypassClamp = false)
+        => bypassClamp
+            ? Math.Clamp(configured, DebugMinTomestoneRequestIntervalMs, DebugMaxTomestoneRequestIntervalMs)
+            : Math.Clamp(configured, SafeMinTomestoneRequestIntervalMs, SafeMaxTomestoneRequestIntervalMs);
+
+    internal static int NormalizeTomestoneMaxConcurrency(int configured, bool bypassClamp = false) {
+        var positive = configured <= 0 ? 1 : configured;
+        return bypassClamp
+            ? Math.Clamp(positive, 1, DebugMaxTomestoneConcurrency)
+            : Math.Clamp(positive, 1, SafeMaxTomestoneConcurrency);
+    }
 
     internal static int NormalizeScanActionIntervalMs(int configured)
-        => Math.Clamp(configured, 100, 2_000);
+        => Math.Clamp(configured, 50, 2_000);
+
+    internal static int NormalizeScanPostCooldownMs(int configured)
+        => Math.Clamp(configured, 0, 2_000);
 
     internal static int NormalizeScanDetailTimeoutMs(int configured)
         => Math.Clamp(configured, 500, 10_000);
 
-    internal static int NormalizeScanMinDwellMs(int configured)
-        => Math.Clamp(configured, 100, 3_000);
-
-    internal static int NormalizeScanPostCooldownMs(int configured)
-        => Math.Clamp(configured, 50, 3_000);
-
-    internal static int NormalizeScanDedupTtlSeconds(int configured)
-        => Math.Clamp(configured, 30, 3_600);
-
-    internal static int NormalizeScanMaxFailures(int configured)
-        => Math.Max(configured, 1);
-
-    internal static int NormalizeScanMaxPerRun(int configured)
-        => Math.Max(configured, 0);
+    internal static int NormalizeScanRetryCount(int configured)
+        => Math.Clamp(configured, 0, 5);
 
     public void Save() {
-        Plugin.PluginInterface.SavePluginConfig(this);
+        lock (_saveSync) {
+            Plugin.PluginInterface.SavePluginConfig(this);
+        }
     }
 }

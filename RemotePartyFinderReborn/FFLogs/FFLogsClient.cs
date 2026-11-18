@@ -22,11 +22,13 @@ public class FFLogsClient : IDisposable
     private readonly Action<Exception, string> _exceptionLog;
     private readonly Action<ApiCredentialValidationState, string> _credentialStatusChanged;
     private readonly SemaphoreSlim _tokenLock = new(1, 1);
+    private readonly CancellationTokenSource _disposeCts = new();
     private string _accessToken = string.Empty;
     private string _tokenClientId = string.Empty;
     private string _tokenClientSecret = string.Empty;
     private DateTime _tokenExpiration;
     private readonly RateLimitCooldownState _rateLimitCooldown = new();
+    private int _disposed;
 
     private DateTime _lastGraphQlErrorLog = DateTime.MinValue;
     private string _lastGraphQlErrorMessage = string.Empty;
@@ -45,7 +47,7 @@ public class FFLogsClient : IDisposable
         Action<ApiCredentialValidationState, string> credentialStatusChanged)
         : this(
             configuration,
-            new HttpClient(),
+            PluginHttpClientFactory.CreateExternalApiClient(),
             static () => DateTime.UtcNow,
             message => Plugin.Log.Info(message),
             message => Plugin.Log.Warning(message),
@@ -66,7 +68,7 @@ public class FFLogsClient : IDisposable
         Action<ApiCredentialValidationState, string> credentialStatusChanged = null)
         : this(
             configuration,
-            new HttpClient(messageHandler),
+            PluginHttpClientFactory.CreateClient(messageHandler, disposeHandler: true, timeout: PluginHttpClientFactory.ExternalApiTimeout),
             utcNow ?? (static () => DateTime.UtcNow),
             infoLog ?? (static _ => { }),
             warningLog ?? (static _ => { }),
@@ -98,8 +100,22 @@ public class FFLogsClient : IDisposable
 
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            _disposeCts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+        }
+
         _httpClient.Dispose();
         _tokenLock.Dispose();
+        _disposeCts.Dispose();
     }
 
     public DateTime RateLimitCooldownUntilUtc
@@ -157,131 +173,181 @@ public class FFLogsClient : IDisposable
         string invalidatedToken = null,
         bool forceRefresh = false)
     {
-        await _tokenLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        if (Volatile.Read(ref _disposed) != 0)
+        {
+            return OperationOutcome<string>.Failure(false, "FFLogsClient is disposed.");
+        }
+
+        CancellationTokenSource linkedCts;
         try
         {
-            var clientId = _configuration.FFLogsClientId?.Trim() ?? string.Empty;
-            var clientSecret = _configuration.FFLogsClientSecret?.Trim() ?? string.Empty;
-            if (forceRefresh
-                || !string.Equals(_tokenClientId, clientId, StringComparison.Ordinal)
-                || !string.Equals(_tokenClientSecret, clientSecret, StringComparison.Ordinal))
-            {
-                _accessToken = string.Empty;
-                _tokenExpiration = DateTime.MinValue;
-                _tokenClientId = clientId;
-                _tokenClientSecret = clientSecret;
-            }
-            else if (!string.IsNullOrEmpty(invalidatedToken)
-                     && string.Equals(_accessToken, invalidatedToken, StringComparison.Ordinal))
-            {
-                _accessToken = string.Empty;
-                _tokenExpiration = DateTime.MinValue;
-            }
+            linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _disposeCts.Token);
+        }
+        catch (ObjectDisposedException)
+        {
+            return OperationOutcome<string>.Failure(false, "FFLogsClient is disposed.");
+        }
 
-            if (!string.IsNullOrEmpty(_accessToken) && _utcNow() < _tokenExpiration)
+        using (linkedCts)
+        {
+            var effectiveToken = linkedCts.Token;
+            var lockAcquired = false;
+            try
             {
-                return OperationOutcome<string>.Success(_accessToken);
+                await _tokenLock.WaitAsync(effectiveToken).ConfigureAwait(false);
+                lockAcquired = true;
             }
-
-            if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret))
+            catch (ObjectDisposedException) when (Volatile.Read(ref _disposed) != 0)
             {
-                ReportCredentialStatus(
-                    ApiCredentialValidationState.NotChecked,
-                    "Client ID and Client Secret are both required.");
-                return OperationOutcome<string>.Failure(false, "FFLogs credentials are not configured.");
+                return OperationOutcome<string>.Failure(false, "FFLogsClient is disposed.");
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && Volatile.Read(ref _disposed) != 0)
+            {
+                return OperationOutcome<string>.Failure(false, "FFLogsClient is disposed.");
             }
 
             try
             {
-                using var request = new HttpRequestMessage(HttpMethod.Post, TokenUrl);
-                var form = new Dictionary<string, string>
+                var clientId = _configuration.FFLogsClientId?.Trim() ?? string.Empty;
+                var clientSecret = _configuration.FFLogsClientSecret?.Trim() ?? string.Empty;
+                if (forceRefresh
+                    || !string.Equals(_tokenClientId, clientId, StringComparison.Ordinal)
+                    || !string.Equals(_tokenClientSecret, clientSecret, StringComparison.Ordinal))
                 {
-                    { "grant_type", "client_credentials" },
-                    { "client_id", clientId },
-                    { "client_secret", clientSecret }
-                };
-                request.Content = new FormUrlEncodedContent(form);
-
-                using var response = await _httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
-                if (!AreCredentialsUnchanged(clientId, clientSecret))
-                {
-                    if ((int)response.StatusCode == 429)
-                    {
-                        ActivateRateLimitCooldown("oauth token request");
-                    }
-
                     _accessToken = string.Empty;
                     _tokenExpiration = DateTime.MinValue;
-                    _tokenClientId = string.Empty;
-                    _tokenClientSecret = string.Empty;
-                    ReportCredentialStatus(
-                        ApiCredentialValidationState.NotChecked,
-                        "Credentials changed; waiting for the next FFLogs request.");
-                    return OperationOutcome<string>.Failure(false, "FFLogs credentials changed during verification.");
+                    _tokenClientId = clientId;
+                    _tokenClientSecret = clientSecret;
+                }
+                else if (!string.IsNullOrEmpty(invalidatedToken)
+                         && string.Equals(_accessToken, invalidatedToken, StringComparison.Ordinal))
+                {
+                    _accessToken = string.Empty;
+                    _tokenExpiration = DateTime.MinValue;
                 }
 
-                if (!response.IsSuccessStatusCode)
+                if (!string.IsNullOrEmpty(_accessToken) && _utcNow() < _tokenExpiration)
                 {
-                    var transientFailure = IsTransientStatusCode(response.StatusCode);
-                    ReportCredentialStatus(
-                        IsOAuthCredentialsRejected(response.StatusCode)
-                            ? ApiCredentialValidationState.Rejected
-                            : ApiCredentialValidationState.RequestFailed,
-                        IsOAuthCredentialsRejected(response.StatusCode)
-                            ? $"FFLogs rejected the Client ID/Secret (HTTP {(int)response.StatusCode})."
-                            : $"FFLogs authentication request failed (HTTP {(int)response.StatusCode}).");
-                    if ((int)response.StatusCode == 429)
-                    {
-                        ActivateRateLimitCooldown("oauth token request");
-                        transientFailure = true;
-                    }
-
-                    _errorLog($"FFLogs OAuth request failed: {response.StatusCode}");
-                    return OperationOutcome<string>.Failure(
-                        transientFailure,
-                        $"FFLogs OAuth request failed: {response.StatusCode}");
-                }
-
-                var content = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-                var json = JObject.Parse(content);
-
-                _accessToken = json["access_token"]?.ToString() ?? string.Empty;
-                var expiresIn = json["expires_in"]?.ToObject<int>() ?? 0;
-                _tokenExpiration = _utcNow().AddSeconds(expiresIn - 60); // Buffer 60s
-
-                if (!string.IsNullOrEmpty(_accessToken))
-                {
-                    ReportCredentialStatus(ApiCredentialValidationState.Accepted, "FFLogs accepted the credentials.");
                     return OperationOutcome<string>.Success(_accessToken);
                 }
 
-                ReportCredentialStatus(ApiCredentialValidationState.RequestFailed, "FFLogs response did not include an access token.");
-                return OperationOutcome<string>.Failure(false, "FFLogs OAuth response did not include an access token.");
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                if (AreCredentialsUnchanged(clientId, clientSecret))
+                if (string.IsNullOrWhiteSpace(clientId) || string.IsNullOrWhiteSpace(clientSecret))
                 {
-                    ReportCredentialStatus(ApiCredentialValidationState.RequestFailed, "Could not reach FFLogs to check the credentials.");
+                    ReportCredentialStatus(
+                        ApiCredentialValidationState.NotChecked,
+                        "Client ID and Client Secret are both required.");
+                    return OperationOutcome<string>.Failure(false, "FFLogs credentials are not configured.");
                 }
-                else
+
+                try
                 {
-                    _accessToken = string.Empty;
-                    _tokenExpiration = DateTime.MinValue;
-                    _tokenClientId = string.Empty;
-                    _tokenClientSecret = string.Empty;
+                    using var request = new HttpRequestMessage(HttpMethod.Post, TokenUrl);
+                    var form = new Dictionary<string, string>
+                    {
+                        { "grant_type", "client_credentials" },
+                        { "client_id", clientId },
+                        { "client_secret", clientSecret }
+                    };
+                    request.Content = new FormUrlEncodedContent(form);
+
+                    using var response = await _httpClient.SendAsync(request, effectiveToken).ConfigureAwait(false);
+                    if (!AreCredentialsUnchanged(clientId, clientSecret))
+                    {
+                        if ((int)response.StatusCode == 429)
+                        {
+                            ActivateRateLimitCooldown("oauth token request");
+                        }
+
+                        _accessToken = string.Empty;
+                        _tokenExpiration = DateTime.MinValue;
+                        _tokenClientId = string.Empty;
+                        _tokenClientSecret = string.Empty;
+                        ReportCredentialStatus(
+                            ApiCredentialValidationState.NotChecked,
+                            "Credentials changed; waiting for the next FFLogs request.");
+                        return OperationOutcome<string>.Failure(false, "FFLogs credentials changed during verification.");
+                    }
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        var transientFailure = IsTransientStatusCode(response.StatusCode);
+                        ReportCredentialStatus(
+                            IsOAuthCredentialsRejected(response.StatusCode)
+                                ? ApiCredentialValidationState.Rejected
+                                : ApiCredentialValidationState.RequestFailed,
+                            IsOAuthCredentialsRejected(response.StatusCode)
+                                ? $"FFLogs rejected the Client ID/Secret (HTTP {(int)response.StatusCode})."
+                                : $"FFLogs authentication request failed (HTTP {(int)response.StatusCode}).");
+                        if ((int)response.StatusCode == 429)
+                        {
+                            ActivateRateLimitCooldown("oauth token request");
+                            transientFailure = true;
+                        }
+
+                        _errorLog($"FFLogs OAuth request failed: {response.StatusCode}");
+                        return OperationOutcome<string>.Failure(
+                            transientFailure,
+                            $"FFLogs OAuth request failed: {response.StatusCode}");
+                    }
+
+                    var content = await response.Content.ReadAsStringAsync(effectiveToken).ConfigureAwait(false);
+                    var json = JObject.Parse(content);
+
+                    _accessToken = json["access_token"]?.ToString() ?? string.Empty;
+                    var expiresIn = json["expires_in"]?.ToObject<int>() ?? 0;
+                    _tokenExpiration = _utcNow().AddSeconds(expiresIn - 60); // Buffer 60s
+
+                    if (!string.IsNullOrEmpty(_accessToken))
+                    {
+                        ReportCredentialStatus(ApiCredentialValidationState.Accepted, "FFLogs accepted the credentials.");
+                        return OperationOutcome<string>.Success(_accessToken);
+                    }
+
+                    ReportCredentialStatus(ApiCredentialValidationState.RequestFailed, "FFLogs response did not include an access token.");
+                    return OperationOutcome<string>.Failure(false, "FFLogs OAuth response did not include an access token.");
                 }
-                _exceptionLog(ex, "Failed to authenticate with FFLogs.");
-                return OperationOutcome<string>.Failure(true, ex.Message);
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (OperationCanceledException) when (Volatile.Read(ref _disposed) != 0)
+                {
+                    return OperationOutcome<string>.Failure(false, "FFLogsClient is disposed.");
+                }
+                catch (ObjectDisposedException) when (Volatile.Read(ref _disposed) != 0)
+                {
+                    return OperationOutcome<string>.Failure(false, "FFLogsClient is disposed.");
+                }
+                catch (Exception ex)
+                {
+                    if (AreCredentialsUnchanged(clientId, clientSecret))
+                    {
+                        ReportCredentialStatus(ApiCredentialValidationState.RequestFailed, "Could not reach FFLogs to check the credentials.");
+                    }
+                    else
+                    {
+                        _accessToken = string.Empty;
+                        _tokenExpiration = DateTime.MinValue;
+                        _tokenClientId = string.Empty;
+                        _tokenClientSecret = string.Empty;
+                    }
+                    _exceptionLog(ex, "Failed to authenticate with FFLogs.");
+                    return OperationOutcome<string>.Failure(true, ex.Message);
+                }
             }
-        }
-        finally
-        {
-            _tokenLock.Release();
+            finally
+            {
+                if (lockAcquired)
+                {
+                    try
+                    {
+                        _tokenLock.Release();
+                    }
+                    catch (ObjectDisposedException) when (Volatile.Read(ref _disposed) != 0)
+                    {
+                    }
+                }
+            }
         }
     }
 
@@ -428,6 +494,8 @@ public class FFLogsClient : IDisposable
         return outcome.Succeeded ? outcome.Value ?? [] : [];
     }
 
+    internal TimeSpan CandidateChunkDelay { get; init; } = TimeSpan.FromMilliseconds(250);
+
     internal async Task<OperationOutcome<Dictionary<string, CharacterFetchedData>>> FetchCharacterCandidateDataBatchOutcomeAsync(
         List<CandidateCharacterQuery> candidates,
         int zoneId,
@@ -444,6 +512,11 @@ public class FFLogsClient : IDisposable
 
         for (var offset = 0; offset < candidates.Count; offset += chunkSize)
         {
+            if (offset > 0 && CandidateChunkDelay > TimeSpan.Zero)
+            {
+                await Task.Delay(CandidateChunkDelay, cancellationToken).ConfigureAwait(false);
+            }
+
             var chunk = candidates.Skip(offset).Take(chunkSize).ToList();
 
             var query = FFLogsQueryBuilder.BuildCharacterCandidateDataBatchQuery(

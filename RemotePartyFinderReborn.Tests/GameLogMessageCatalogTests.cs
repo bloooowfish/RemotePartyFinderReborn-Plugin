@@ -88,6 +88,28 @@ public sealed class GameLogMessageCatalogTests {
         Assert.Empty(candidates);
     }
 
+    [Fact]
+    public void Resolve_chara_card_failure_texts_loads_trimmed_ordinal_texts_for_known_ids() {
+        var lookup = new FakeLogMessageLookup([
+            new LogMessageInfo(5854, "Should not be included"),
+            new LogMessageInfo(5855, "  Plate unavailable.  "),
+            new LogMessageInfo(5856, "Plate not configured."),
+            new LogMessageInfo(5857, "   "),
+            new LogMessageInfo(5860, "Data center unreachable."),
+            new LogMessageInfo(5861, "Should also not be included"),
+        ]);
+
+        var texts = GameLogMessageCatalog.ResolveCharaCardFailureTexts(lookup);
+
+        Assert.Equal(3, texts.Count);
+        Assert.Contains("Plate unavailable.", texts);
+        Assert.Contains("Plate not configured.", texts);
+        Assert.Contains("Data center unreachable.", texts);
+        Assert.DoesNotContain("Should not be included", texts);
+        Assert.DoesNotContain("Should also not be included", texts);
+        Assert.DoesNotContain("plate unavailable.", texts);
+    }
+
     private sealed class FakeLogMessageLookup(IEnumerable<LogMessageInfo> messages) : ILogMessageLookup {
         private readonly IReadOnlyDictionary<uint, LogMessageInfo> _messages = messages.ToDictionary(message => message.Id);
 

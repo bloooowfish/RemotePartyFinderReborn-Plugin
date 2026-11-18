@@ -13,6 +13,7 @@ namespace RemotePartyFinderReborn;
 
 internal sealed class PartyDetailCollector : IDisposable {
     private static readonly TimeSpan UploadPumpInterval = TimeSpan.FromMilliseconds(150);
+    private static readonly TimeSpan ShutdownWaitTimeout = TimeSpan.FromSeconds(2);
 
     private readonly Plugin? _plugin;
     private readonly Configuration? _configuration;
@@ -26,6 +27,12 @@ internal sealed class PartyDetailCollector : IDisposable {
     private readonly PartyDetailUploadExecutor? _uploadExecutor;
     private readonly Stopwatch _uploadPumpTimer = new();
     private readonly PendingDetailQueue _pendingDetailQueue = new();
+    private readonly CancellationTokenSource _disposeCts = new();
+    private readonly object _activeTasksLock = new();
+    private readonly HashSet<Task> _activeUploadTasks = new();
+
+    private int _shutdownSignaled;
+    private int _disposed;
 
     private uint _lastQueuedListingId;
     private long _lastQueuedAckVersion;
@@ -67,7 +74,7 @@ internal sealed class PartyDetailCollector : IDisposable {
         _captureState = captureState ?? throw new ArgumentNullException(nameof(captureState));
         _tryQueueArrival = TryQueueArrivalCore;
         _pumpPendingUploads = PumpUploadQueue;
-        _httpClient = httpClient ?? new HttpClient();
+        _httpClient = httpClient ?? PluginHttpClientFactory.CreateIngestClient();
         _ownsHttpClient = httpClient is null;
         _utcNow = utcNow ?? (static () => DateTime.UtcNow);
         _nextJitterMs = nextJitterMs ?? (static (min, max) => Random.Shared.Next(min, max));
@@ -87,7 +94,7 @@ internal sealed class PartyDetailCollector : IDisposable {
         _captureState = captureState ?? throw new ArgumentNullException(nameof(captureState));
         _tryQueueArrival = TryQueueArrivalCore;
         _pumpPendingUploads = PumpUploadQueue;
-        _httpClient = httpClient ?? new HttpClient();
+        _httpClient = httpClient ?? PluginHttpClientFactory.CreateIngestClient();
         _ownsHttpClient = httpClient is null;
         _utcNow = utcNow ?? (static () => DateTime.UtcNow);
         _nextJitterMs = nextJitterMs ?? (static (min, max) => Random.Shared.Next(min, max));
@@ -107,11 +114,22 @@ internal sealed class PartyDetailCollector : IDisposable {
         ArgumentNullException.ThrowIfNull(tryQueuePayload);
         _tryQueueArrival = arrival => tryQueuePayload(arrival.Payload);
         _pumpPendingUploads = pumpPendingUploads ?? throw new ArgumentNullException(nameof(pumpPendingUploads));
-        _httpClient = httpClient ?? new HttpClient();
+        _httpClient = httpClient ?? PluginHttpClientFactory.CreateIngestClient();
         _ownsHttpClient = httpClient is null;
         _utcNow = utcNow ?? (static () => DateTime.UtcNow);
         _nextJitterMs = nextJitterMs ?? (static (min, max) => Random.Shared.Next(min, max));
         _uploadPumpTimer.Start();
+    }
+
+    internal void BeginShutdown() {
+        if (Interlocked.Exchange(ref _shutdownSignaled, 1) != 0) {
+            return;
+        }
+
+        try {
+            _disposeCts.Cancel();
+        } catch (ObjectDisposedException) {
+        }
     }
 
     public void Dispose() {
@@ -119,6 +137,24 @@ internal sealed class PartyDetailCollector : IDisposable {
             DetachFrameworkUpdateHandler(_plugin);
         }
 
+        BeginShutdown();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) {
+            return;
+        }
+
+        Task[] activeTasks;
+        lock (_activeTasksLock) {
+            activeTasks = _activeUploadTasks.ToArray();
+        }
+
+        if (activeTasks.Length > 0) {
+            try {
+                Task.WhenAll(activeTasks).Wait(ShutdownWaitTimeout);
+            } catch (Exception) {
+            }
+        }
+
+        _disposeCts.Dispose();
         if (_ownsHttpClient) {
             _httpClient.Dispose();
         }
@@ -143,19 +179,17 @@ internal sealed class PartyDetailCollector : IDisposable {
     }
 
     private void TryCapturePendingGeneration() {
-        if (!_captureState.TryGetNextUnconsumedArrival(out var arrival)) {
-            return;
-        }
+        while (_captureState.TryGetNextUnconsumedArrival(out var arrival)) {
+            if (!PartyDetailUploadPolicy.IsSnapshotReadyForEnqueue(arrival.Payload)) {
+                break;
+            }
 
-        if (!PartyDetailUploadPolicy.IsSnapshotReadyForEnqueue(arrival.Payload)) {
-            return;
-        }
+            if (!_tryQueueArrival(arrival)) {
+                break;
+            }
 
-        if (!_tryQueueArrival(arrival)) {
-            return;
+            _captureState.TryMarkConsumed(arrival.Generation);
         }
-
-        _captureState.TryMarkConsumed(arrival.Generation);
     }
 
     private bool TryQueueArrivalCore(PartyDetailPendingArrival arrival) {
@@ -163,7 +197,7 @@ internal sealed class PartyDetailCollector : IDisposable {
     }
 
     private bool TryQueuePayloadCore(UploadablePartyDetail payload, PartyDetailRequestOwner owner) {
-        var fingerprint = PartyDetailUploadPolicy.ComputeFingerprint(payload.MemberContentIds, payload.MemberJobs, payload.SlotFlags);
+        var fingerprint = PartyDetailUploadPolicy.ComputeFingerprint(payload);
         var nowUtc = _utcNow();
 
         LogDebug(
@@ -189,11 +223,19 @@ internal sealed class PartyDetailCollector : IDisposable {
     }
 
     private void StartDueUploads(DateTime nowUtc) {
+        if (_shutdownSignaled != 0) {
+            return;
+        }
+
         _pendingDetailQueue.PruneExpiredManualEntries(nowUtc, TimeSpan.FromMinutes(1));
         _captureState.PruneExpiredManualRequests();
+        if (!HasAnyAttemptableTarget(nowUtc)) {
+            return;
+        }
+
         var maxConcurrency = PartyDetailUploadPolicy.NormalizeDetailUploadConcurrency(_configuration?.DetailUploadMaxConcurrency ?? 1);
         var batchSize = PartyDetailUploadPolicy.NormalizeDetailUploadBatchSize(_configuration?.DetailUploadBatchSize ?? 1);
-        while (Volatile.Read(ref _activeUploadWorkers) < maxConcurrency) {
+        while (_shutdownSignaled == 0 && Volatile.Read(ref _activeUploadWorkers) < maxConcurrency) {
 #if DEBUG
             var pendingQueueUnits = _pendingDetailQueue.Count;
             var queueStartedAt = DebugPerformanceDiagnostics.Begin();
@@ -210,8 +252,13 @@ internal sealed class PartyDetailCollector : IDisposable {
                 return;
             }
 
+            if (!TryGetDisposeToken(out var cancellationToken)) {
+                _pendingDetailQueue.ReleaseInFlight(nextBatch);
+                return;
+            }
+
             Interlocked.Increment(ref _activeUploadWorkers);
-            _ = ProcessQueuedBatchAsync(nextBatch);
+            TrackUploadTask(ProcessQueuedBatchAsync(nextBatch, cancellationToken));
         }
     }
 
@@ -241,18 +288,22 @@ internal sealed class PartyDetailCollector : IDisposable {
         );
     }
 
-    private Task ProcessQueuedBatchAsync(IReadOnlyList<PendingDetailEntry> pendingBatch) {
+    private Task ProcessQueuedBatchAsync(
+        IReadOnlyList<PendingDetailEntry> pendingBatch,
+        CancellationToken cancellationToken
+    ) {
         return Task.Run(async () => {
             try {
                 var uploadExecutor = _uploadExecutor
                     ?? throw new InvalidOperationException("Detail uploads require collector configuration.");
-                var uploadOutcomes = await uploadExecutor.UploadBatchToAllTargetsAsync(pendingBatch);
+                var uploadOutcomes = await uploadExecutor.UploadBatchToAllTargetsAsync(pendingBatch, cancellationToken);
                 foreach (var pending in pendingBatch) {
                     var uploadOutcome = uploadOutcomes.TryGetValue(pending.Detail.ListingId, out var outcome)
                         ? outcome
                         : new DetailUploadOutcome(DetailUploadResult.RetryableFailure);
                     ApplyUploadOutcome(pending, uploadOutcome);
                 }
+            } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
             } catch (Exception exception) {
                 LogError($"PartyDetailCollector upload error: {exception.Message}");
                 foreach (var pending in pendingBatch) {
@@ -266,59 +317,111 @@ internal sealed class PartyDetailCollector : IDisposable {
         });
     }
 
+    private bool TryGetDisposeToken(out CancellationToken cancellationToken) {
+        if (_shutdownSignaled != 0) {
+            cancellationToken = default;
+            return false;
+        }
+
+        try {
+            cancellationToken = _disposeCts.Token;
+            return !cancellationToken.IsCancellationRequested;
+        } catch (ObjectDisposedException) {
+            cancellationToken = default;
+            return false;
+        }
+    }
+
+    private Task TrackUploadTask(Task uploadTask) {
+        if (uploadTask.IsCompleted) {
+            return uploadTask;
+        }
+
+        lock (_activeTasksLock) {
+            _activeUploadTasks.Add(uploadTask);
+        }
+
+        _ = uploadTask.ContinueWith(
+            static (completed, state) => {
+                var owner = (PartyDetailCollector)state!;
+                lock (owner._activeTasksLock) {
+                    owner._activeUploadTasks.Remove(completed);
+                }
+            },
+            this,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default
+        );
+
+        return uploadTask;
+    }
+
     private void ApplyUploadOutcome(PendingDetailEntry pending, DetailUploadOutcome uploadOutcome) {
         switch (uploadOutcome.Result) {
             case DetailUploadResult.Applied:
                 _pendingDetailQueue.RemoveIfUnchanged(pending);
-                var successAt = _utcNow();
-                Interlocked.Exchange(ref _lastSuccessfulUploadAtUtcTicks, successAt.Ticks);
-                _lastSuccessfulUploadListingId = pending.Detail.ListingId;
-                Interlocked.Increment(ref _lastSuccessfulUploadAckVersion);
+                RecordSuccessfulUpload(pending.Detail.ListingId);
+                break;
+
+            case DetailUploadResult.TerminalRejected:
+                _pendingDetailQueue.RemoveIfUnchanged(pending);
+                RecordTerminalUpload(pending.Detail.ListingId);
+                LogWarning($"PartyDetailCollector: listing {pending.Detail.ListingId} detail rejected by server; {uploadOutcome.Message}");
                 break;
 
             case DetailUploadResult.ListingMissing:
-            case DetailUploadResult.TerminalRejected:
-                _pendingDetailQueue.RemoveIfUnchanged(pending);
-                var terminalAt = _utcNow();
-                Interlocked.Exchange(ref _lastTerminalUploadAtUtcTicks, terminalAt.Ticks);
-                _lastTerminalUploadListingId = pending.Detail.ListingId;
-                Interlocked.Increment(ref _lastTerminalUploadAckVersion);
-                if (uploadOutcome.Result == DetailUploadResult.TerminalRejected) {
-                    LogWarning($"PartyDetailCollector: listing {pending.Detail.ListingId} detail rejected by server; {uploadOutcome.Message}");
-                } else {
-                    LogDebug($"PartyDetailCollector: listing {pending.Detail.ListingId} missing on server while applying detail update; dropping queued detail payload.");
-                }
+            case DetailUploadResult.Deferred:
+                ScheduleDeferredBackoff(pending, uploadOutcome);
                 break;
 
-            case DetailUploadResult.Deferred:
-                if (DropManualBestEffortDetail(pending, uploadOutcome.Result)) {
-                    break;
-                }
-
-                ScheduleDeferredBackoff(pending);
+            case DetailUploadResult.CircuitBlocked:
+                ScheduleCircuitBlockedBackoff(pending, uploadOutcome);
                 break;
 
             default:
-                if (DropManualBestEffortDetail(pending, uploadOutcome.Result)) {
+                if (DropManualBestEffortDetail(pending, uploadOutcome)) {
                     break;
                 }
 
-                ScheduleRetry(pending, uploadOutcome.RetryAfterSeconds);
+                ScheduleRetry(pending, uploadOutcome);
                 break;
         }
     }
 
-    private bool DropManualBestEffortDetail(PendingDetailEntry pending, DetailUploadResult result) {
+    private void RecordSuccessfulUpload(uint listingId) {
+        var successAt = _utcNow();
+        Interlocked.Exchange(ref _lastSuccessfulUploadAtUtcTicks, successAt.Ticks);
+        _lastSuccessfulUploadListingId = listingId;
+        Interlocked.Increment(ref _lastSuccessfulUploadAckVersion);
+    }
+
+    private void RecordTerminalUpload(uint listingId) {
+        var terminalAt = _utcNow();
+        Interlocked.Exchange(ref _lastTerminalUploadAtUtcTicks, terminalAt.Ticks);
+        _lastTerminalUploadListingId = listingId;
+        Interlocked.Increment(ref _lastTerminalUploadAckVersion);
+    }
+
+    private bool DropManualBestEffortDetail(PendingDetailEntry pending, DetailUploadOutcome uploadOutcome) {
         if (pending.Owner != PartyDetailRequestOwner.Manual) {
             return false;
         }
 
         _pendingDetailQueue.RemoveIfUnchanged(pending);
-        LogDebug($"PartyDetailCollector: dropping manual detail payload listing={pending.Detail.ListingId} after {result}; manual captures are best-effort and are not kept in the retry queue.");
+        if (pending.HasAppliedTarget || uploadOutcome.HasAppliedTarget) {
+            RecordSuccessfulUpload(pending.Detail.ListingId);
+        }
+
+        LogDebug($"PartyDetailCollector: dropping manual detail payload listing={pending.Detail.ListingId} after {uploadOutcome.Result}; manual captures are best-effort and are not kept in the retry queue.");
         return true;
     }
 
     private void ScheduleRetry(PendingDetailEntry pending, int? retryAfterSeconds) {
+        ScheduleRetry(pending, new DetailUploadOutcome(DetailUploadResult.RetryableFailure, retryAfterSeconds));
+    }
+
+    private void ScheduleRetry(PendingDetailEntry pending, DetailUploadOutcome uploadOutcome) {
         var configuration = _configuration ?? throw new InvalidOperationException("Retry scheduling requires collector configuration.");
         if (!_pendingDetailQueue.TryGet(pending.Detail.ListingId, out var current)) {
             return;
@@ -328,20 +431,24 @@ internal sealed class PartyDetailCollector : IDisposable {
             return;
         }
 
+        var merged = MergeOutcomeProgress(current, uploadOutcome);
         var configuredRetryCount = PartyDetailUploadPolicy.NormalizeRetryCount(configuration.DetailUploadRetryCount);
         if (PartyDetailUploadPolicy.ShouldDropPendingDetail(current.AttemptCount, configuredRetryCount)) {
             _pendingDetailQueue.RemoveIfUnchanged(pending);
+            if (merged.HasAppliedTarget) {
+                RecordSuccessfulUpload(pending.Detail.ListingId);
+            }
             LogWarning($"PartyDetailCollector: dropping detail payload listing={pending.Detail.ListingId} after {current.AttemptCount} retries");
             return;
         }
 
         var nextAttemptCount = current.AttemptCount + 1;
-        var updated = current with {
+        var updated = merged with {
             AttemptCount = nextAttemptCount,
             NextAttemptAtUtc = PartyDetailUploadPolicy.ComputeNextAttemptAtUtc(
                 _utcNow(),
                 nextAttemptCount,
-                retryAfterSeconds,
+                uploadOutcome.RetryAfterSeconds,
                 _nextJitterMs
             ),
         };
@@ -349,7 +456,7 @@ internal sealed class PartyDetailCollector : IDisposable {
         _pendingDetailQueue.TryUpdate(current, updated);
     }
 
-    private void ScheduleDeferredBackoff(PendingDetailEntry pending) {
+    private void ScheduleDeferredBackoff(PendingDetailEntry pending, DetailUploadOutcome uploadOutcome) {
         if (!_pendingDetailQueue.TryGet(pending.Detail.ListingId, out var current)) {
             return;
         }
@@ -358,8 +465,23 @@ internal sealed class PartyDetailCollector : IDisposable {
             return;
         }
 
+        var merged = MergeOutcomeProgress(current, uploadOutcome);
+        var configuredRetryCount = _configuration?.DetailUploadRetryCount ?? 0;
+        if (PartyDetailUploadPolicy.ShouldDropDeferredPendingDetail(current.DeferredCount, configuredRetryCount)) {
+            _pendingDetailQueue.RemoveIfUnchanged(pending);
+            if (merged.HasAppliedTarget) {
+                RecordSuccessfulUpload(pending.Detail.ListingId);
+            } else if (uploadOutcome.Result == DetailUploadResult.ListingMissing) {
+                RecordTerminalUpload(pending.Detail.ListingId);
+                LogDebug($"PartyDetailCollector: listing {pending.Detail.ListingId} missing on server after {current.DeferredCount} deferral(s); dropping queued detail payload.");
+            } else {
+                LogWarning($"PartyDetailCollector: dropping detail payload listing={pending.Detail.ListingId} after {current.DeferredCount} deferrals ({uploadOutcome.Result})");
+            }
+            return;
+        }
+
         var nextDeferredCount = current.DeferredCount + 1;
-        var updated = current with {
+        var updated = merged with {
             DeferredCount = nextDeferredCount,
             NextAttemptAtUtc = PartyDetailUploadPolicy.ComputeDeferredNextAttemptAtUtc(
                 _utcNow(),
@@ -371,6 +493,88 @@ internal sealed class PartyDetailCollector : IDisposable {
         _pendingDetailQueue.TryUpdate(current, updated);
     }
 
+    private void ScheduleCircuitBlockedBackoff(PendingDetailEntry pending, DetailUploadOutcome uploadOutcome) {
+        if (!_pendingDetailQueue.TryGet(pending.Detail.ListingId, out var current)) {
+            return;
+        }
+
+        if (current.Fingerprint != pending.Fingerprint) {
+            return;
+        }
+
+        var merged = MergeOutcomeProgress(current, uploadOutcome);
+        var nowUtc = _utcNow();
+        var minRemaining = GetMinRemainingBreakDuration(merged, nowUtc);
+        var updated = merged with {
+            NextAttemptAtUtc = PartyDetailUploadPolicy.ComputeCircuitBlockedNextAttemptAtUtc(
+                nowUtc,
+                minRemaining,
+                _nextJitterMs
+            ),
+        };
+
+        _pendingDetailQueue.TryUpdate(current, updated);
+    }
+
+    private static PendingDetailEntry MergeOutcomeProgress(PendingDetailEntry current, DetailUploadOutcome uploadOutcome) {
+        var resolvedIds = current.ResolvedTargetIds;
+        if (uploadOutcome.ResolvedTargetIds is { Count: > 0 } newlyResolved) {
+            resolvedIds = current.SafeResolvedTargetIds.Union(newlyResolved);
+        }
+
+        var hasAppliedTarget = current.HasAppliedTarget || uploadOutcome.HasAppliedTarget;
+        if (ReferenceEquals(resolvedIds, current.ResolvedTargetIds) && hasAppliedTarget == current.HasAppliedTarget) {
+            return current;
+        }
+
+        return current with {
+            ResolvedTargetIds = resolvedIds,
+            HasAppliedTarget = hasAppliedTarget,
+        };
+    }
+
+    private TimeSpan? GetMinRemainingBreakDuration(PendingDetailEntry entry, DateTime nowUtc) {
+        if (_configuration is null) {
+            return null;
+        }
+
+        TimeSpan? minRemaining = null;
+        foreach (var target in _configuration.GetUploadUrlsSnapshot()) {
+            if (!target.IsEnabled || entry.IsTargetResolved(target.Id)) {
+                continue;
+            }
+
+            if (!IngestEndpointResolver.IsValidUploadUrl(target.Url, out _)) {
+                continue;
+            }
+
+            var remaining = UploadAttemptRecorder.GetCircuitStatus(target, _configuration, nowUtc).RemainingBreakDuration;
+            if (!minRemaining.HasValue || remaining < minRemaining.Value) {
+                minRemaining = remaining;
+            }
+        }
+
+        return minRemaining;
+    }
+
+    private bool HasAnyAttemptableTarget(DateTime nowUtc) {
+        if (_configuration is null) {
+            return true;
+        }
+
+        foreach (var target in _configuration.GetUploadUrlsSnapshot()) {
+            if (!target.IsEnabled || !IngestEndpointResolver.IsValidUploadUrl(target.Url, out _)) {
+                continue;
+            }
+
+            if (!UploadAttemptRecorder.PeekIsCircuitOpen(target, _configuration, nowUtc)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     internal void EnqueuePendingDetailForTesting(
         UploadablePartyDetail payload,
         DateTime nowUtc,
@@ -378,7 +582,7 @@ internal sealed class PartyDetailCollector : IDisposable {
     ) {
         _pendingDetailQueue.Enqueue(
             payload,
-            PartyDetailUploadPolicy.ComputeFingerprint(payload.MemberContentIds, payload.MemberJobs, payload.SlotFlags),
+            PartyDetailUploadPolicy.ComputeFingerprint(payload),
             nowUtc,
             owner
         );
@@ -391,8 +595,13 @@ internal sealed class PartyDetailCollector : IDisposable {
             return Task.CompletedTask;
         }
 
+        if (!TryGetDisposeToken(out var cancellationToken)) {
+            _pendingDetailQueue.ReleaseInFlight(nextBatch);
+            return Task.CompletedTask;
+        }
+
         Interlocked.Increment(ref _activeUploadWorkers);
-        return ProcessQueuedBatchAsync(nextBatch);
+        return TrackUploadTask(ProcessQueuedBatchAsync(nextBatch, cancellationToken));
     }
 
     internal void PumpDueUploadsForTesting() {
@@ -425,7 +634,7 @@ internal sealed class PartyDetailCollector : IDisposable {
 
         if (_configuration is not null) {
             openCircuitTargets = enabledTargets.Count(target =>
-                UploadAttemptRecorder.IsCircuitOpen(target, _configuration, nowUtc));
+                UploadAttemptRecorder.PeekIsCircuitOpen(target, _configuration, nowUtc));
         }
 
         foreach (var pending in pendingEntries) {
@@ -447,7 +656,11 @@ internal sealed class PartyDetailCollector : IDisposable {
             var hasAvailableTarget = false;
             var hasCapabilityEligibleTarget = false;
             foreach (var target in enabledTargets) {
-                if (UploadAttemptRecorder.IsCircuitOpen(target, _configuration, nowUtc)) {
+                if (pending.IsTargetResolved(target.Id)) {
+                    continue;
+                }
+
+                if (UploadAttemptRecorder.PeekIsCircuitOpen(target, _configuration, nowUtc)) {
                     continue;
                 }
 
@@ -487,12 +700,13 @@ internal sealed class PartyDetailCollector : IDisposable {
             return null;
         }
 
-        return new PendingDetailDebugState(pending.AttemptCount, pending.NextAttemptAtUtc);
+        return new PendingDetailDebugState(pending.AttemptCount, pending.NextAttemptAtUtc, pending.DeferredCount);
     }
 
     internal readonly record struct PendingDetailDebugState(
         int AttemptCount,
-        DateTime NextAttemptAtUtc
+        DateTime NextAttemptAtUtc,
+        int DeferredCount = 0
     );
 
     private static void LogDebug(string message) {

@@ -52,24 +52,35 @@ internal static class DpapiSecretProtector {
     }
 
     internal static string Protect(string? plaintext) {
+        return ProtectCore(
+            plaintext,
+            OperatingSystem.IsWindows(),
+            static bytes => ProtectedData.Protect(bytes, OptionalEntropy, DataProtectionScope.CurrentUser));
+    }
+
+    internal static string ProtectCore(
+        string? plaintext,
+        bool isWindows,
+        Func<byte[], byte[]> protectBytes) {
         if (string.IsNullOrEmpty(plaintext)) {
             return string.Empty;
         }
 
-        if (!OperatingSystem.IsWindows()) {
-            return plaintext;
+        if (!isWindows) {
+            TryLogWarning("DPAPI secret protection is unavailable on this platform; secret will not be saved in plaintext.");
+            return string.Empty;
         }
 
         try {
             var plaintextBytes = Encoding.UTF8.GetBytes(plaintext);
-            var protectedBytes = ProtectedData.Protect(plaintextBytes, OptionalEntropy, DataProtectionScope.CurrentUser);
+            var protectedBytes = protectBytes(plaintextBytes);
             return string.Concat(ProtectedPrefix, Convert.ToBase64String(protectedBytes));
         } catch (CryptographicException ex) {
             TryLogWarning($"Failed to protect configuration secret with DPAPI: {ex.Message}");
-            return plaintext;
+            return string.Empty;
         } catch (PlatformNotSupportedException ex) {
             TryLogWarning($"DPAPI secret protection is not supported on this platform: {ex.Message}");
-            return plaintext;
+            return string.Empty;
         }
     }
 

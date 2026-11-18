@@ -794,7 +794,9 @@ public sealed class CharaCardResolverRuntimeTests {
         runtime.Deliver(new CharaCardPacketModel(2525UL, 0, string.Empty));
 
         Assert.False(addonLifecycle.Deliver("SelectOk.PreSetup"));
-        Assert.True(addonLifecycle.Deliver("Toast.Quest"));
+        Assert.False(addonLifecycle.Deliver("Toast.Normal"));
+        Assert.False(addonLifecycle.Deliver("Toast.Quest"));
+        Assert.True(addonLifecycle.Deliver("Toast.Error"));
         Assert.True(addonLifecycle.Deliver("ChatLog.5856"));
     }
 
@@ -1149,6 +1151,222 @@ public sealed class CharaCardResolverRuntimeTests {
         );
     }
 
+    [Fact]
+    public void Pump_enforces_dispatch_cooldown_with_jitter_after_successful_dispatch() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        var nowUtc = new DateTime(2026, 4, 13, 10, 15, 0, DateTimeKind.Utc);
+        var runtime = new FakeCharaCardResolverRuntime();
+        using var resolver = new CharaCardResolver(
+            database,
+            runtime,
+            worldId => worldId == 74 ? "Tonberry" : null,
+            () => nowUtc,
+            nextJitterMs: static (_, _) => 75
+        );
+
+        resolver.EnqueueMany([4101UL, 4102UL]);
+        resolver.Pump();
+        Assert.Equal([4101UL], runtime.RequestedContentIds);
+
+        // First request completes quickly (within 200ms), clearing InFlight state.
+        nowUtc = nowUtc.AddMilliseconds(200);
+        runtime.Deliver(new CharaCardPacketModel(4101UL, 74, "Player One"));
+        resolver.Pump();
+        Assert.Equal(ResolveState.Resolved, resolver.GetResolveState(4101UL));
+
+        // 1ms before 350ms + 75ms = 425ms cooldown elapses: must NOT dispatch next request yet.
+        nowUtc = nowUtc.AddMilliseconds(224);
+        resolver.Pump();
+        Assert.Equal([4101UL], runtime.RequestedContentIds);
+        Assert.Equal(ResolveState.Queued, resolver.GetResolveState(4102UL));
+
+        // At exact 425ms cooldown boundary: next request dispatches.
+        nowUtc = nowUtc.AddMilliseconds(1);
+        resolver.Pump();
+        Assert.Equal([4101UL, 4102UL], runtime.RequestedContentIds);
+        Assert.Equal(ResolveState.InFlight, resolver.GetResolveState(4102UL));
+    }
+
+    [Fact]
+    public void Pump_does_not_arm_dispatch_cooldown_when_runtime_try_request_fails() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        var nowUtc = new DateTime(2026, 4, 13, 10, 20, 0, DateTimeKind.Utc);
+        var runtime = new FakeCharaCardResolverRuntime {
+            TryRequestResult = false,
+        };
+        using var resolver = new CharaCardResolver(
+            database,
+            runtime,
+            worldId => worldId == 74 ? "Tonberry" : null,
+            () => nowUtc,
+            nextJitterMs: static (_, _) => 100
+        );
+
+        resolver.EnqueueMany([4201UL, 4202UL]);
+        resolver.Pump();
+        Assert.Equal([4201UL], runtime.RequestedContentIds);
+        Assert.Equal(ResolveState.FailedTransient, resolver.GetResolveState(4201UL));
+
+        // Since 4201 failed locally to dispatch, 4202 can dispatch immediately without cooldown wait.
+        runtime.TryRequestResult = true;
+        resolver.Pump();
+        Assert.Equal([4201UL, 4202UL], runtime.RequestedContentIds);
+        Assert.Equal(ResolveState.InFlight, resolver.GetResolveState(4202UL));
+    }
+
+    [Fact]
+    public void DalamudSelectOkDialogSuppressionRuntime_only_subscribes_error_toast_and_never_normal_or_quest() {
+        var addonCalls = new List<string>();
+        var chatCalls = new List<string>();
+        var toastCalls = new List<string>();
+        var suppressionRuntime = CreateSuppressionRuntime(
+            ["Plate unavailable."],
+            addonCalls,
+            chatCalls,
+            toastCalls
+        );
+
+        suppressionRuntime.Initialize(_ => false);
+        Assert.Contains("add_ErrorToast", toastCalls);
+        Assert.DoesNotContain("add_Toast", toastCalls);
+        Assert.DoesNotContain("add_QuestToast", toastCalls);
+        Assert.Contains("add_LogMessage", chatCalls);
+        Assert.Contains("RegisterListener", addonCalls);
+
+        suppressionRuntime.Dispose();
+        Assert.Contains("remove_ErrorToast", toastCalls);
+        Assert.DoesNotContain("remove_Toast", toastCalls);
+        Assert.DoesNotContain("remove_QuestToast", toastCalls);
+        Assert.Contains("remove_LogMessage", chatCalls);
+        Assert.Contains("UnregisterListener", addonCalls);
+    }
+
+    [Fact]
+    public void DalamudSelectOkDialogSuppressionRuntime_suppresses_only_matching_chara_card_error_toast() {
+        var handlerInvocations = new List<string>();
+        var shouldSuppress = true;
+        var suppressionRuntime = CreateSuppressionRuntime(
+            ["  アドベンチャラープレートの情報を取得できませんでした。  ", "公開設定にされていないため表示できません。"],
+            [],
+            [],
+            []
+        );
+        suppressionRuntime.Initialize(source => {
+            handlerInvocations.Add(source);
+            return shouldSuppress;
+        });
+
+        // Arbitrary ErrorToast text must NEVER invoke handler or be handled.
+        Assert.False(InvokeErrorToast(suppressionRuntime, "Not enough gil."));
+        Assert.False(InvokeErrorToast(suppressionRuntime, "   "));
+        Assert.Empty(handlerInvocations);
+
+        // Exact localized text (even with leading/trailing whitespace) invokes handler("Toast.Error") and suppresses when handler approves.
+        Assert.True(InvokeErrorToast(suppressionRuntime, "  アドベンチャラープレートの情報を取得できませんでした。 "));
+        Assert.Equal(["Toast.Error"], handlerInvocations);
+
+        // Matching text does NOT suppress when handler returns false (e.g., suppression window inactive/expired).
+        shouldSuppress = false;
+        Assert.False(InvokeErrorToast(suppressionRuntime, "公開設定にされていないため表示できません。"));
+        Assert.Equal(["Toast.Error", "Toast.Error"], handlerInvocations);
+    }
+
+    [Fact]
+    public void DalamudSelectOkDialogSuppressionRuntime_never_suppresses_when_lookup_set_is_empty() {
+        var handlerInvocations = new List<string>();
+        var suppressionRuntime = CreateSuppressionRuntime(
+            charaCardErrorToastTexts: null,
+            [],
+            [],
+            []
+        );
+        suppressionRuntime.Initialize(source => {
+            handlerInvocations.Add(source);
+            return true;
+        });
+
+        Assert.False(InvokeErrorToast(suppressionRuntime, "アドベンチャラープレートの情報を取得できませんでした。"));
+        Assert.False(InvokeErrorToast(suppressionRuntime, "Any error toast."));
+        Assert.Empty(handlerInvocations);
+    }
+
+    private static DalamudSelectOkDialogSuppressionRuntime CreateSuppressionRuntime(
+        IEnumerable<string>? charaCardErrorToastTexts,
+        List<string> addonCalls,
+        List<string> chatCalls,
+        List<string> toastCalls
+    ) {
+        var ctor = typeof(DalamudSelectOkDialogSuppressionRuntime).GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic)
+            .Single(c => c.GetParameters()[3].ParameterType == typeof(IEnumerable<string>));
+        var parameters = ctor.GetParameters();
+        var addonLifecycle = CreateInterfaceProxy(parameters[0].ParameterType, addonCalls);
+        var chatGui = CreateInterfaceProxy(parameters[1].ParameterType, chatCalls);
+        var toastGui = CreateInterfaceProxy(parameters[2].ParameterType, toastCalls);
+
+        return (DalamudSelectOkDialogSuppressionRuntime)ctor.Invoke([
+            addonLifecycle,
+            chatGui,
+            toastGui,
+            charaCardErrorToastTexts,
+            null,
+            null,
+        ]);
+    }
+
+    private static bool InvokeErrorToast(DalamudSelectOkDialogSuppressionRuntime runtime, string text) {
+        var method = typeof(DalamudSelectOkDialogSuppressionRuntime).GetMethod(
+            "OnErrorToast",
+            BindingFlags.Instance | BindingFlags.NonPublic
+        )!;
+        var seStringType = method.GetParameters()[0].ParameterType.GetElementType()!;
+        var seString = CreateSeString(seStringType, text);
+        object?[] args = [seString, false];
+        method.Invoke(runtime, args);
+        return (bool)args[1]!;
+    }
+
+    private static object CreateSeString(Type seStringType, string text) {
+        var stringCtor = seStringType.GetConstructor([typeof(string)]);
+        if (stringCtor is not null) {
+            return stringCtor.Invoke([text]);
+        }
+
+        var payloadType = seStringType.Assembly.GetType("Dalamud.Game.Text.SeStringHandling.Payload")!;
+        var textPayloadType = seStringType.Assembly.GetType("Dalamud.Game.Text.SeStringHandling.Payloads.TextPayload")!;
+        var textPayload = textPayloadType.GetConstructor([typeof(string)])!.Invoke([text]);
+        var payloadArray = Array.CreateInstance(payloadType, 1);
+        payloadArray.SetValue(textPayload, 0);
+        return seStringType.GetConstructor([payloadArray.GetType()])!.Invoke([payloadArray]);
+    }
+
+    private static object CreateInterfaceProxy(Type interfaceType, List<string> calls) {
+        var proxyMethod = typeof(DispatchProxy)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Single(m => m.Name == nameof(DispatchProxy.Create) && m.GetGenericArguments().Length == 2)
+            .MakeGenericMethod(interfaceType, typeof(RecordingDispatchProxy));
+        var proxy = (RecordingDispatchProxy)proxyMethod.Invoke(null, null)!;
+        proxy.Calls = calls;
+        return proxy;
+    }
+
+    public class RecordingDispatchProxy : DispatchProxy {
+        internal List<string> Calls { get; set; } = [];
+
+        protected override object? Invoke(MethodInfo? targetMethod, object?[]? args) {
+            if (targetMethod is not null) {
+                Calls.Add(targetMethod.Name);
+            }
+
+            return targetMethod?.ReturnType.IsValueType == true && targetMethod.ReturnType != typeof(void)
+                ? Activator.CreateInstance(targetMethod.ReturnType)
+                : null;
+        }
+    }
+
     private sealed class FakeCharaCardResolverRuntime : ICharaCardResolverRuntime {
         private Func<CharaCardPacketModel, bool>? _packetHandler;
         private Func<CharaCardPacketModel, bool>? _agentPacketHandler;
@@ -1164,7 +1382,7 @@ public sealed class CharaCardResolverRuntimeTests {
 
         public bool ThrowOnInitialize { get; init; }
 
-        public bool TryRequestResult { get; init; } = true;
+        public bool TryRequestResult { get; set; } = true;
 
         public bool IsDisposed { get; private set; }
 

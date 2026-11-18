@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Linq;
 
 #nullable enable
@@ -32,7 +33,20 @@ internal sealed class PendingDetailQueue {
         _pendingDetails.AddOrUpdate(
             payload.ListingId,
             _ => queued,
-            (_, existing) => existing.Fingerprint == fingerprint ? existing : queued
+            (_, existing) => {
+                var promotedOwner = existing.Owner == PartyDetailRequestOwner.Scanner
+                    || owner == PartyDetailRequestOwner.Scanner
+                    ? PartyDetailRequestOwner.Scanner
+                    : owner;
+
+                if (existing.Fingerprint != fingerprint) {
+                    return queued with { Owner = promotedOwner };
+                }
+
+                return existing.Owner != promotedOwner
+                    ? existing with { Owner = promotedOwner }
+                    : existing;
+            }
         );
     }
 
@@ -152,5 +166,13 @@ internal sealed record PendingDetailEntry(
     DateTime QueuedAtUtc,
     int AttemptCount,
     DateTime NextAttemptAtUtc,
-    int DeferredCount = 0
-);
+    int DeferredCount = 0,
+    ImmutableHashSet<Guid>? ResolvedTargetIds = null,
+    bool HasAppliedTarget = false
+) {
+    internal ImmutableHashSet<Guid> SafeResolvedTargetIds
+        => ResolvedTargetIds ?? ImmutableHashSet<Guid>.Empty;
+
+    internal bool IsTargetResolved(Guid targetId)
+        => ResolvedTargetIds?.Contains(targetId) ?? false;
+}

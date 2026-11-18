@@ -72,6 +72,32 @@ public sealed class PartyDetailRequestCoordinatorTests {
     }
 
     [Fact]
+    public void Scanner_game_log_suppression_records_failure_signal_for_pf_errors_but_not_plate_errors() {
+        var state = new PartyDetailCaptureState();
+        var coordinator = new PartyDetailRequestCoordinator(ScannerHeadlessBackendKind.NativeSuppression);
+        var attemptId = Guid.NewGuid();
+
+        coordinator.ArmScannerRequest(attemptId, listingId: 9001U, contentId: 44UL, allowHeadless: true);
+        coordinator.BeginScannerOpenAttempt(attemptId);
+        var cycle = coordinator.EnsureRequestCycleForOpenIntercept(state, listingId: 9001U, contentId: 44UL);
+        coordinator.EndScannerOpenAttempt(attemptId);
+
+        // CharaCard/plate failures must never emit a PF detail fast-fail signal.
+        Assert.True(coordinator.ShouldSuppressScannerGameLog(state, 5857));
+        Assert.False(coordinator.TryGetScannerFailureSignal(cycle.RequestSerial, 9001U, 44UL, out _));
+
+        // Non-retryable PF error (974) emits signal while keeping suppression active until completed.
+        Assert.True(coordinator.ShouldSuppressScannerGameLog(state, 974));
+        Assert.True(coordinator.TryGetScannerFailureSignal(cycle.RequestSerial, 9001U, 44UL, out var signal));
+        Assert.Equal(974U, signal.LogMessageId);
+        Assert.True(signal.IsNonRetryableUnavailable);
+
+        coordinator.CompleteScannerRequest(attemptId, PartyDetailScannerAttemptOutcome.Unavailable);
+        Assert.Null(coordinator.GetArmedScannerRequestSerial(attemptId));
+        Assert.False(coordinator.TryGetScannerFailureSignal(cycle.RequestSerial, 9001U, 44UL, out _));
+    }
+
+    [Fact]
     public void Terminal_scanner_outcome_releases_suppression() {
         var state = new PartyDetailCaptureState();
         var coordinator = new PartyDetailRequestCoordinator(ScannerHeadlessBackendKind.NativeSuppression);
@@ -118,6 +144,7 @@ public sealed class PartyDetailRequestCoordinatorTests {
             LeaderContentId = leaderContentId,
             LeaderName = "Leader",
             HomeWorld = 77,
+            CreatedWorld = 77,
             MemberContentIds = new List<ulong> { leaderContentId },
             MemberJobs = new List<byte> { 19 },
             SlotFlags = new List<string> { "0x0000000000000001" },

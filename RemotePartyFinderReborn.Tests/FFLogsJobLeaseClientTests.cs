@@ -256,6 +256,110 @@ public sealed class FFLogsJobLeaseClientTests
     }
 
     [Fact]
+    public async Task AcquireLeaseAsync_releases_half_open_probe_on_missing_headers_deferral_401_404_and_cancellation() {
+        var now = new DateTime(2026, 5, 10, 12, 30, 0, DateTimeKind.Utc);
+        var uploadUrl = new UploadUrl("https://lease-probe.example");
+        var configuration = new Configuration {
+            CircuitBreakerFailureThreshold = 1,
+            CircuitBreakerBreakDurationMinutes = 1,
+            IngestClientId = string.Empty,
+            UploadUrls = ImmutableList.Create(uploadUrl),
+        };
+        UploadAttemptRecorder.RecordFailure(uploadUrl, now);
+        var probeNow = now.AddMinutes(1);
+
+        var responses = new Queue<Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>>>();
+        var sender = new LeaseTestIngestHttpSender((req, ct) => responses.Dequeue()(req, ct));
+        var seams = new FFLogsCollectorSeams(sender, new LeaseTestFFLogsApiClient(), new LeaseTestFFLogsTimeProvider(() => probeNow));
+        var client = new FFLogsJobLeaseClient(seams);
+
+        // 1) Missing worker headers must not claim/leak the Half-Open probe slot.
+        var missingHeaderClient = new FFLogsJobLeaseClient(seams, new MissingWorkerRegionProvider());
+        var noHeaders = await missingHeaderClient.TryAcquireSessionAsync(configuration, CancellationToken.None);
+        Assert.Null(noHeaders.Session);
+        Assert.False(UploadAttemptRecorder.PeekIsCircuitOpen(uploadUrl, configuration, probeNow));
+
+        // 2) Pre-send capability deferral must not claim/leak the Half-Open probe slot.
+        configuration.IngestClientId = Guid.NewGuid().ToString("N");
+        uploadUrl.RequireProtectedCapabilities(ProtectedEndpointCapabilityKind.FflogsJobs);
+        var deferred = await client.TryAcquireSessionAsync(configuration, CancellationToken.None);
+        Assert.NotNull(deferred.Session);
+        Assert.False(deferred.Session!.HasJobs);
+        Assert.True(deferred.Session.UseBaseDelayWhenNoWork);
+        Assert.False(UploadAttemptRecorder.PeekIsCircuitOpen(uploadUrl, configuration, probeNow));
+
+        // Reset to separate targets for 401 vs 404/OCE/Recovery (401 intentionally sets capability-required deferral).
+        var authUrl = new UploadUrl("https://lease-probe-auth.example");
+        configuration.UploadUrls = ImmutableList.Create(authUrl);
+        UploadAttemptRecorder.RecordFailure(authUrl, now);
+
+        // 3) 401 non-failure response releases Half-Open probe slot.
+        responses.Enqueue((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Unauthorized)));
+        var res401 = await client.TryAcquireSessionAsync(configuration, CancellationToken.None);
+        Assert.NotNull(res401.Session);
+        Assert.False(res401.Session!.HasJobs);
+        Assert.False(res401.HadTransientFailure);
+        Assert.False(UploadAttemptRecorder.PeekIsCircuitOpen(authUrl, configuration, probeNow));
+
+        var activeUrl = new UploadUrl("https://lease-probe-active.example");
+        configuration.UploadUrls = ImmutableList.Create(activeUrl);
+        UploadAttemptRecorder.RecordFailure(activeUrl, now);
+
+        // 4) 404 non-failure response releases Half-Open probe slot.
+        responses.Enqueue((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.NotFound)));
+        var res404 = await client.TryAcquireSessionAsync(configuration, CancellationToken.None);
+        Assert.NotNull(res404.Session);
+        Assert.False(res404.Session!.HasJobs);
+        Assert.False(res404.HadTransientFailure);
+        Assert.False(UploadAttemptRecorder.PeekIsCircuitOpen(activeUrl, configuration, probeNow));
+
+        // 5) Caller OperationCanceledException releases Half-Open probe slot so subsequent healthy attempt succeeds.
+        using var cts = new CancellationTokenSource();
+        responses.Enqueue((_, _) => {
+            cts.Cancel();
+            throw new OperationCanceledException(cts.Token);
+        });
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => client.TryAcquireSessionAsync(configuration, cts.Token));
+        Assert.False(UploadAttemptRecorder.PeekIsCircuitOpen(activeUrl, configuration, probeNow));
+
+        // 6) Final healthy probe settles circuit to closed.
+        responses.Enqueue((_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) {
+            Content = new StringContent("[]"),
+        }));
+        var resOk = await client.TryAcquireSessionAsync(configuration, CancellationToken.None);
+        Assert.False(resOk.HadTransientFailure);
+        Assert.Equal(0, activeUrl.FailureCount);
+        Assert.Empty(responses);
+    }
+
+    private sealed class LeaseTestIngestHttpSender(
+        Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> handler
+    ) : IIngestHttpSender {
+        public Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            => handler(request, cancellationToken);
+    }
+
+    private sealed class LeaseTestFFLogsApiClient : IFFLogsApiClient {
+        public DateTime RateLimitCooldownUntilUtc => DateTime.MinValue;
+        public bool TryGetRateLimitRemaining(out TimeSpan remaining) {
+            remaining = TimeSpan.Zero;
+            return false;
+        }
+        public void ResetRateLimitCooldown() { }
+        public Task<OperationOutcome<Dictionary<string, FFLogsClient.CharacterFetchedData>>> FetchCharacterCandidateDataBatchAsync(
+            List<FFLogsClient.CandidateCharacterQuery> queries,
+            int zoneId,
+            int? difficultyId,
+            CancellationToken cancellationToken
+        ) => Task.FromResult(OperationOutcome<Dictionary<string, FFLogsClient.CharacterFetchedData>>.Success(new Dictionary<string, FFLogsClient.CharacterFetchedData>()));
+    }
+
+    private sealed class LeaseTestFFLogsTimeProvider(Func<DateTime> utcNow) : IFFLogsTimeProvider {
+        public DateTime UtcNow => utcNow();
+    }
+
+    [Fact]
     public async Task Collector_continues_results_submission_through_the_lease_session_owner()
     {
         var configuration = new Configuration

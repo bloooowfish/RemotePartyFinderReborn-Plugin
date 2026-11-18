@@ -6,6 +6,7 @@ using System.Runtime.CompilerServices;
 using System.Threading;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using RemotePartyFinderReborn.Tomestone;
 using Xunit;
 
 namespace RemotePartyFinderReborn.Tests;
@@ -20,6 +21,34 @@ public sealed class UploadContractTests {
         Assert.Equal(typeof(uint), RequiredPropertyType<UploadableListing>(nameof(UploadableListing.Id)));
         Assert.Equal(typeof(uint), RequiredPropertyType<UploadablePartyDetail>(nameof(UploadablePartyDetail.ListingId)));
         Assert.Equal(typeof(uint), RequiredPropertyType<ListingDetailCapability>(nameof(ListingDetailCapability.ListingId)));
+    }
+
+    [Fact]
+    public void Uploadable_party_detail_and_batch_item_serialize_new_metadata_fields_in_snake_case() {
+        var detail = new UploadablePartyDetail {
+            ListingId = 9001U,
+            LeaderContentId = 44UL,
+            LeaderName = "Leader",
+            HomeWorld = 77,
+            CreatedWorld = 74,
+            LastServerRestart = 1700000000U,
+            ObservedAtUnixMs = 1770000000123L,
+            MemberContentIds = [44UL],
+            MemberJobs = [19],
+            SlotFlags = ["0x0000000000000001"],
+        };
+
+        var detailJson = JObject.Parse(JsonConvert.SerializeObject(detail));
+        Assert.Equal((ushort)74, detailJson.Value<ushort>("created_world"));
+        Assert.Equal(1700000000U, detailJson.Value<uint>("last_server_restart"));
+        Assert.Equal(1770000000123L, detailJson.Value<long>("observed_at_unix_ms"));
+
+        var batchItem = UploadablePartyDetailBatchItem.FromDetail(detail, "tok-1");
+        var batchJson = JObject.Parse(JsonConvert.SerializeObject(batchItem));
+        Assert.Equal((ushort)74, batchJson.Value<ushort>("created_world"));
+        Assert.Equal(1700000000U, batchJson.Value<uint>("last_server_restart"));
+        Assert.Equal(1770000000123L, batchJson.Value<long>("observed_at_unix_ms"));
+        Assert.Equal("tok-1", batchJson.Value<string>("capability_token"));
     }
 
     [Fact]
@@ -69,6 +98,68 @@ public sealed class UploadContractTests {
             .ToArray();
 
         Assert.Empty(normalizeObjectiveMethods);
+    }
+
+    [Fact]
+    public void ParseJob_and_TomestoneJob_deserialize_server_manifest_metadata_in_snake_case() {
+        const string json = """
+        {
+          "content_id": 424242,
+          "name": "Manifest Tester",
+          "server": "Tonberry",
+          "region": "JP",
+          "zone_id": 99,
+          "difficulty_id": 101,
+          "encounter_id": 8801,
+          "secondary_encounter_id": 8802,
+          "zone_encounters": [8800, 8801, 8802],
+          "tomestone_expansion": "dawntrail",
+          "tomestone_category": "raids",
+          "tomestone_clears_category": "savage",
+          "tomestone_zone_slug": "aac-future-savage",
+          "tomestone_encounter_slug": "future-p1",
+          "tomestone_encounter_names": ["future-p1", "future-p1-alt"],
+          "tomestone_secondary_encounter_slug": "future-p2",
+          "tomestone_secondary_encounter_names": ["future-p2"],
+          "tomestone_progress_kind": "boss_percentage",
+          "lease_token": "lease-manifest-1"
+        }
+        """;
+
+        var parseJob = JsonConvert.DeserializeObject<ParseJob>(json);
+        Assert.NotNull(parseJob);
+        Assert.Equal([8800u, 8801u, 8802u], parseJob.ZoneEncounters);
+        Assert.Equal("dawntrail", parseJob.TomestoneExpansion);
+        Assert.Equal("raids", parseJob.TomestoneCategory);
+        Assert.Equal("savage", parseJob.TomestoneClearsCategory);
+        Assert.Equal("aac-future-savage", parseJob.TomestoneZoneSlug);
+        Assert.Equal("future-p1", parseJob.TomestoneEncounterSlug);
+        Assert.Equal(["future-p1", "future-p1-alt"], parseJob.TomestoneEncounterNames);
+        Assert.Equal("future-p2", parseJob.TomestoneSecondaryEncounterSlug);
+        Assert.Equal(["future-p2"], parseJob.TomestoneSecondaryEncounterNames);
+        Assert.Equal("boss_percentage", parseJob.TomestoneProgressKind);
+
+        var tomestoneJob = JsonConvert.DeserializeObject<TomestoneJob>(json);
+        Assert.NotNull(tomestoneJob);
+        Assert.Equal(parseJob.ZoneEncounters, tomestoneJob.ZoneEncounters);
+        Assert.Equal(parseJob.TomestoneZoneSlug, tomestoneJob.TomestoneZoneSlug);
+        Assert.Equal(parseJob.TomestoneSecondaryEncounterSlug, tomestoneJob.TomestoneSecondaryEncounterSlug);
+        Assert.Equal(parseJob.TomestoneProgressKind, tomestoneJob.TomestoneProgressKind);
+    }
+
+    [Fact]
+    public void ParseResult_serializes_fflogs_queried_encounters_in_snake_case() {
+        var result = new ParseResult {
+            ContentId = 777UL,
+            ZoneId = 73,
+            DifficultyId = 101,
+            FflogsQueriedEncounters = [101, 102, 103, 104, 105],
+            MatchedServer = "Tonberry",
+            LeaseToken = "lease-777",
+        };
+
+        var json = JObject.Parse(JsonConvert.SerializeObject(result));
+        Assert.Equal([101, 102, 103, 104, 105], json["fflogs_queried_encounters"]!.Values<int>().ToArray());
     }
 
     private static Type RequiredPropertyType<T>(string propertyName) {

@@ -43,9 +43,9 @@ internal sealed class UploadableListing {
         ContentIdLower = (uint)source.ContentId;
         Name = source.Name.Encode();
         Description = source.Description.Encode();
-        CreatedWorld = (ushort)source.World.Value.RowId;
-        HomeWorld = (ushort)source.HomeWorld.Value.RowId;
-        CurrentWorld = (ushort)source.CurrentWorld.Value.RowId;
+        CreatedWorld = (ushort)source.World.RowId;
+        HomeWorld = (ushort)source.HomeWorld.RowId;
+        CurrentWorld = (ushort)source.CurrentWorld.RowId;
         Category = source.Category;
         Duty = source.RawDuty;
         DutyType = source.DutyType;

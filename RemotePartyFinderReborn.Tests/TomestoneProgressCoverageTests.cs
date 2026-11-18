@@ -39,7 +39,7 @@ public sealed class TomestoneProgressCoverageTests
     }
 
     [Fact]
-    public async Task Cleared_without_percentiles_abandons_lease_with_tomestone_no_data()
+    public async Task Cleared_without_percentiles_returns_result_with_queried_encounter_coverage()
     {
         var progression = new StubTomestoneProgressionService
         {
@@ -49,11 +49,13 @@ public sealed class TomestoneProgressCoverageTests
         var batchResult = await ProcessSingleJobAsync(progression, zoneId: 73, encounterId: 101);
 
         Assert.False(batchResult.HadTransientFailure);
-        Assert.Empty(batchResult.ProcessedResults);
-        var abandon = Assert.Single(batchResult.AbandonedLeases);
-        Assert.Equal("tomestone_no_data", abandon.Reason);
-        Assert.Equal("tomestone_cleared_without_percentiles", abandon.FailureCode);
-        Assert.Equal("lease", abandon.LeaseToken);
+        Assert.Empty(batchResult.AbandonedLeases);
+        var result = Assert.Single(batchResult.ProcessedResults);
+        Assert.Equal([101], result.TomestoneQueriedEncounters);
+        Assert.Empty(result.Encounters);
+        Assert.Empty(result.BossPercentages);
+        Assert.Empty(result.PhaseProgress);
+        Assert.Equal("lease", result.LeaseToken);
     }
 
     [Theory]
@@ -122,10 +124,12 @@ public sealed class TomestoneProgressCoverageTests
         var batchResult = await ProcessSingleJobAsync(progression, zoneId: 65, encounterId: 1079);
 
         Assert.False(batchResult.HadTransientFailure);
-        Assert.Empty(batchResult.ProcessedResults);
-        var abandon = Assert.Single(batchResult.AbandonedLeases);
-        Assert.Equal("tomestone_no_data", abandon.Reason);
-        Assert.Equal("tomestone_cleared_without_percentiles", abandon.FailureCode);
+        Assert.Empty(batchResult.AbandonedLeases);
+        var result = Assert.Single(batchResult.ProcessedResults);
+        Assert.Equal([1079], result.TomestoneQueriedEncounters);
+        Assert.Empty(result.Encounters);
+        Assert.Empty(result.BossPercentages);
+        Assert.Empty(result.PhaseProgress);
     }
 
     private static Task<TomestoneBatchProcessResult> ProcessSingleJobAsync(
@@ -137,7 +141,7 @@ public sealed class TomestoneProgressCoverageTests
             new StubFFLogsIngestHttpSender(),
             progression,
             new ManualFFLogsTimeProvider(),
-            new Configuration { TomestoneRequestIntervalMs = 0, TomestoneMaxConcurrency = 1 },
+            new Configuration { TomestoneRequestIntervalMs = 0, TomestoneMaxConcurrency = 1, BypassTomestonePacingClampDebug = true },
             new ApiCredentialStatusStore(),
             static (_, _) => Task.CompletedTask);
         var session = new TomestoneLeaseSession(

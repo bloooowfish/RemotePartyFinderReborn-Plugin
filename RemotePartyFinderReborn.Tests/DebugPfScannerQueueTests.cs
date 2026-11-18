@@ -29,37 +29,36 @@ public sealed class DebugPfScannerQueueTests {
     [Fact]
     public void Candidate_updates_keep_first_seen_and_refresh_last_seen_for_expiry() {
         var start = new DateTime(2026, 10, 16, 12, 0, 0, DateTimeKind.Utc);
-        var queue = new DebugPfListingQueue();
-        queue.UpsertVisible(new DebugPfListingCandidate(1001, 0, start, 1));
-        queue.UpsertVisible(new DebugPfListingCandidate(1001, 0, start.AddSeconds(25), 2));
+        var buffer = new CollectedListingBuffer();
+        Assert.True(buffer.UpsertFromListing(1001, 0, 1, start));
+        Assert.False(buffer.UpsertFromListing(1001, 0, 2, start.AddSeconds(25)));
 
-        queue.PruneCaches(start.AddSeconds(40), dedupTtlSeconds: 600);
+        buffer.Prune(start.AddSeconds(600));
 
-        Assert.Equal(1, queue.VisibleCount);
-        Assert.True(queue.TryGetLatestVisible(1001, out var updated));
+        Assert.Equal(1, buffer.Count);
+        var updated = Assert.Single(buffer.TakeOrderedSnapshot(start.AddSeconds(600)));
         Assert.Equal(start, updated.SeenAtUtc);
         Assert.Equal(start.AddSeconds(25), updated.LastSeenAtUtc);
 
-        queue.PruneCaches(start.AddSeconds(56), dedupTtlSeconds: 600);
-        Assert.Equal(0, queue.VisibleCount);
+        buffer.Prune(start.AddSeconds(626));
+        Assert.Equal(0, buffer.Count);
     }
 
     [Fact]
-    public void Pending_target_uses_latest_nonzero_content_id_at_open_time() {
+    public void Pending_target_uses_latest_nonzero_content_id_from_snapshot() {
         var now = new DateTime(2026, 10, 16, 12, 0, 0, DateTimeKind.Utc);
+        var buffer = new CollectedListingBuffer();
+        buffer.UpsertFromListing(1002, 0, 1, now);
+        buffer.UpsertFromListing(1002, 987654, 2, now.AddSeconds(29));
+
+        var snapshot = buffer.TakeOrderedSnapshot(now.AddSeconds(60));
         var queue = new DebugPfListingQueue();
-        queue.UpsertVisible(new DebugPfListingCandidate(1002, 0, now, 1));
-        queue.RebuildPendingQueueFromVisible(now, dedupTtlSeconds: 600);
-        queue.UpsertVisible(new DebugPfListingCandidate(1002, 987654, now.AddSeconds(29), 2));
-        queue.PruneCaches(now.AddSeconds(60), dedupTtlSeconds: 600);
+        queue.RebuildPendingQueueFromSnapshot(snapshot, now.AddSeconds(60), dedupTtlSeconds: 600);
 
         Assert.True(queue.TryTakeNextReadyTarget(now.AddSeconds(60), 600, out var target));
 
         Assert.Equal(1002UL, target.ListingId);
         Assert.Equal(987654UL, target.ContentId);
-
-        queue.UpsertVisible(new DebugPfListingCandidate(1002, 222333, now.AddSeconds(2), 3));
-        Assert.Equal(222333UL, queue.RefreshCandidate(target).ContentId);
     }
 
     [Fact]
@@ -69,7 +68,7 @@ public sealed class DebugPfScannerQueueTests {
         var queue = new DebugPfListingQueue();
         var machine = new DebugPfScanStateMachine(queue);
 
-        Assert.Null(machine.SyncQueue(start, [target], false, 0, 30, runFromCollectedListings: true));
+        Assert.Null(machine.SyncQueue(start, [target], dedupTtlSeconds: 30));
         Assert.Equal(target.ListingId, machine.CurrentTargetListingId);
         machine.HandleOpenAttemptResult(
             start,
@@ -83,10 +82,7 @@ public sealed class DebugPfScannerQueueTests {
         var completion = machine.SyncQueue(
             start.AddSeconds(31),
             [target],
-            hasIncomingListings: false,
-            maxPerRun: 0,
-            dedupTtlSeconds: 30,
-            runFromCollectedListings: true);
+            dedupTtlSeconds: 30);
 
         Assert.Equal("collected_batch_complete", completion);
         Assert.Equal(1, machine.ConsecutiveFailures);
@@ -100,11 +96,11 @@ public sealed class DebugPfScannerQueueTests {
         var queue = new DebugPfListingQueue();
         var machine = new DebugPfScanStateMachine(queue);
 
-        Assert.Null(machine.SyncQueue(start, [target], false, 0, 30, runFromCollectedListings: true));
+        Assert.Null(machine.SyncQueue(start, [target], dedupTtlSeconds: 30));
         machine.HandleOpenAttemptResult(start, true, 100, 500, 0, 50, requestSerial: 1);
         var snapshot = new DebugPfDetailSnapshot(target.ListingId, target.ContentId, NonZeroMembers: 4, TotalSlots: 8);
-        machine.HandleDetailReadyState(start.AddMilliseconds(1), snapshot, 800, 500, 0, 50);
-        machine.HandleDetailReadyState(start.AddMilliseconds(2), snapshot, 800, 500, 0, 50);
+        machine.HandleDetailReadyState(start.AddMilliseconds(1), snapshot, detailReadyTimeoutMs: 500, configuredRetries: 0, postListingCooldownMs: 50);
+        machine.HandleDetailReadyState(start.AddMilliseconds(2), snapshot, detailReadyTimeoutMs: 500, configuredRetries: 0, postListingCooldownMs: 50);
         Assert.Equal(DebugPfScanState.WaitCollected, machine.State);
         machine.HandleCollectedState(start.AddMilliseconds(3), hasConsumedAck: true, postListingCooldownMs: 50);
         machine.AdvanceCooldown(start.AddMilliseconds(54));
@@ -112,10 +108,7 @@ public sealed class DebugPfScannerQueueTests {
         var completion = machine.SyncQueue(
             start.AddSeconds(31),
             [target],
-            hasIncomingListings: false,
-            maxPerRun: 0,
-            dedupTtlSeconds: 30,
-            runFromCollectedListings: true);
+            dedupTtlSeconds: 30);
 
         Assert.Equal("collected_batch_complete", completion);
         Assert.Equal(1, machine.ProcessedCount);

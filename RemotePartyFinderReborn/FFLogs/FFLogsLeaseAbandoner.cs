@@ -30,7 +30,8 @@ internal sealed class FFLogsLeaseAbandoner
         string reason,
         CancellationToken cancellationToken,
         Action<string> warningLog,
-        Action<string> debugLog)
+        Action<string> debugLog,
+        IEnumerable<AbandonFflogsLease> alreadyAbandonedLeases = null)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(leaseSession);
@@ -40,7 +41,7 @@ internal sealed class FFLogsLeaseAbandoner
         ArgumentNullException.ThrowIfNull(warningLog);
         ArgumentNullException.ThrowIfNull(debugLog);
 
-        var abandonBatch = BuildAbandonLeaseBatch(leasedJobs, processedResults, reason);
+        var abandonBatch = BuildAbandonLeaseBatch(leasedJobs, processedResults, reason, alreadyAbandonedLeases);
         await SendAbandonBatchAsync(
             configuration,
             leaseSession.UploadUrl,
@@ -48,6 +49,50 @@ internal sealed class FFLogsLeaseAbandoner
             cancellationToken,
             warningLog,
             debugLog).ConfigureAwait(false);
+    }
+
+    public async Task AbandonExplicitLeasesAsync(
+        Configuration configuration,
+        FFLogsLeaseSession leaseSession,
+        IReadOnlyList<AbandonFflogsLease> abandonBatch,
+        CancellationToken cancellationToken,
+        Action<string> warningLog,
+        Action<string> debugLog)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentNullException.ThrowIfNull(leaseSession);
+        ArgumentNullException.ThrowIfNull(abandonBatch);
+        ArgumentNullException.ThrowIfNull(warningLog);
+        ArgumentNullException.ThrowIfNull(debugLog);
+
+        if (abandonBatch.Count == 0)
+        {
+            return;
+        }
+
+        await SendAbandonBatchAsync(
+            configuration,
+            leaseSession.UploadUrl,
+            abandonBatch,
+            cancellationToken,
+            warningLog,
+            debugLog).ConfigureAwait(false);
+    }
+
+    internal static AbandonFflogsLease CreateJobAbandonment(ParseJob job, string reason)
+    {
+        ArgumentNullException.ThrowIfNull(job);
+        ArgumentNullException.ThrowIfNull(reason);
+
+        return new AbandonFflogsLease
+        {
+            ContentId = job.ContentId,
+            ZoneId = job.ZoneId,
+            DifficultyId = job.DifficultyId,
+            LeaseToken = job.LeaseToken,
+            Reason = reason,
+            ProcessorKind = FFLogsJobLeaseClient.ProcessorKindValue,
+        };
     }
 
     public async Task AbandonOversizedResultLeaseAsync(
@@ -206,14 +251,25 @@ internal sealed class FFLogsLeaseAbandoner
     private static string ParseJobKey(ParseJob job)
         => $"{job.ContentId}:{job.ZoneId}:{job.DifficultyId}";
 
+    private static string AbandonLeaseKey(AbandonFflogsLease lease)
+        => $"{lease.ContentId}:{lease.ZoneId}:{lease.DifficultyId}";
+
     private static List<AbandonFflogsLease> BuildAbandonLeaseBatch(
         IEnumerable<ParseJob> leasedJobs,
         IEnumerable<ParseResult> processedResults,
-        string reason)
+        string reason,
+        IEnumerable<AbandonFflogsLease> alreadyAbandonedLeases = null)
     {
-        var processedKeys = new HashSet<string>(
+        var excludedKeys = new HashSet<string>(
             processedResults.Select(FFLogsSubmitBuffer.GetParseResultKey),
             StringComparer.Ordinal);
+        if (alreadyAbandonedLeases is not null)
+        {
+            foreach (var abandoned in alreadyAbandonedLeases)
+            {
+                excludedKeys.Add(AbandonLeaseKey(abandoned));
+            }
+        }
 
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var batch = new List<AbandonFflogsLease>();
@@ -226,20 +282,12 @@ internal sealed class FFLogsLeaseAbandoner
             }
 
             var key = ParseJobKey(job);
-            if (processedKeys.Contains(key) || !seen.Add(key))
+            if (excludedKeys.Contains(key) || !seen.Add(key))
             {
                 continue;
             }
 
-            batch.Add(new AbandonFflogsLease
-            {
-                ContentId = job.ContentId,
-                ZoneId = job.ZoneId,
-                DifficultyId = job.DifficultyId,
-                LeaseToken = job.LeaseToken,
-                Reason = reason,
-                ProcessorKind = FFLogsJobLeaseClient.ProcessorKindValue,
-            });
+            batch.Add(CreateJobAbandonment(job, reason));
         }
 
         return batch;

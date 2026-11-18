@@ -42,7 +42,8 @@ internal sealed class PlateFailureSuppressionState {
         _suppressedUiOpenBudgets.Arm(
             contentId,
             budget,
-            observedAtUtc.Add(DefaultContentIdSuppressionWindow)
+            observedAtUtc.Add(DefaultContentIdSuppressionWindow),
+            nowUtc: observedAtUtc
         );
     }
 
@@ -54,7 +55,8 @@ internal sealed class PlateFailureSuppressionState {
         _suppressedSelectOkDialogBudgets.Arm(
             contentId,
             budget,
-            observedAtUtc.Add(DefaultContentIdSuppressionWindow)
+            observedAtUtc.Add(DefaultContentIdSuppressionWindow),
+            nowUtc: observedAtUtc
         );
     }
 

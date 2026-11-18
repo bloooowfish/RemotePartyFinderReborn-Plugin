@@ -20,14 +20,21 @@ public sealed class TomestoneConfigurationTests
         Assert.Equal(string.Empty, configuration.TomestoneApiKey);
         Assert.False(configuration.HasTomestoneApiKeyConfigured);
         Assert.False(configuration.EnableTomestoneProgressEnrichment);
-        Assert.Equal(750, configuration.TomestoneRequestIntervalMs);
+        Assert.Equal(1000, configuration.TomestoneRequestIntervalMs);
         Assert.Equal(1, configuration.TomestoneMaxConcurrency);
+        Assert.False(configuration.BypassTomestonePacingClampDebug);
 
         var apiKeyProp = typeof(Configuration).GetProperty(nameof(Configuration.TomestoneApiKey));
         Assert.NotNull(apiKeyProp);
         var converterAttr = apiKeyProp!.GetCustomAttributes<JsonConverterAttribute>().SingleOrDefault();
         Assert.NotNull(converterAttr);
         Assert.Equal(typeof(DpapiProtectedStringJsonConverter), converterAttr!.ConverterType);
+
+        var bypassProp = typeof(Configuration).GetProperty(
+            nameof(Configuration.BypassTomestonePacingClampDebug),
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+        Assert.NotNull(bypassProp);
+        Assert.NotNull(bypassProp!.GetCustomAttribute<JsonIgnoreAttribute>());
     }
 
     [Theory]
@@ -51,31 +58,59 @@ public sealed class TomestoneConfigurationTests
 
         configuration.ResetTomestoneAdvancedDefaults();
 
-        Assert.Equal(750, configuration.TomestoneRequestIntervalMs);
+        Assert.Equal(1000, configuration.TomestoneRequestIntervalMs);
         Assert.Equal(1, configuration.TomestoneMaxConcurrency);
     }
 
     [Theory]
-    [InlineData(-1, 0)]
-    [InlineData(0, 0)]
-    [InlineData(750, 750)]
-    [InlineData(5_000, 5_000)]
-    [InlineData(60_000, 60_000)]
-    [InlineData(60_001, 60_000)]
-    public void Tomestone_request_interval_is_normalized_consistently(int configured, int expected)
+    [InlineData(-1, false, 1000)]
+    [InlineData(0, false, 1000)]
+    [InlineData(750, false, 1000)]
+    [InlineData(1000, false, 1000)]
+    [InlineData(5_000, false, 5_000)]
+    [InlineData(60_000, false, 60_000)]
+    [InlineData(60_001, false, 60_000)]
+    [InlineData(-1, true, 0)]
+    [InlineData(0, true, 0)]
+    [InlineData(250, true, 250)]
+    [InlineData(60_001, true, 60_000)]
+    public void Tomestone_request_interval_is_normalized_consistently(int configured, bool bypassClamp, int expected)
     {
-        Assert.Equal(expected, Configuration.NormalizeTomestoneRequestIntervalMs(configured));
+        Assert.Equal(expected, Configuration.NormalizeTomestoneRequestIntervalMs(configured, bypassClamp));
     }
 
     [Theory]
-    [InlineData(-1, 1)]
-    [InlineData(0, 1)]
-    [InlineData(1, 1)]
-    [InlineData(2, 2)]
-    [InlineData(3, 3)]
-    [InlineData(4, 3)]
-    public void Tomestone_max_concurrency_is_normalized_consistently(int configured, int expected)
+    [InlineData(-1, false, 1)]
+    [InlineData(0, false, 1)]
+    [InlineData(1, false, 1)]
+    [InlineData(3, false, 1)]
+    [InlineData(10, false, 1)]
+    [InlineData(-1, true, 1)]
+    [InlineData(0, true, 1)]
+    [InlineData(1, true, 1)]
+    [InlineData(3, true, 3)]
+    [InlineData(10, true, 10)]
+    [InlineData(11, true, 10)]
+    public void Tomestone_max_concurrency_is_normalized_consistently(int configured, bool bypassClamp, int expected)
     {
-        Assert.Equal(expected, Configuration.NormalizeTomestoneMaxConcurrency(configured));
+        Assert.Equal(expected, Configuration.NormalizeTomestoneMaxConcurrency(configured, bypassClamp));
+    }
+
+    [Fact]
+    public void Effective_tomestone_pacing_clamps_unless_session_debug_bypass_is_enabled()
+    {
+        var configuration = new Configuration
+        {
+            TomestoneRequestIntervalMs = 50,
+            TomestoneMaxConcurrency = 3,
+        };
+
+        Assert.Equal(1000, configuration.GetEffectiveTomestoneRequestIntervalMs());
+        Assert.Equal(1, configuration.GetEffectiveTomestoneMaxConcurrency());
+
+        configuration.BypassTomestonePacingClampDebug = true;
+
+        Assert.Equal(50, configuration.GetEffectiveTomestoneRequestIntervalMs());
+        Assert.Equal(3, configuration.GetEffectiveTomestoneMaxConcurrency());
     }
 }

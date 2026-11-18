@@ -14,6 +14,9 @@ internal sealed class UploadablePartyDetailBatchItem {
     public ulong LeaderContentId { get; set; }
     public string LeaderName { get; set; } = string.Empty;
     public ushort HomeWorld { get; set; }
+    public ushort CreatedWorld { get; set; }
+    public uint LastServerRestart { get; set; }
+    public long ObservedAtUnixMs { get; set; }
     public List<ulong> MemberContentIds { get; set; } = new();
     public List<byte> MemberJobs { get; set; } = new();
     public List<string> SlotFlags { get; set; } = new();
@@ -29,6 +32,9 @@ internal sealed class UploadablePartyDetailBatchItem {
             LeaderContentId = detail.LeaderContentId,
             LeaderName = detail.LeaderName,
             HomeWorld = detail.HomeWorld,
+            CreatedWorld = detail.CreatedWorld,
+            LastServerRestart = detail.LastServerRestart,
+            ObservedAtUnixMs = detail.ObservedAtUnixMs,
             MemberContentIds = detail.MemberContentIds,
             MemberJobs = detail.MemberJobs,
             SlotFlags = detail.SlotFlags,

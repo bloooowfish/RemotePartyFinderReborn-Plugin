@@ -11,10 +11,17 @@ internal static class PartyDetailSnapshotBuilder {
         out UploadablePartyDetail snapshot,
         out PartyDetailDebugSnapshot? debugSnapshot
     ) {
+        return TryBuildFromAgent(AgentLookingForGroup.Instance(), out snapshot, out debugSnapshot);
+    }
+
+    internal static unsafe bool TryBuildFromAgent(
+        AgentLookingForGroup* lookingForGroupAgent,
+        out UploadablePartyDetail snapshot,
+        out PartyDetailDebugSnapshot? debugSnapshot
+    ) {
         snapshot = new UploadablePartyDetail();
         debugSnapshot = null;
 
-        var lookingForGroupAgent = AgentLookingForGroup.Instance();
         if (lookingForGroupAgent == null) {
             return false;
         }
@@ -61,6 +68,9 @@ internal static class PartyDetailSnapshotBuilder {
             LeaderContentId = viewedListing.LeaderContentId,
             LeaderName = lookingForGroupAgent->LastLeader.ToString(),
             HomeWorld = viewedListing.HomeWorld,
+            CreatedWorld = viewedListing.World,
+            LastServerRestart = viewedListing.LastPatchHotfixTimestamp,
+            ObservedAtUnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
             MemberContentIds = memberContentIds,
             MemberJobs = memberJobs,
             SlotFlags = slotFlags,

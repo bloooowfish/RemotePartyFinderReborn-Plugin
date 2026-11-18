@@ -22,8 +22,13 @@ internal enum DebugPfScanState {
 }
 
 internal sealed class DebugPfScanStateMachine {
-    private const int MinCollectionTimeoutMs = 1500;
-    private const int CollectionTimeoutExtraBudgetMs = 700;
+    internal const int DefaultActionIntervalMs = Configuration.DefaultScanActionIntervalMs;
+    internal const int DefaultDetailReadyTimeoutMs = Configuration.DefaultScanDetailTimeoutMs;
+    internal const int DefaultPostListingCooldownMs = Configuration.DefaultScanPostListingCooldownMs;
+    internal const int DefaultDedupTtlSeconds = 600;
+    internal const int DefaultMaxConsecutiveFailures = 5;
+    internal const int DefaultMaxRetries = Configuration.DefaultScanRetryCount;
+    private const int DetailCollectionTimeoutMs = 3500;
 
     private readonly DebugPfListingQueue _queue;
 
@@ -34,7 +39,8 @@ internal sealed class DebugPfScanStateMachine {
     private int _openAttemptsForTarget;
     private int _consecutiveFailures;
     private int _processedCount;
-    private DateTime _nextActionAtUtc = DateTime.MinValue;
+    private DateTime _nextOpenAtUtc = DateTime.MinValue;
+    private DateTime _cooldownUntilUtc = DateTime.MinValue;
     private DateTime _stateDeadlineUtc = DateTime.MinValue;
     private long? _activeRequestSerial;
     private DebugPfDetailSnapshot _lastReadySnapshot;
@@ -55,7 +61,6 @@ internal sealed class DebugPfScanStateMachine {
     internal int PendingCount => _queue.PendingCount;
     internal int ProcessedCount => _processedCount;
     internal int ConsecutiveFailures => _consecutiveFailures;
-    internal int VisibleListingCount => _queue.VisibleCount;
     internal string LastAttemptReason => _lastAttemptReason;
     internal PartyDetailScannerAttemptOutcome? LastTerminalOutcome => _lastTerminalOutcome;
     internal bool LastAttemptSuccess => _lastAttemptSuccess;
@@ -64,14 +69,23 @@ internal sealed class DebugPfScanStateMachine {
 
     internal void Reset() {
         _queue.Reset();
+        ResetRunState();
+    }
 
+    internal void ResetRunPreservingDedup() {
+        _queue.ResetRun();
+        ResetRunState();
+    }
+
+    private void ResetRunState() {
         _state = DebugPfScanState.Idle;
         _hasTarget = false;
         _retryTargetAfterCooldown = false;
         _openAttemptsForTarget = 0;
         _consecutiveFailures = 0;
         _processedCount = 0;
-        _nextActionAtUtc = DateTime.MinValue;
+        _nextOpenAtUtc = DateTime.MinValue;
+        _cooldownUntilUtc = DateTime.MinValue;
         _stateDeadlineUtc = DateTime.MinValue;
         _activeRequestSerial = null;
         _lastReadySnapshot = default;
@@ -82,54 +96,27 @@ internal sealed class DebugPfScanStateMachine {
         _lastAttemptListingId = 0UL;
     }
 
-    internal void UpsertVisibleCandidate(DebugPfListingCandidate candidate) {
-        _queue.UpsertVisible(candidate);
-    }
-
-    internal void RefreshCurrentTarget() {
-        if (_hasTarget) {
-            _target = _queue.RefreshCandidate(_target);
-        }
-    }
-
     internal void StartSyncQueue() {
         _state = DebugPfScanState.SyncQueue;
     }
 
     internal bool IsActionReady(DateTime nowUtc) {
-        return nowUtc >= _nextActionAtUtc;
+        return nowUtc >= _nextOpenAtUtc;
     }
 
     internal string SyncQueue(
         DateTime nowUtc,
         IReadOnlyCollection<DebugPfListingCandidate> collectedSnapshot,
-        bool hasIncomingListings,
-        int maxPerRun,
-        int dedupTtlSeconds,
-        bool runFromCollectedListings
+        int dedupTtlSeconds = DefaultDedupTtlSeconds
     ) {
         _queue.PruneCaches(nowUtc, dedupTtlSeconds);
 
-        if (maxPerRun > 0 && _processedCount >= maxPerRun) {
-            return "max_per_run";
-        }
-
         if (_queue.PendingCount == 0) {
-            if (runFromCollectedListings) {
-                _queue.RebuildPendingQueueFromSnapshot(collectedSnapshot, nowUtc, dedupTtlSeconds);
-            } else {
-                _queue.RebuildPendingQueueFromVisible(nowUtc, dedupTtlSeconds);
-            }
+            _queue.RebuildPendingQueueFromSnapshot(collectedSnapshot, nowUtc, dedupTtlSeconds);
         }
 
         if (!_queue.TryTakeNextReadyTarget(nowUtc, dedupTtlSeconds, out var nextTarget)) {
-            if (!IsQueueDrained(_queue.PendingCount, hasIncomingListings)) {
-                _nextActionAtUtc = nowUtc.AddMilliseconds(250);
-                _state = DebugPfScanState.Cooldown;
-                return null;
-            }
-
-            return runFromCollectedListings ? "collected_batch_complete" : "current_page_complete";
+            return "collected_batch_complete";
         }
 
         _target = nextTarget;
@@ -143,10 +130,10 @@ internal sealed class DebugPfScanStateMachine {
     internal void HandleOpenAttemptResult(
         DateTime nowUtc,
         bool opened,
-        int actionIntervalMs,
-        int detailReadyTimeoutMs,
-        int configuredRetries,
-        int postListingCooldownMs,
+        int actionIntervalMs = DefaultActionIntervalMs,
+        int detailReadyTimeoutMs = DefaultDetailReadyTimeoutMs,
+        int configuredRetries = DefaultMaxRetries,
+        int postListingCooldownMs = DefaultPostListingCooldownMs,
         long? requestSerial = null
     ) {
         if (!_hasTarget) {
@@ -155,7 +142,8 @@ internal sealed class DebugPfScanStateMachine {
         }
 
         _openAttemptsForTarget++;
-        _nextActionAtUtc = nowUtc.AddMilliseconds(Configuration.NormalizeScanActionIntervalMs(actionIntervalMs));
+        var normalizedActionIntervalMs = Configuration.NormalizeScanActionIntervalMs(actionIntervalMs);
+        _nextOpenAtUtc = nowUtc.AddMilliseconds(normalizedActionIntervalMs);
 
         if (opened) {
             _stateDeadlineUtc = nowUtc.AddMilliseconds(GetDetailReadyTimeoutMs(detailReadyTimeoutMs));
@@ -166,8 +154,9 @@ internal sealed class DebugPfScanStateMachine {
             return;
         }
 
-        if (ShouldRetryTargetAfterFailure(_openAttemptsForTarget, configuredRetries)) {
+        if (ShouldRetryTargetAfterFailure(_openAttemptsForTarget, Configuration.NormalizeScanRetryCount(configuredRetries))) {
             _retryTargetAfterCooldown = true;
+            _cooldownUntilUtc = _nextOpenAtUtc;
             _state = DebugPfScanState.Cooldown;
             return;
         }
@@ -182,10 +171,9 @@ internal sealed class DebugPfScanStateMachine {
     internal void HandleDetailReadyState(
         DateTime nowUtc,
         DebugPfDetailSnapshot snapshot,
-        int minDwellMs,
-        int detailReadyTimeoutMs,
-        int configuredRetries,
-        int postListingCooldownMs
+        int detailReadyTimeoutMs = DefaultDetailReadyTimeoutMs,
+        int configuredRetries = DefaultMaxRetries,
+        int postListingCooldownMs = DefaultPostListingCooldownMs
     ) {
         if (!_hasTarget) {
             _state = DebugPfScanState.SyncQueue;
@@ -206,7 +194,7 @@ internal sealed class DebugPfScanStateMachine {
 
             var requiredStableTicks = _target.ContentId == 0 ? 4 : 2;
             if (_readyStableTicks >= requiredStableTicks) {
-                _stateDeadlineUtc = nowUtc.AddMilliseconds(GetDetailCollectionTimeoutMs(detailReadyTimeoutMs, minDwellMs));
+                _stateDeadlineUtc = nowUtc.AddMilliseconds(GetDetailCollectionTimeoutMs(detailReadyTimeoutMs));
                 _state = DebugPfScanState.WaitCollected;
                 return;
             }
@@ -219,8 +207,13 @@ internal sealed class DebugPfScanStateMachine {
             return;
         }
 
-        if (ShouldRetryTargetAfterFailure(_openAttemptsForTarget, configuredRetries)) {
+        if (ShouldRetryTargetAfterFailure(_openAttemptsForTarget, Configuration.NormalizeScanRetryCount(configuredRetries))) {
             _retryTargetAfterCooldown = true;
+            _activeRequestSerial = null;
+            _readyStableTicks = 0;
+            _lastReadySnapshot = default;
+            var postCooldownDeadline = nowUtc.AddMilliseconds(Configuration.NormalizeScanPostCooldownMs(postListingCooldownMs));
+            _cooldownUntilUtc = _nextOpenAtUtc >= postCooldownDeadline ? _nextOpenAtUtc : postCooldownDeadline;
             _state = DebugPfScanState.Cooldown;
             return;
         }
@@ -228,7 +221,61 @@ internal sealed class DebugPfScanStateMachine {
         MarkAttempt(nowUtc, success: false, "detail_timeout", PartyDetailScannerAttemptOutcome.TimedOut, postListingCooldownMs);
     }
 
-    internal void HandleCollectedState(DateTime nowUtc, bool hasConsumedAck, int postListingCooldownMs) {
+    internal void HandleServerFailureSignal(
+        DateTime nowUtc,
+        uint logMessageId,
+        bool isNonRetryableUnavailable,
+        int configuredRetries = DefaultMaxRetries,
+        int postListingCooldownMs = DefaultPostListingCooldownMs
+    ) {
+        if (!_hasTarget) {
+            _state = DebugPfScanState.SyncQueue;
+            return;
+        }
+
+        if (isNonRetryableUnavailable) {
+            _queue.RecordAttempt(_target.ListingId, nowUtc, recordCrossRunDedup: false);
+            _lastAttemptListingId = _target.ListingId;
+            _lastAttemptReason = $"pf_unavailable_{logMessageId}";
+            _lastTerminalOutcome = PartyDetailScannerAttemptOutcome.Unavailable;
+            _lastAttemptSuccess = false;
+
+            _hasTarget = false;
+            _retryTargetAfterCooldown = false;
+            _openAttemptsForTarget = 0;
+            _activeRequestSerial = null;
+            _readyStableTicks = 0;
+            _lastReadySnapshot = default;
+            _cooldownUntilUtc = nowUtc.AddMilliseconds(Configuration.NormalizeScanPostCooldownMs(postListingCooldownMs));
+            _state = DebugPfScanState.Cooldown;
+            return;
+        }
+
+        if (ShouldRetryTargetAfterFailure(_openAttemptsForTarget, Configuration.NormalizeScanRetryCount(configuredRetries))) {
+            _retryTargetAfterCooldown = true;
+            _activeRequestSerial = null;
+            _readyStableTicks = 0;
+            _lastReadySnapshot = default;
+            var postCooldownDeadline = nowUtc.AddMilliseconds(Configuration.NormalizeScanPostCooldownMs(postListingCooldownMs));
+            _cooldownUntilUtc = _nextOpenAtUtc >= postCooldownDeadline ? _nextOpenAtUtc : postCooldownDeadline;
+            _state = DebugPfScanState.Cooldown;
+            return;
+        }
+
+        MarkAttempt(
+            nowUtc,
+            success: false,
+            $"pf_error_{logMessageId}",
+            PartyDetailScannerAttemptOutcome.TimedOut,
+            postListingCooldownMs
+        );
+    }
+
+    internal void HandleCollectedState(
+        DateTime nowUtc,
+        bool hasConsumedAck,
+        int postListingCooldownMs = DefaultPostListingCooldownMs
+    ) {
         if (!_hasTarget) {
             _state = DebugPfScanState.SyncQueue;
             return;
@@ -247,7 +294,7 @@ internal sealed class DebugPfScanStateMachine {
     }
 
     internal void AdvanceCooldown(DateTime nowUtc) {
-        if (nowUtc < _nextActionAtUtc) {
+        if (nowUtc < _cooldownUntilUtc) {
             return;
         }
 
@@ -272,10 +319,6 @@ internal sealed class DebugPfScanStateMachine {
         return attemptsMade <= PartyDetailUploadPolicy.NormalizeRetryCount(configuredRetries);
     }
 
-    internal static bool IsQueueDrained(int pendingTargets, bool hasIncomingListings) {
-        return pendingTargets <= 0 && !hasIncomingListings;
-    }
-
     private void MarkAttempt(
         DateTime nowUtc,
         bool success,
@@ -284,7 +327,7 @@ internal sealed class DebugPfScanStateMachine {
         int postListingCooldownMs
     ) {
         if (_hasTarget) {
-            _queue.RecordAttempt(_target.ListingId, nowUtc);
+            _queue.RecordAttempt(_target.ListingId, nowUtc, recordCrossRunDedup: success);
             _lastAttemptListingId = _target.ListingId;
         }
 
@@ -305,16 +348,13 @@ internal sealed class DebugPfScanStateMachine {
         _activeRequestSerial = null;
         _readyStableTicks = 0;
         _lastReadySnapshot = default;
-        _nextActionAtUtc = nowUtc.AddMilliseconds(Configuration.NormalizeScanPostCooldownMs(postListingCooldownMs));
+        _cooldownUntilUtc = nowUtc.AddMilliseconds(Configuration.NormalizeScanPostCooldownMs(postListingCooldownMs));
         _state = DebugPfScanState.Cooldown;
     }
 
-    private static int GetDetailReadyTimeoutMs(int configuredTimeoutMs) {
-        return Configuration.NormalizeScanDetailTimeoutMs(configuredTimeoutMs);
-    }
+    private static int GetDetailReadyTimeoutMs(int configuredTimeoutMs)
+        => Configuration.NormalizeScanDetailTimeoutMs(configuredTimeoutMs);
 
-    private static int GetDetailCollectionTimeoutMs(int configuredTimeoutMs, int minDwellMs) {
-        var timeoutFloorFromDwellMs = minDwellMs + CollectionTimeoutExtraBudgetMs;
-        return Math.Clamp(Math.Max(GetDetailReadyTimeoutMs(configuredTimeoutMs), timeoutFloorFromDwellMs), MinCollectionTimeoutMs, 10000);
-    }
+    private static int GetDetailCollectionTimeoutMs(int configuredTimeoutMs)
+        => Math.Clamp(Math.Max(GetDetailReadyTimeoutMs(configuredTimeoutMs), DetailCollectionTimeoutMs), 1500, 10_000);
 }

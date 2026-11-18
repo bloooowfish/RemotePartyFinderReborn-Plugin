@@ -1061,6 +1061,58 @@ public sealed class TomestoneApiClientAdapterTests
         }
     }
 
+    [Fact]
+    public async Task TomestoneProgressionService_cleans_up_pending_profile_request_entry_in_finally_when_caller_cancels_or_fetch_fails() {
+        var config = EnabledConfiguration();
+        var firstRequestStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var allowFirstResponse = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var callCount = 0;
+
+        using var handler = new DelegateHttpMessageHandler(async (request, _) => {
+            var currentCall = Interlocked.Increment(ref callCount);
+            if (currentCall == 1) {
+                firstRequestStarted.TrySetResult();
+                await allowFirstResponse.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                return new HttpResponseMessage(HttpStatusCode.InternalServerError);
+            }
+
+            return ProfileWithTwoEncounters();
+        });
+        var now = new DateTime(2026, 5, 10, 14, 0, 0, DateTimeKind.Utc);
+        using var apiClient = new TomestoneApiClient(config, handler, () => now);
+        var service = new TomestoneProgressionService(apiClient, config, utcNow: () => now);
+
+        using var callerCts = new CancellationTokenSource();
+        var firstTask = service.FetchProgressionDataAsync("Alpha", "Tonberry", 73U, 101U, callerCts.Token);
+        await firstRequestStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, service.PendingProfileRequestCountForTesting);
+
+        // Canceling the caller leaves the shared underlying fetch in-flight briefly,
+        // and completing/failing the underlying fetch must always clear _profileRequests via finally.
+        callerCts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => firstTask);
+
+        allowFirstResponse.TrySetResult();
+        var deadline = DateTime.UtcNow.AddSeconds(2);
+        while (service.PendingProfileRequestCountForTesting > 0 && DateTime.UtcNow < deadline) {
+            await Task.Delay(10);
+        }
+
+        Assert.Equal(0, service.PendingProfileRequestCountForTesting);
+
+        // A retry must not get stuck on the canceled/failed Lazy entry and must issue a new request.
+        _ = await service.FetchProgressionDataAsync("Alpha", "Tonberry", 73U, 101U, CancellationToken.None);
+        Assert.Equal(2, callCount);
+        Assert.Equal(0, service.PendingProfileRequestCountForTesting);
+    }
+
+    private sealed class DelegateHttpMessageHandler(
+        Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> handler
+    ) : HttpMessageHandler {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            => handler(request, cancellationToken);
+    }
+
     private static Configuration EnabledConfiguration() => new()
     {
         EnableTomestoneProgressEnrichment = true,
