@@ -507,7 +507,7 @@ public sealed class TomestoneBatchProcessorTests
     }
 
     [Fact]
-    public async Task Batch_processor_abandons_single_boss_cleared_without_percentiles()
+    public async Task Batch_processor_returns_queried_coverage_when_single_boss_cleared_without_percentiles()
     {
         var progression = new StubTomestoneProgressionService
         {
@@ -523,17 +523,18 @@ public sealed class TomestoneBatchProcessorTests
         Assert.False(result.HadTransientFailure);
         Assert.False(result.HitRateLimitCooldown);
         Assert.False(result.HitApiKeyRejected);
-        Assert.Empty(result.ProcessedResults);
-        var abandon = Assert.Single(result.AbandonedLeases);
-        Assert.Equal(7301UL, abandon.ContentId);
-        Assert.Equal(101u, abandon.EncounterId);
-        Assert.Equal("tomestone_no_data", abandon.Reason);
-        Assert.Equal("tomestone_cleared_without_percentiles", abandon.FailureCode);
-        Assert.Equal("Tomestone API reported completed activity without clear rankings.", abandon.Message);
+        Assert.Empty(result.AbandonedLeases);
+        var submitted = Assert.Single(result.ProcessedResults);
+        Assert.Equal(7301UL, submitted.ContentId);
+        Assert.Equal(101u, submitted.EncounterId);
+        Assert.Empty(submitted.Encounters);
+        Assert.Empty(submitted.BossPercentages);
+        Assert.Empty(submitted.PhaseProgress);
+        Assert.Equal([101], submitted.TomestoneQueriedEncounters);
     }
 
     [Fact]
-    public async Task Batch_processor_split_boss_cleared_primary_and_prog_secondary_emits_only_secondary_coverage()
+    public async Task Batch_processor_split_boss_cleared_primary_and_prog_secondary_covers_both_encounters()
     {
         var progression = new StubTomestoneProgressionService
         {
@@ -568,7 +569,43 @@ public sealed class TomestoneBatchProcessorTests
         Assert.Equal(104u, submitted.EncounterId);
         Assert.Equal(42.5, submitted.BossPercentages[105], 1);
         Assert.False(submitted.BossPercentages.ContainsKey(104));
-        Assert.Equal([105], submitted.TomestoneQueriedEncounters);
+        Assert.Equal([104, 105], submitted.TomestoneQueriedEncounters);
+    }
+
+    [Fact]
+    public async Task Batch_processor_split_boss_both_cleared_returns_result_with_both_queried_encounters()
+    {
+        var progression = new StubTomestoneProgressionService
+        {
+            OnFetchProgressionDataAsync = static (_, _, _, _, _) => Task.FromResult(TomestoneProgressData.ClearedProgress),
+        };
+        var processor = CreateProcessor(progression);
+        var session = new TomestoneLeaseSession(
+            new UploadUrl("https://upload.example/"),
+            [
+                new TomestoneJob
+                {
+                    ContentId = 7402,
+                    ZoneId = 73,
+                    DifficultyId = 101,
+                    EncounterId = 104,
+                    SecondaryEncounterId = 105,
+                    Name = "Split Both Cleared",
+                    Server = "Tonberry",
+                    Region = "JP",
+                    LeaseToken = "lease-split-both-cleared",
+                },
+            ]);
+
+        var result = await processor.ProcessLeaseSessionAsync(session, CancellationToken.None);
+
+        Assert.False(result.HadTransientFailure);
+        Assert.Empty(result.AbandonedLeases);
+        var submitted = Assert.Single(result.ProcessedResults);
+        Assert.Empty(submitted.Encounters);
+        Assert.Empty(submitted.BossPercentages);
+        Assert.Empty(submitted.PhaseProgress);
+        Assert.Equal([104, 105], submitted.TomestoneQueriedEncounters);
     }
 
     private sealed class SplitBossProfileHandler(Action onRequest) : System.Net.Http.HttpMessageHandler

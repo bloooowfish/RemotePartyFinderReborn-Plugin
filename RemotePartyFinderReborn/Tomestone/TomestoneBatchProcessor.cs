@@ -286,19 +286,6 @@ internal sealed class TomestoneBatchProcessor
         }
 
         var result = BuildTomestoneResult(job, targetResults);
-        if (result == null)
-        {
-            return new SingleJobOutcome(
-                Result: null,
-                Abandonment: TomestoneLeaseAbandoner.CreateJobAbandonment(
-                    job,
-                    "tomestone_no_data",
-                    "tomestone_cleared_without_percentiles",
-                    "Tomestone API reported completed activity without clear rankings."),
-                TransientFailure: false,
-                HitRateLimitCooldown: false,
-                HitApiKeyRejected: false);
-        }
 
         return new SingleJobOutcome(
             Result: result,
@@ -328,20 +315,18 @@ internal sealed class TomestoneBatchProcessor
         var bossPercentages = new Dictionary<int, double>();
         var phaseProgress = new Dictionary<int, List<PhaseProgress>>();
         var queriedEncounters = new List<int>(targetResults.Count);
-        var sawClearedWithoutPercentiles = false;
 
         foreach (var (encounterId, data) in targetResults)
         {
-            if (data.Cleared)
-            {
-                sawClearedWithoutPercentiles = true;
-                continue;
-            }
-
             var encounterIdKey = (int)encounterId;
             if (!queriedEncounters.Contains(encounterIdKey))
             {
                 queriedEncounters.Add(encounterIdKey);
+            }
+
+            if (data.Cleared)
+            {
+                continue;
             }
 
             if (data.BossPercentage.HasValue)
@@ -353,11 +338,6 @@ internal sealed class TomestoneBatchProcessor
             {
                 phaseProgress[encounterIdKey] = data.Phases.ToList();
             }
-        }
-
-        if (sawClearedWithoutPercentiles && bossPercentages.Count == 0 && phaseProgress.Count == 0)
-        {
-            return null;
         }
 
         return new TomestoneResult

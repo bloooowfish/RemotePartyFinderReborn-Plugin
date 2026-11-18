@@ -17,7 +17,7 @@ internal sealed class LuminaLogMessageLookup : ILogMessageLookup {
 
     public bool TryGet(uint logMessageId, out LogMessageInfo message) {
         var sheet = _dataManager.GetExcelSheet<LuminaLogMessage>();
-        if (!sheet.TryGetRow(logMessageId, out var row)) {
+        if (sheet is null || !sheet.TryGetRow(logMessageId, out var row)) {
             message = default;
             return false;
         }
@@ -30,6 +30,10 @@ internal sealed class LuminaLogMessageLookup : ILogMessageLookup {
         ArgumentNullException.ThrowIfNull(predicate);
 
         var sheet = _dataManager.GetExcelSheet<LuminaLogMessage>();
+        if (sheet is null) {
+            yield break;
+        }
+
         foreach (var row in sheet) {
             var message = ToInfo(row);
             if (predicate(message)) {

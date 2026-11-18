@@ -136,6 +136,7 @@ public class Plugin : IDalamudPlugin {
                     this.AddonLifecycle,
                     this.ChatGui,
                     this.ToastGui,
+                    this.DataManager,
                     message => Log.Warning(message),
                     message => Log.Debug(message)),
                 gameInteropProvider: this.GameInteropProvider,

@@ -103,19 +103,35 @@ public sealed class PartyDetailUploadResponseMapperTests {
         Assert.Empty(state.TerminalRejected);
     }
 
-    [Theory]
-    [InlineData("invalid", "too many members in request")]
-    [InlineData("forbidden", "capability resource mismatch")]
-    public void Batch_status_invalid_or_forbidden_maps_to_terminal_rejected(string status, string message) {
-        var state = ApplyBatchResponse($$"""
+    [Fact]
+    public void Batch_status_invalid_maps_to_terminal_rejected() {
+        var state = ApplyBatchResponse("""
             {"status":"partial","results":[
-                {"listing_id":9001,"status":"{{status}}","matched_count":0,"modified_count":0,"message":"{{message}}"}
+                {"listing_id":9001,"status":"invalid","matched_count":0,"modified_count":0,"message":"too many members in request"}
             ]}
             """, [9001U]);
 
         Assert.Empty(state.Applied);
         Assert.Empty(state.Missing);
-        Assert.Equal(message, state.TerminalRejected[9001U]);
+        Assert.Empty(state.CapabilityForbidden);
+        Assert.Equal("too many members in request", state.TerminalRejected[9001U]);
+    }
+
+    [Theory]
+    [InlineData("capability resource mismatch")]
+    [InlineData("missing capability token")]
+    [InlineData("forbidden")]
+    public void Batch_status_forbidden_with_capability_message_maps_to_capability_forbidden(string message) {
+        var state = ApplyBatchResponse($$"""
+            {"status":"partial","results":[
+                {"listing_id":9001,"status":"forbidden","matched_count":0,"modified_count":0,"message":"{{message}}"}
+            ]}
+            """, [9001U]);
+
+        Assert.Empty(state.Applied);
+        Assert.Empty(state.Missing);
+        Assert.Empty(state.TerminalRejected);
+        Assert.Contains(9001U, state.CapabilityForbidden);
     }
 
     [Fact]
@@ -142,7 +158,9 @@ public sealed class PartyDetailUploadResponseMapperTests {
             state.Applied,
             state.Missing,
             state.TerminalRejected,
-            state.RetryAfterByListing
+            state.RetryAfterByListing,
+            state.CapabilityForbidden,
+            state.RetryableFailed
         );
 
         return state;
@@ -153,5 +171,7 @@ public sealed class PartyDetailUploadResponseMapperTests {
         internal HashSet<uint> Missing { get; } = [];
         internal Dictionary<uint, string> TerminalRejected { get; } = [];
         internal Dictionary<uint, int?> RetryAfterByListing { get; } = [];
+        internal HashSet<uint> CapabilityForbidden { get; } = [];
+        internal HashSet<uint> RetryableFailed { get; } = [];
     }
 }

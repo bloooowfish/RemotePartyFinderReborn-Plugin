@@ -193,6 +193,12 @@ internal sealed class ContentIdResolveQueue {
     }
 
     public bool TryStartNext(DateTime nowUtc, out ResolveRequestStatus request) {
+        // Enforce single-flight so concurrent CharaCard requests cannot race the single client UI/packet state.
+        if (_requests.Values.Any(static candidate => candidate.State == ResolveState.InFlight)) {
+            request = default!;
+            return false;
+        }
+
         foreach (var candidate in _requests.Values
                      .Where(candidate => candidate.State == ResolveState.Queued
                                          || (candidate.State == ResolveState.FailedTransient

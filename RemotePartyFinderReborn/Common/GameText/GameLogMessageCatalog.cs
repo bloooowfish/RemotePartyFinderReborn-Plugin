@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -49,6 +50,24 @@ internal static class GameLogMessageCatalog {
         return KnownSuppressionLogMessageIds()
             .Where(id => !lookup.TryGet(id, out _))
             .ToArray();
+    }
+
+    internal static HashSet<string> ResolveCharaCardFailureTexts(ILogMessageLookup lookup) {
+        ArgumentNullException.ThrowIfNull(lookup);
+
+        var texts = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var messageId in CharaCardFailureMessageIdSet) {
+            if (!lookup.TryGet(messageId, out var info)) {
+                continue;
+            }
+
+            var trimmed = info.Text?.Trim();
+            if (!string.IsNullOrWhiteSpace(trimmed)) {
+                texts.Add(trimmed);
+            }
+        }
+
+        return texts;
     }
 
     internal static IReadOnlyList<LogMessageInfo> SearchSuppressionCandidates(

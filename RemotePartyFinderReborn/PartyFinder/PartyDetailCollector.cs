@@ -163,7 +163,7 @@ internal sealed class PartyDetailCollector : IDisposable {
     }
 
     private bool TryQueuePayloadCore(UploadablePartyDetail payload, PartyDetailRequestOwner owner) {
-        var fingerprint = PartyDetailUploadPolicy.ComputeFingerprint(payload.MemberContentIds, payload.MemberJobs, payload.SlotFlags);
+        var fingerprint = PartyDetailUploadPolicy.ComputeFingerprint(payload);
         var nowUtc = _utcNow();
 
         LogDebug(
@@ -276,26 +276,15 @@ internal sealed class PartyDetailCollector : IDisposable {
                 Interlocked.Increment(ref _lastSuccessfulUploadAckVersion);
                 break;
 
-            case DetailUploadResult.ListingMissing:
             case DetailUploadResult.TerminalRejected:
                 _pendingDetailQueue.RemoveIfUnchanged(pending);
-                var terminalAt = _utcNow();
-                Interlocked.Exchange(ref _lastTerminalUploadAtUtcTicks, terminalAt.Ticks);
-                _lastTerminalUploadListingId = pending.Detail.ListingId;
-                Interlocked.Increment(ref _lastTerminalUploadAckVersion);
-                if (uploadOutcome.Result == DetailUploadResult.TerminalRejected) {
-                    LogWarning($"PartyDetailCollector: listing {pending.Detail.ListingId} detail rejected by server; {uploadOutcome.Message}");
-                } else {
-                    LogDebug($"PartyDetailCollector: listing {pending.Detail.ListingId} missing on server while applying detail update; dropping queued detail payload.");
-                }
+                RecordTerminalUpload(pending.Detail.ListingId);
+                LogWarning($"PartyDetailCollector: listing {pending.Detail.ListingId} detail rejected by server; {uploadOutcome.Message}");
                 break;
 
+            case DetailUploadResult.ListingMissing:
             case DetailUploadResult.Deferred:
-                if (DropManualBestEffortDetail(pending, uploadOutcome.Result)) {
-                    break;
-                }
-
-                ScheduleDeferredBackoff(pending);
+                ScheduleDeferredBackoff(pending, uploadOutcome.Result);
                 break;
 
             default:
@@ -306,6 +295,13 @@ internal sealed class PartyDetailCollector : IDisposable {
                 ScheduleRetry(pending, uploadOutcome.RetryAfterSeconds);
                 break;
         }
+    }
+
+    private void RecordTerminalUpload(uint listingId) {
+        var terminalAt = _utcNow();
+        Interlocked.Exchange(ref _lastTerminalUploadAtUtcTicks, terminalAt.Ticks);
+        _lastTerminalUploadListingId = listingId;
+        Interlocked.Increment(ref _lastTerminalUploadAckVersion);
     }
 
     private bool DropManualBestEffortDetail(PendingDetailEntry pending, DetailUploadResult result) {
@@ -349,12 +345,24 @@ internal sealed class PartyDetailCollector : IDisposable {
         _pendingDetailQueue.TryUpdate(current, updated);
     }
 
-    private void ScheduleDeferredBackoff(PendingDetailEntry pending) {
+    private void ScheduleDeferredBackoff(PendingDetailEntry pending, DetailUploadResult result) {
         if (!_pendingDetailQueue.TryGet(pending.Detail.ListingId, out var current)) {
             return;
         }
 
         if (current.Fingerprint != pending.Fingerprint) {
+            return;
+        }
+
+        var configuredRetryCount = _configuration?.DetailUploadRetryCount ?? 0;
+        if (PartyDetailUploadPolicy.ShouldDropDeferredPendingDetail(current.DeferredCount, configuredRetryCount)) {
+            _pendingDetailQueue.RemoveIfUnchanged(pending);
+            if (result == DetailUploadResult.ListingMissing) {
+                RecordTerminalUpload(pending.Detail.ListingId);
+                LogDebug($"PartyDetailCollector: listing {pending.Detail.ListingId} missing on server after {current.DeferredCount} deferral(s); dropping queued detail payload.");
+            } else {
+                LogWarning($"PartyDetailCollector: dropping detail payload listing={pending.Detail.ListingId} after {current.DeferredCount} deferrals ({result})");
+            }
             return;
         }
 
@@ -378,7 +386,7 @@ internal sealed class PartyDetailCollector : IDisposable {
     ) {
         _pendingDetailQueue.Enqueue(
             payload,
-            PartyDetailUploadPolicy.ComputeFingerprint(payload.MemberContentIds, payload.MemberJobs, payload.SlotFlags),
+            PartyDetailUploadPolicy.ComputeFingerprint(payload),
             nowUtc,
             owner
         );
@@ -487,12 +495,13 @@ internal sealed class PartyDetailCollector : IDisposable {
             return null;
         }
 
-        return new PendingDetailDebugState(pending.AttemptCount, pending.NextAttemptAtUtc);
+        return new PendingDetailDebugState(pending.AttemptCount, pending.NextAttemptAtUtc, pending.DeferredCount);
     }
 
     internal readonly record struct PendingDetailDebugState(
         int AttemptCount,
-        DateTime NextAttemptAtUtc
+        DateTime NextAttemptAtUtc,
+        int DeferredCount = 0
     );
 
     private static void LogDebug(string message) {

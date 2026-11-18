@@ -32,7 +32,20 @@ internal sealed class PendingDetailQueue {
         _pendingDetails.AddOrUpdate(
             payload.ListingId,
             _ => queued,
-            (_, existing) => existing.Fingerprint == fingerprint ? existing : queued
+            (_, existing) => {
+                var promotedOwner = existing.Owner == PartyDetailRequestOwner.Scanner
+                    || owner == PartyDetailRequestOwner.Scanner
+                    ? PartyDetailRequestOwner.Scanner
+                    : owner;
+
+                if (existing.Fingerprint != fingerprint) {
+                    return queued with { Owner = promotedOwner };
+                }
+
+                return existing.Owner != promotedOwner
+                    ? existing with { Owner = promotedOwner }
+                    : existing;
+            }
         );
     }
 

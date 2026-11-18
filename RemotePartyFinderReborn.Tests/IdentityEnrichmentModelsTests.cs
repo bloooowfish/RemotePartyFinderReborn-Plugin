@@ -236,23 +236,49 @@ public sealed class IdentityEnrichmentModelsTests {
         var nowUtc = new DateTime(2026, 4, 13, 2, 30, 0, DateTimeKind.Utc);
         var queue = new ContentIdResolveQueue();
         Assert.True(queue.Enqueue(8108UL, nowUtc.AddMinutes(-1)));
-        Assert.True(queue.Enqueue(8208UL, nowUtc.AddMinutes(-1)));
-        Assert.True(queue.TryStartNext(nowUtc.AddMinutes(-1), out var first));
-        Assert.True(queue.TryStartNext(nowUtc.AddMinutes(-1), out var second));
+        Assert.True(queue.TryStartNext(nowUtc.AddMinutes(-1), out var request));
+
+        Assert.Empty(queue.FindExpiredInFlightRequests(
+            nowUtc,
+            TimeSpan.FromSeconds(5),
+            contentId => contentId == request.ContentId
+        ));
 
         var expired = queue.FindExpiredInFlightRequests(
             nowUtc,
             TimeSpan.FromSeconds(5),
-            contentId => contentId == first.ContentId
+            _ => false
         );
 
         var candidate = Assert.Single(expired);
-        Assert.Equal(second.ContentId, candidate.ContentId);
-        Assert.Equal(second.AttemptVersion, candidate.AttemptVersion);
+        Assert.Equal(request.ContentId, candidate.ContentId);
+        Assert.Equal(request.AttemptVersion, candidate.AttemptVersion);
         Assert.True(queue.MarkTimeout(candidate.ContentId, candidate.AttemptVersion, nowUtc));
         Assert.False(queue.MarkTimeout(candidate.ContentId, candidate.AttemptVersion - 1, nowUtc));
-        Assert.Equal(ResolveState.InFlight, queue.GetState(first.ContentId));
-        Assert.Equal(ResolveState.FailedTransient, queue.GetState(second.ContentId));
+        Assert.Equal(ResolveState.FailedTransient, queue.GetState(request.ContentId));
+    }
+
+    [Fact]
+    public void TryStartNext_enforces_single_flight_while_any_request_is_in_flight() {
+        var nowUtc = new DateTime(2026, 4, 13, 2, 45, 0, DateTimeKind.Utc);
+        var queue = new ContentIdResolveQueue();
+
+        Assert.True(queue.Enqueue(1001UL, nowUtc));
+        Assert.True(queue.Enqueue(1002UL, nowUtc));
+
+        Assert.True(queue.TryStartNext(nowUtc, out var first));
+        Assert.Equal(1001UL, first.ContentId);
+        Assert.Equal(ResolveState.InFlight, queue.GetState(1001UL));
+
+        // While 1001 is InFlight, 1002 must not start concurrently.
+        Assert.False(queue.TryStartNext(nowUtc, out _));
+        Assert.Equal(ResolveState.Queued, queue.GetState(1002UL));
+
+        // Once 1001 settles (resolved or timed out), 1002 becomes eligible.
+        queue.MarkResolved(new CharacterIdentitySnapshot(1001UL, "First", 74, "Tonberry", nowUtc));
+        Assert.True(queue.TryStartNext(nowUtc, out var second));
+        Assert.Equal(1002UL, second.ContentId);
+        Assert.Equal(ResolveState.InFlight, queue.GetState(1002UL));
     }
 
     [Fact]

@@ -144,6 +144,7 @@ public sealed class PartyDetailRequestCoordinatorTests {
             LeaderContentId = leaderContentId,
             LeaderName = "Leader",
             HomeWorld = 77,
+            CreatedWorld = 77,
             MemberContentIds = new List<ulong> { leaderContentId },
             MemberJobs = new List<byte> { 19 },
             SlotFlags = new List<string> { "0x0000000000000001" },

@@ -40,6 +40,8 @@ internal sealed class PartyDetailUploadExecutor {
     ) {
         var applied = new HashSet<uint>();
         var missing = new HashSet<uint>();
+        var deferred = new HashSet<uint>();
+        var retryableFailed = new HashSet<uint>();
         var terminalRejected = new Dictionary<uint, string>();
         var retryAfterByListing = new Dictionary<uint, int?>();
         var attempted = new HashSet<uint>();
@@ -58,7 +60,17 @@ internal sealed class PartyDetailUploadExecutor {
             }
 
             if (uploadTarget.DetailBatchUnsupported) {
-                await UploadSinglesToTargetAsync(uploadTarget, candidates, applied, missing, terminalRejected, retryAfterByListing, attempted);
+                await UploadSinglesToTargetAsync(
+                    uploadTarget,
+                    candidates,
+                    applied,
+                    missing,
+                    terminalRejected,
+                    retryAfterByListing,
+                    attempted,
+                    deferred,
+                    retryableFailed
+                );
                 continue;
             }
 
@@ -88,21 +100,36 @@ internal sealed class PartyDetailUploadExecutor {
                 var body = await response.Content.ReadAsStringAsync();
 
                 if (response.IsSuccessStatusCode) {
-                    UploadAttemptRecorder.RecordSuccess(uploadTarget);
-                    foreach (var item in sendable) {
-                        uploadTarget.InvalidateDetailCapability(item.Pending.Detail.ListingId);
-                    }
-
                     if (DetailUploadResponseMapper.TryParseDetailBatchResponse(body, out var batchResponse) && batchResponse.Results.Count > 0) {
+                        var targetCapabilityForbidden = new HashSet<uint>();
                         DetailUploadResponseMapper.ApplyBatchResponse(
                             batchResponse,
                             sendable.Select(static item => item.Pending.Detail.ListingId),
                             applied,
                             missing,
                             terminalRejected,
-                            retryAfterByListing
+                            retryAfterByListing,
+                            targetCapabilityForbidden,
+                            retryableFailed
                         );
+
+                        if (targetCapabilityForbidden.Count > 0) {
+                            uploadTarget.MarkDetailCapabilitiesRequired();
+                            foreach (var listingId in targetCapabilityForbidden) {
+                                uploadTarget.InvalidateDetailCapability(listingId);
+                                deferred.Add(listingId);
+                            }
+                        }
+
+                        // Keep endpoint failure state honest when every item in the batch was rejected for capability reasons.
+                        if (targetCapabilityForbidden.Count < sendable.Count) {
+                            UploadAttemptRecorder.RecordSuccess(uploadTarget);
+                        }
                     } else {
+                        UploadAttemptRecorder.RecordSuccess(uploadTarget);
+                        foreach (var item in sendable) {
+                            retryableFailed.Add(item.Pending.Detail.ListingId);
+                        }
                         _warningLog($"PartyDetailCollector: {endpoint.Url}: unexpected batch response without item results; retrying sent detail payloads");
                     }
 
@@ -120,7 +147,9 @@ internal sealed class PartyDetailUploadExecutor {
                         missing,
                         terminalRejected,
                         retryAfterByListing,
-                        attempted
+                        attempted,
+                        deferred,
+                        retryableFailed
                     );
                     continue;
                 }
@@ -130,9 +159,13 @@ internal sealed class PartyDetailUploadExecutor {
                     uploadTarget.MarkDetailCapabilitiesRequired();
                     foreach (var item in sendable) {
                         uploadTarget.InvalidateDetailCapability(item.Pending.Detail.ListingId);
+                        deferred.Add(item.Pending.Detail.ListingId);
                     }
                 } else {
                     UploadAttemptRecorder.RecordFailure(uploadTarget, _utcNow());
+                    foreach (var item in sendable) {
+                        retryableFailed.Add(item.Pending.Detail.ListingId);
+                    }
                 }
 
                 if ((int)response.StatusCode == 429) {
@@ -151,9 +184,15 @@ internal sealed class PartyDetailUploadExecutor {
                 _debugLog($"PartyDetailCollector: {endpoint.Url}: {response.StatusCode} {body}");
             } catch (OperationCanceledException exception) {
                 UploadAttemptRecorder.RecordFailure(uploadTarget, _utcNow());
+                foreach (var item in sendable) {
+                    retryableFailed.Add(item.Pending.Detail.ListingId);
+                }
                 _errorLog($"PartyDetailCollector batch upload timed out to {endpoint.Url}: {exception.Message}");
             } catch (Exception exception) {
                 UploadAttemptRecorder.RecordFailure(uploadTarget, _utcNow());
+                foreach (var item in sendable) {
+                    retryableFailed.Add(item.Pending.Detail.ListingId);
+                }
                 _errorLog($"PartyDetailCollector batch upload error to {endpoint.Url}: {exception.Message}");
             }
         }
@@ -167,7 +206,12 @@ internal sealed class PartyDetailUploadExecutor {
                 outcomes[listingId] = new DetailUploadOutcome(DetailUploadResult.TerminalRejected, Message: message);
             } else if (missing.Contains(listingId)) {
                 outcomes[listingId] = new DetailUploadOutcome(DetailUploadResult.ListingMissing);
-            } else if (!attempted.Contains(listingId)) {
+            } else if (retryableFailed.Contains(listingId)) {
+                outcomes[listingId] = new DetailUploadOutcome(
+                    DetailUploadResult.RetryableFailure,
+                    retryAfterByListing.GetValueOrDefault(listingId)
+                );
+            } else if (deferred.Contains(listingId) || !attempted.Contains(listingId)) {
                 outcomes[listingId] = new DetailUploadOutcome(DetailUploadResult.Deferred);
             } else {
                 outcomes[listingId] = new DetailUploadOutcome(
@@ -187,7 +231,9 @@ internal sealed class PartyDetailUploadExecutor {
         HashSet<uint> missing,
         Dictionary<uint, string> terminalRejected,
         Dictionary<uint, int?> retryAfterByListing,
-        HashSet<uint> attempted
+        HashSet<uint> attempted,
+        HashSet<uint> deferred,
+        HashSet<uint> retryableFailed
     ) {
         foreach (var pending in pendingEntries) {
             var listingId = pending.Detail.ListingId;
@@ -201,7 +247,16 @@ internal sealed class PartyDetailUploadExecutor {
             }
             attempted.Add(listingId);
 
-            DetailUploadResponseMapper.MergeUploadOutcome(listingId, outcome.Value, applied, missing, terminalRejected, retryAfterByListing);
+            DetailUploadResponseMapper.MergeUploadOutcome(
+                listingId,
+                outcome.Value,
+                applied,
+                missing,
+                terminalRejected,
+                retryAfterByListing,
+                deferred,
+                retryableFailed
+            );
         }
     }
 
@@ -264,7 +319,6 @@ internal sealed class PartyDetailUploadExecutor {
 
             if (response.IsSuccessStatusCode) {
                 UploadAttemptRecorder.RecordSuccess(uploadTarget);
-                uploadTarget.InvalidateDetailCapability(payload.ListingId);
 
                 var outcome = DetailUploadResponseMapper.MapSuccessfulSingleResponse(
                     body,
@@ -285,9 +339,11 @@ internal sealed class PartyDetailUploadExecutor {
             if (isAuthFailure) {
                 uploadTarget.MarkDetailCapabilitiesRequired();
                 uploadTarget.InvalidateDetailCapability(payload.ListingId);
-            } else {
-                UploadAttemptRecorder.RecordFailure(uploadTarget, _utcNow());
+                _debugLog($"PartyDetailCollector: {endpoint.Url}: {response.StatusCode} {body}");
+                return new DetailUploadOutcome(DetailUploadResult.Deferred);
             }
+
+            UploadAttemptRecorder.RecordFailure(uploadTarget, _utcNow());
 
             int? retryAfterSeconds = null;
             if ((int)response.StatusCode == 429) {

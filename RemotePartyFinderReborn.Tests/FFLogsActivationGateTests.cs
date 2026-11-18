@@ -332,6 +332,7 @@ public sealed class FFLogsActivationGateTests {
             LeaderContentId = 44UL,
             LeaderName = "Leader",
             HomeWorld = 77,
+            CreatedWorld = 77,
             MemberContentIds = [44UL, 55UL],
             MemberJobs = [19, 24],
             SlotFlags = ["0x0000000000000000", "0x0000000000000000"],

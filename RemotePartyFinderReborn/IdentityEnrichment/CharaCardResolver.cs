@@ -98,6 +98,8 @@ internal readonly record struct GameUiMessageModel(
 internal sealed class CharaCardResolver : IDisposable {
     private static readonly TimeSpan DefaultRequestTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan DefaultIdentityUploadAttemptTimeout = TimeSpan.FromSeconds(5);
+    internal static readonly TimeSpan MinDispatchInterval = TimeSpan.FromMilliseconds(350);
+    internal const int MaxDispatchJitterMs = 100;
     internal static IReadOnlySet<uint> PlateFailureMessageIds => GameLogMessageCatalog.CharaCardFailureMessageIds;
     internal static readonly AddonEvent[] SelectOkSuppressionEvents = [
         AddonEvent.PreSetup,
@@ -122,6 +124,7 @@ internal sealed class CharaCardResolver : IDisposable {
     private readonly PlateFailureSuppressionState _plateFailureSuppressionState = new();
     private readonly Func<ushort, string?> _worldNameResolver;
     private readonly Func<DateTime> _utcNow;
+    private readonly Func<int, int, int> _nextJitterMs;
     private readonly Action<CharacterIdentitySnapshot> _persistResolvedIdentity;
     private readonly TimeSpan _requestTimeout;
     private readonly Action<string>? _debugSink;
@@ -134,6 +137,7 @@ internal sealed class CharaCardResolver : IDisposable {
     private readonly Dictionary<ulong, PendingProjection> _pendingProjections = new();
     private readonly object _sync = new();
     private CharaCardResolverDebugSnapshot? _latestDebugSnapshot;
+    private DateTime _nextDispatchAllowedAtUtc = DateTime.MinValue;
     private bool _disposed;
 
     internal CharaCardResolver(
@@ -176,7 +180,8 @@ internal sealed class CharaCardResolver : IDisposable {
         Func<IReadOnlyList<CharacterIdentityUploadPayload>, CancellationToken, Task<bool>>? uploadResolvedIdentitiesAsync = null,
         HttpClient? identityUploadHttpClient = null,
         ISelectOkDialogSuppressionRuntime? selectOkDialogSuppressionRuntime = null,
-        Func<bool>? isOperational = null
+        Func<bool>? isOperational = null,
+        Func<int, int, int>? nextJitterMs = null
     ) {
         _database = database ?? throw new ArgumentNullException(nameof(database));
         _debugSink = debugSink;
@@ -186,6 +191,7 @@ internal sealed class CharaCardResolver : IDisposable {
         _selectOkDialogSuppressionRuntime = selectOkDialogSuppressionRuntime;
         _worldNameResolver = worldNameResolver ?? ResolveWorldName;
         _utcNow = utcNow ?? (() => DateTime.UtcNow);
+        _nextJitterMs = nextJitterMs ?? (static (min, max) => Random.Shared.Next(min, max));
         _persistResolvedIdentity = persistResolvedIdentity ?? _database.UpsertResolvedIdentity;
         _queue = new ContentIdResolveQueue(maxAttempts: ResolveMaxAttemptsFromRetryCount(configuration?.CharaCardResolveRetryCount ?? 1));
         _requestTimeout = requestTimeout ?? DefaultRequestTimeout;
@@ -308,6 +314,10 @@ internal sealed class CharaCardResolver : IDisposable {
 
         ResolveRequestStatus request;
         lock (_sync) {
+            if (nowUtc < _nextDispatchAllowedAtUtc) {
+                return;
+            }
+
             if (!_queue.TryStartNext(nowUtc, out request)) {
                 return;
             }
@@ -325,6 +335,10 @@ internal sealed class CharaCardResolver : IDisposable {
 
             lock (_sync) {
                 var observedAtUtc = _utcNow();
+                var jitterMs = Math.Clamp(_nextJitterMs(0, MaxDispatchJitterMs + 1), 0, MaxDispatchJitterMs);
+                _nextDispatchAllowedAtUtc = observedAtUtc
+                    + MinDispatchInterval
+                    + TimeSpan.FromMilliseconds(jitterMs);
                 _plateFailureSuppressionState.ArmDispatchedRequestSuppression(observedAtUtc);
                 _plateFailureSuppressionState.TrackSelectOkDialogBudget(request.ContentId, observedAtUtc);
             }
@@ -644,7 +658,7 @@ internal sealed class CharaCardResolver : IDisposable {
     }
 
     private bool ShouldSuppressAddonOrGameLogSource(string source) {
-        if (source.StartsWith("Toast.", StringComparison.Ordinal)) {
+        if (string.Equals(source, "Toast.Error", StringComparison.Ordinal)) {
             return ShouldSuppressGameUiText(source);
         }
 

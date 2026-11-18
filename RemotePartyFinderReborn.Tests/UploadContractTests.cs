@@ -23,6 +23,34 @@ public sealed class UploadContractTests {
     }
 
     [Fact]
+    public void Uploadable_party_detail_and_batch_item_serialize_new_metadata_fields_in_snake_case() {
+        var detail = new UploadablePartyDetail {
+            ListingId = 9001U,
+            LeaderContentId = 44UL,
+            LeaderName = "Leader",
+            HomeWorld = 77,
+            CreatedWorld = 74,
+            LastServerRestart = 1700000000U,
+            ObservedAtUnixMs = 1770000000123L,
+            MemberContentIds = [44UL],
+            MemberJobs = [19],
+            SlotFlags = ["0x0000000000000001"],
+        };
+
+        var detailJson = JObject.Parse(JsonConvert.SerializeObject(detail));
+        Assert.Equal((ushort)74, detailJson.Value<ushort>("created_world"));
+        Assert.Equal(1700000000U, detailJson.Value<uint>("last_server_restart"));
+        Assert.Equal(1770000000123L, detailJson.Value<long>("observed_at_unix_ms"));
+
+        var batchItem = UploadablePartyDetailBatchItem.FromDetail(detail, "tok-1");
+        var batchJson = JObject.Parse(JsonConvert.SerializeObject(batchItem));
+        Assert.Equal((ushort)74, batchJson.Value<ushort>("created_world"));
+        Assert.Equal(1700000000U, batchJson.Value<uint>("last_server_restart"));
+        Assert.Equal(1770000000123L, batchJson.Value<long>("observed_at_unix_ms"));
+        Assert.Equal("tok-1", batchJson.Value<string>("capability_token"));
+    }
+
+    [Fact]
     public void Upload_listing_exposes_client_high_end_telemetry_fields() {
         Assert.Equal(typeof(bool), RequiredPropertyType<UploadableListing>("PfCategoryHighEnd"));
         Assert.Equal(typeof(bool), RequiredPropertyType<UploadableListing>("CfcExcelHighEnd"));
