@@ -73,6 +73,9 @@ internal sealed class StubFFLogsApiClient : IFFLogsApiClient {
                 cancellationToken);
             return OperationOutcome<Dictionary<string, FFLogsClient.CharacterFetchedData>>.Success(result);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
+            throw;
+        }
         catch (Exception ex) {
             return OperationOutcome<Dictionary<string, FFLogsClient.CharacterFetchedData>>.Failure(true, ex.Message);
         }

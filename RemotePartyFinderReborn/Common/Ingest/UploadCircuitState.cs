@@ -7,10 +7,12 @@ namespace RemotePartyFinderReborn;
 internal sealed class UploadCircuitState
 {
     internal static readonly TimeSpan DefaultHalfOpenProbeTimeout = TimeSpan.FromMinutes(2);
+    internal static readonly TimeSpan DefaultRouteNotFoundCooldown = TimeSpan.FromMinutes(15);
 
     private readonly object _lock = new();
     private int _failureCount;
     private DateTime _lastFailureTime = DateTime.MinValue;
+    private DateTime _routeNotFoundCooldownUntilUtc = DateTime.MinValue;
     private bool _halfOpenProbeInFlight;
     private DateTime _halfOpenProbeStartedAtUtc = DateTime.MinValue;
     private long _halfOpenProbeToken;
@@ -57,6 +59,7 @@ internal sealed class UploadCircuitState
         {
             _failureCount = 0;
             _lastFailureTime = DateTime.MinValue;
+            _routeNotFoundCooldownUntilUtc = DateTime.MinValue;
             _halfOpenProbeInFlight = false;
             _halfOpenProbeStartedAtUtc = DateTime.MinValue;
             _halfOpenProbeToken++;
@@ -75,6 +78,24 @@ internal sealed class UploadCircuitState
         }
     }
 
+    internal void RecordRouteNotFoundFailure(DateTime utcNow, TimeSpan? cooldownDuration = null)
+    {
+        var effectiveCooldown = ResolveRouteNotFoundCooldown(cooldownDuration);
+        var cooldownUntilUtc = utcNow + effectiveCooldown;
+        lock (_lock)
+        {
+            _failureCount++;
+            _lastFailureTime = utcNow;
+            if (cooldownUntilUtc > _routeNotFoundCooldownUntilUtc)
+            {
+                _routeNotFoundCooldownUntilUtc = cooldownUntilUtc;
+            }
+            _halfOpenProbeInFlight = false;
+            _halfOpenProbeStartedAtUtc = DateTime.MinValue;
+            _halfOpenProbeToken++;
+        }
+    }
+
     internal bool TryBeginAttempt(
         int failureThreshold,
         int breakDurationMinutes,
@@ -86,6 +107,12 @@ internal sealed class UploadCircuitState
         var effectiveProbeTimeout = ResolveProbeTimeout(halfOpenProbeTimeout);
         lock (_lock)
         {
+            if (utcNow < _routeNotFoundCooldownUntilUtc)
+            {
+                halfOpenProbeToken = 0;
+                return false;
+            }
+
             if (_failureCount < effectiveThreshold)
             {
                 halfOpenProbeToken = 0;
@@ -146,6 +173,11 @@ internal sealed class UploadCircuitState
         var effectiveProbeTimeout = ResolveProbeTimeout(halfOpenProbeTimeout);
         lock (_lock)
         {
+            if (utcNow < _routeNotFoundCooldownUntilUtc)
+            {
+                return true;
+            }
+
             if (_failureCount < effectiveThreshold)
             {
                 return false;
@@ -161,6 +193,32 @@ internal sealed class UploadCircuitState
         }
     }
 
+    internal TimeSpan GetRemainingBreakDuration(int failureThreshold, int breakDurationMinutes, DateTime utcNow)
+    {
+        var effectiveThreshold = Math.Max(1, failureThreshold);
+        lock (_lock)
+        {
+            var remaining = TimeSpan.Zero;
+            if (_routeNotFoundCooldownUntilUtc > utcNow)
+            {
+                remaining = _routeNotFoundCooldownUntilUtc - utcNow;
+            }
+
+            if (_failureCount >= effectiveThreshold)
+            {
+                var breakDuration = TimeSpan.FromMinutes(breakDurationMinutes);
+                var elapsed = utcNow - _lastFailureTime;
+                var standardRemaining = breakDuration - elapsed;
+                if (standardRemaining > remaining)
+                {
+                    remaining = standardRemaining;
+                }
+            }
+
+            return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+        }
+    }
+
     private bool IsHalfOpenProbeStaleLocked(DateTime utcNow, TimeSpan effectiveProbeTimeout)
     {
         return utcNow - _halfOpenProbeStartedAtUtc >= effectiveProbeTimeout;
@@ -171,5 +229,12 @@ internal sealed class UploadCircuitState
         return halfOpenProbeTimeout is { } configured && configured > TimeSpan.Zero
             ? configured
             : DefaultHalfOpenProbeTimeout;
+    }
+
+    private static TimeSpan ResolveRouteNotFoundCooldown(TimeSpan? cooldownDuration)
+    {
+        return cooldownDuration is { } configured && configured > TimeSpan.Zero
+            ? configured
+            : DefaultRouteNotFoundCooldown;
     }
 }

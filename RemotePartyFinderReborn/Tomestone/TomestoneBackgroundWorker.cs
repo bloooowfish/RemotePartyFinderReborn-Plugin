@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
@@ -26,6 +27,9 @@ internal sealed class TomestoneBackgroundWorker
     private readonly Func<bool> _isPluginOperational;
     private UploadUrl _lastSessionUploadUrl;
     private DateTime _lastCooldownSkipLogUtc = DateTime.MinValue;
+    private TomestoneLeaseSession _activeLeaseSession;
+    private IReadOnlyList<TomestoneResult> _activeProcessedResults = [];
+    private readonly List<AbandonTomestoneLease> _activeExplicitlyAbandoned = [];
 
     public TomestoneBackgroundWorker(
         Configuration configuration,
@@ -180,11 +184,16 @@ internal sealed class TomestoneBackgroundWorker
             return 0;
         }
 
+        _activeLeaseSession = leaseSession;
+        _activeProcessedResults = [];
+        _activeExplicitlyAbandoned.Clear();
+
         var jobs = leaseSession.Jobs;
         _debugLog($"Received {jobs.Count} Tomestone progression job(s) from server.");
 
         var processResult = await _batchProcessor.ProcessLeaseSessionAsync(leaseSession, cancellationToken);
         hadTransientFailure |= processResult.HadTransientFailure;
+        _activeProcessedResults = processResult.ProcessedResults;
 
         var submitAttempt = await _resultSubmitter.TrySubmitResultsAsync(
             _configuration,
@@ -206,7 +215,30 @@ internal sealed class TomestoneBackgroundWorker
                 cancellationToken,
                 _warningLog,
                 _debugLog);
+            _activeExplicitlyAbandoned.AddRange(processResult.AbandonedLeases);
         }
+
+        if (processResult.ShouldAbandonRemainingLeases || processResult.HadTransientFailure)
+        {
+            var (abandonReason, failureCode) = processResult.HitRateLimitCooldown
+                ? ("worker_rate_limit_deferred", "tomestone_rate_limited")
+                : processResult.HitApiKeyRejected
+                    ? ("worker_api_key_rejected", "tomestone_api_key_rejected")
+                    : ("worker_transient_failure", "tomestone_transient_failure");
+            await _leaseAbandoner.AbandonUnprocessedLeasesAsync(
+                _configuration,
+                leaseSession,
+                jobs,
+                processResult.ProcessedResults,
+                abandonReason,
+                failureCode,
+                cancellationToken,
+                _warningLog,
+                _debugLog,
+                processResult.AbandonedLeases);
+        }
+
+        ClearActiveLeaseSession();
 
         if (submitAttempt.ShouldUseBaseDelayBeforeNextPoll)
         {
@@ -276,57 +308,101 @@ internal sealed class TomestoneBackgroundWorker
             _debugLog).ConfigureAwait(false);
     }
 
+    private void ClearActiveLeaseSession()
+    {
+        _activeLeaseSession = null;
+        _activeProcessedResults = [];
+        _activeExplicitlyAbandoned.Clear();
+    }
+
     private async Task FlushOrAbandonOnShutdownAsync()
     {
-        if (!_resultSubmitter.HasPendingResults)
-        {
-            return;
-        }
-
-        var targetUrl = _lastSessionUploadUrl
-                        ?? _jobLeaseClient.SelectAvailableUploadUrl(_configuration, _warningLog);
-        if (targetUrl == null)
-        {
-            _resultSubmitter.DrainPendingResults();
-            return;
-        }
-
-        using var shutdownCts = new CancellationTokenSource(ShutdownFlushTimeout);
-        try
-        {
-            await _resultSubmitter.TryFlushPendingAsync(
-                _configuration,
-                targetUrl,
-                shutdownCts.Token,
-                _infoLog,
-                _warningLog,
-                _errorLog,
-                _debugLog).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is OperationCanceledException or HttpRequestException)
-        {
-            // Fall through to abandon remaining unsubmitted leases.
-        }
+        var activeSession = _activeLeaseSession;
+        var activeProcessedResults = _activeProcessedResults;
+        var activeExplicitlyAbandoned = _activeExplicitlyAbandoned.ToArray();
+        ClearActiveLeaseSession();
 
         if (_resultSubmitter.HasPendingResults)
         {
-            var remaining = _resultSubmitter.DrainPendingResults();
-            try
+            var targetUrl = _lastSessionUploadUrl
+                            ?? activeSession?.UploadUrl
+                            ?? _jobLeaseClient.SelectAvailableUploadUrl(_configuration, _warningLog);
+            if (targetUrl == null)
             {
-                using var abandonCts = new CancellationTokenSource(ShutdownAbandonTimeout);
-                await _leaseAbandoner.AbandonResultLeasesAsync(
-                    _configuration,
-                    targetUrl,
-                    remaining,
-                    "worker_shutdown",
-                    "worker_shutdown",
-                    abandonCts.Token,
-                    _warningLog,
-                    _debugLog).ConfigureAwait(false);
+                _resultSubmitter.DrainPendingResults();
             }
-            catch (Exception ex)
+            else
             {
-                _debugLog($"TomestoneCollector: shutdown lease abandon skipped: {ex.Message}");
+                using var shutdownCts = new CancellationTokenSource(ShutdownFlushTimeout);
+                try
+                {
+                    await _resultSubmitter.TryFlushPendingAsync(
+                        _configuration,
+                        targetUrl,
+                        shutdownCts.Token,
+                        _infoLog,
+                        _warningLog,
+                        _errorLog,
+                        _debugLog).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is OperationCanceledException or HttpRequestException)
+                {
+                    // Fall through to abandon remaining unsubmitted leases.
+                }
+
+                if (_resultSubmitter.HasPendingResults)
+                {
+                    var remaining = _resultSubmitter.DrainPendingResults();
+                    try
+                    {
+                        using var abandonCts = new CancellationTokenSource(ShutdownAbandonTimeout);
+                        await _leaseAbandoner.AbandonResultLeasesAsync(
+                            _configuration,
+                            targetUrl,
+                            remaining,
+                            "worker_shutdown",
+                            "worker_shutdown",
+                            abandonCts.Token,
+                            _warningLog,
+                            _debugLog).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _debugLog($"TomestoneCollector: shutdown lease abandon skipped: {ex.Message}");
+                    }
+                }
+            }
+        }
+
+        if (activeSession != null && activeSession.HasJobs)
+        {
+            var sessionTargetUrl = activeSession.UploadUrl
+                                   ?? _lastSessionUploadUrl
+                                   ?? _jobLeaseClient.SelectAvailableUploadUrl(_configuration, _warningLog);
+            if (sessionTargetUrl != null)
+            {
+                var sessionForAbandon = activeSession.UploadUrl != null
+                    ? activeSession
+                    : new TomestoneLeaseSession(sessionTargetUrl, activeSession.Jobs, activeSession.UseBaseDelayWhenNoWork);
+                try
+                {
+                    using var abandonCts = new CancellationTokenSource(ShutdownAbandonTimeout);
+                    await _leaseAbandoner.AbandonUnprocessedLeasesAsync(
+                        _configuration,
+                        sessionForAbandon,
+                        activeSession.Jobs,
+                        activeProcessedResults,
+                        "worker_shutdown",
+                        "worker_shutdown",
+                        abandonCts.Token,
+                        _warningLog,
+                        _debugLog,
+                        activeExplicitlyAbandoned).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _debugLog($"TomestoneCollector: shutdown in-flight lease abandon skipped: {ex.Message}");
+                }
             }
         }
     }

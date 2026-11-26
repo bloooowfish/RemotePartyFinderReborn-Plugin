@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using Dalamud.Plugin.Services;
+using LuminaWorld = Lumina.Excel.Sheets.World;
 
 #nullable enable
 
@@ -17,7 +18,9 @@ internal interface IFFLogsWorkerRegionSnapshotState
     bool HasObservedSnapshot { get; }
 }
 
-internal sealed class CachedFFLogsWorkerRegionProvider(Action<string>? warningLog = null) :
+internal sealed class CachedFFLogsWorkerRegionProvider(
+    Action<string>? warningLog = null,
+    Func<ushort, string?>? fallbackRegionResolver = null) :
     IFFLogsWorkerRegionProvider,
     IFFLogsWorkerRegionSnapshotState
 {
@@ -78,17 +81,29 @@ internal sealed class CachedFFLogsWorkerRegionProvider(Action<string>? warningLo
 
         if (FFLogsWorkerRegionResolver.TryMapWorldId(worldId.Value, out var resolvedRegion))
         {
-            lock (_gate)
-            {
-                _cachedRegion = resolvedRegion;
-                _unavailableReason = string.Empty;
-                _hasObservedSnapshot = true;
-                _loggedUnavailable = false;
-            }
+            SetAvailable(resolvedRegion);
+            return;
+        }
+
+        var fallbackRegion = fallbackRegionResolver?.Invoke(worldId.Value);
+        if (!string.IsNullOrWhiteSpace(fallbackRegion))
+        {
+            SetAvailable(fallbackRegion.Trim());
             return;
         }
 
         SetUnavailable($"current world id {worldId.Value} is not mapped.");
+    }
+
+    private void SetAvailable(string region)
+    {
+        lock (_gate)
+        {
+            _cachedRegion = region;
+            _unavailableReason = string.Empty;
+            _hasObservedSnapshot = true;
+            _loggedUnavailable = false;
+        }
     }
 
     private void SetUnavailable(string reason)
@@ -118,10 +133,25 @@ internal sealed class DalamudFFLogsWorkerRegionProvider :
         IFramework framework,
         IObjectTable objectTable,
         Action<string>? warningLog = null)
+        : this(framework, objectTable, null, warningLog)
+    {
+    }
+
+    public DalamudFFLogsWorkerRegionProvider(
+        IFramework framework,
+        IObjectTable objectTable,
+        IDataManager? dataManager,
+        Action<string>? warningLog = null)
     {
         _framework = framework ?? throw new ArgumentNullException(nameof(framework));
         _objectTable = objectTable ?? throw new ArgumentNullException(nameof(objectTable));
-        _cache = new CachedFFLogsWorkerRegionProvider(warningLog);
+        _cache = new CachedFFLogsWorkerRegionProvider(
+            warningLog,
+            dataManager == null
+                ? null
+                : worldId => FFLogsWorkerRegionResolver.TryResolveFromDataManager(worldId, dataManager, out var region)
+                    ? region
+                    : null);
         _framework.Update += OnFrameworkUpdate;
     }
 
@@ -156,6 +186,54 @@ internal sealed class DalamudFFLogsWorkerRegionProvider :
 
 internal static class FFLogsWorkerRegionResolver
 {
+    public static bool TryMapDataCenterRegionId(uint regionId, [NotNullWhen(true)] out string? region)
+    {
+        region = regionId switch
+        {
+            1 => "JP",
+            2 => "NA",
+            3 => "EU",
+            4 => "OC",
+            _ => null,
+        };
+
+        return region != null;
+    }
+
+    public static bool TryResolveFromDataManager(
+        ushort worldId,
+        IDataManager? dataManager,
+        [NotNullWhen(true)] out string? region)
+    {
+        region = null;
+        if (worldId == 0 || dataManager == null)
+        {
+            return false;
+        }
+
+        try
+        {
+            var worldSheet = dataManager.GetExcelSheet<LuminaWorld>();
+            if (worldSheet == null || !worldSheet.TryGetRow(worldId, out var world))
+            {
+                return false;
+            }
+
+            if (world.DataCenter.ValueNullable is not { } dataCenter)
+            {
+                return false;
+            }
+
+            return TryMapDataCenterRegionId(dataCenter.Region.RowId, out region)
+                || TryMapDataCenterName(dataCenter.Name.ExtractText(), out region);
+        }
+        catch
+        {
+            region = null;
+            return false;
+        }
+    }
+
     public static bool TryMapDataCenterName(string? dataCenterName, [NotNullWhen(true)] out string? region)
     {
         region = dataCenterName?.Trim() switch

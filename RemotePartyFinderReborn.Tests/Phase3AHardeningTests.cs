@@ -237,15 +237,15 @@ public sealed class Phase3AHardeningTests {
             }));
         }
 
-        var drained = new List<uint>();
+        var drained = new List<ulong>();
         while (state.TryGetNextUnconsumedArrival(out var next)) {
             drained.Add(next.Payload.ListingId);
             Assert.True(state.TryMarkConsumed(next.Generation));
         }
 
         Assert.Equal(16, drained.Count);
-        Assert.Equal(2004U, drained[0]);
-        Assert.Equal(2019U, drained[^1]);
+        Assert.Equal(2004UL, drained[0]);
+        Assert.Equal(2019UL, drained[^1]);
     }
 
     [Fact]
@@ -550,9 +550,13 @@ public sealed class Phase3AHardeningTests {
             Assert.True(db.IsIdentityCachedInMemoryForTesting(101UL));
             Assert.True(db.IsIdentityNegativeCachedForTesting(99999UL));
 
-            // Inserting a new identity clears negative cache.
+            // Inserting a new identity removes only that ID from the negative cache.
+            var unrelatedAbsentFetched = db.GetIdentities([88888UL]);
+            Assert.Empty(unrelatedAbsentFetched);
+            Assert.True(db.IsIdentityNegativeCachedForTesting(88888UL));
             db.UpsertResolvedIdentity(new CharacterIdentitySnapshot(99999UL, "Newly Resolved", 74, "Tonberry", resolvedAt.AddMinutes(2)));
             Assert.False(db.IsIdentityNegativeCachedForTesting(99999UL));
+            Assert.True(db.IsIdentityNegativeCachedForTesting(88888UL));
 
             // 2. TakePendingIdentityUploads falls back to SQLite for evicted pending uploads.
             var pendingIdentities = db.TakePendingIdentityUploads(10);
@@ -565,11 +569,12 @@ public sealed class Phase3AHardeningTests {
             Assert.Equal((ushort)74, partial.HomeWorld);
             Assert.Equal("Tonberry", partial.WorldName);
 
-            // 4. MarkAllPlayersDirty flushes synchronously so SQLite dirty=1 is immediately durable.
+            // 4. MarkAllPlayersDirty updates in-memory dirty state asynchronously and persists via background flush.
             Assert.Equal(0, db.PendingCount);
             var requeued = db.MarkAllPlayersDirty();
             Assert.Equal(1, requeued);
             Assert.Equal(1, db.PendingCount);
+            db.Flush();
             using (var verifyConn = new SqliteConnection($"Data Source={dbPath};Mode=ReadWriteCreate")) {
                 verifyConn.Open();
                 using var cmd = verifyConn.CreateCommand();
@@ -781,7 +786,107 @@ public sealed class Phase3AHardeningTests {
         Assert.Empty(delays);
     }
 
-    private static PendingDetailEntry CreatePendingDetail(uint listingId, DateTime nowUtc) {
+    [Fact]
+    public void PlayerLocalDatabase_MarkBatchUploaded_ignores_stale_hash_when_player_mutated_in_flight() {
+        var tempDir = Path.Combine(Path.GetTempPath(), $"rpfr-db-hash-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+        try {
+            var dbPath = Path.Combine(tempDir, "players.db");
+            using var db = new PlayerLocalDatabase(dbPath);
+            var oldSnapshot = new UploadablePlayer {
+                ContentId = 7001UL,
+                Name = "Before Rename",
+                HomeWorld = 74,
+                CurrentWorld = 74,
+                AccountId = 501UL,
+            };
+            var updatedSnapshot = new UploadablePlayer {
+                ContentId = 7001UL,
+                Name = "After Rename",
+                HomeWorld = 74,
+                CurrentWorld = 74,
+                AccountId = 501UL,
+            };
+
+            db.UpsertObservedPlayers([oldSnapshot]);
+            var taken = db.TakePendingBatch(10);
+            Assert.Single(taken);
+
+            // Simulate a newer observation arriving before the old upload finishes.
+            db.UpsertObservedPlayers([updatedSnapshot]);
+            db.MarkBatchUploaded(taken);
+
+            Assert.Equal(1, db.PendingCount);
+            var nextBatch = db.TakePendingBatch(10);
+            Assert.Equal("After Rename", Assert.Single(nextBatch).Name);
+
+            // Matching the latest payload hash clears dirty cleanly.
+            db.MarkBatchUploaded(nextBatch);
+            Assert.Equal(0, db.PendingCount);
+
+            // Also verify evicted overflow rows only clear dirty in SQLite when payload_hash matches.
+            db.UpsertObservedPlayers([
+                new UploadablePlayer {
+                    ContentId = 7002UL,
+                    Name = "Evicted V2",
+                    HomeWorld = 74,
+                    CurrentWorld = 74,
+                    AccountId = 502UL,
+                },
+            ]);
+            db.Flush();
+            db.EvictPlayerFromMemoryForTesting(7002UL);
+            db.MarkBatchUploaded([
+                new UploadablePlayer {
+                    ContentId = 7002UL,
+                    Name = "Evicted V1",
+                    HomeWorld = 74,
+                    CurrentWorld = 74,
+                    AccountId = 502UL,
+                },
+            ]);
+            db.Flush();
+            Assert.Equal(1, db.PendingCount);
+        } finally {
+            SqliteConnection.ClearAllPools();
+            if (Directory.Exists(tempDir)) {
+                Directory.Delete(tempDir, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Plugin_WaitForShutdownTasksConcurrently_runs_tasks_in_parallel_within_single_budget() {
+        var tcs1 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var tcs2 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var tcs3 = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _ = Task.Run(async () => {
+            await Task.Delay(120);
+            tcs1.TrySetResult();
+            tcs2.TrySetResult();
+            tcs3.TrySetResult();
+        });
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var remaining = Plugin.WaitForShutdownTasksConcurrently(
+            [tcs1.Task, tcs2.Task, tcs3.Task],
+            TimeSpan.FromSeconds(2));
+        sw.Stop();
+
+        Assert.True(remaining > TimeSpan.Zero);
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(1.5));
+
+        // Stuck tasks must exhaust at most the single bounded budget rather than multiplying per task.
+        var stuckTasks = new[] { new TaskCompletionSource().Task, new TaskCompletionSource().Task };
+        var boundedSw = System.Diagnostics.Stopwatch.StartNew();
+        var exhausted = Plugin.WaitForShutdownTasksConcurrently(stuckTasks, TimeSpan.FromMilliseconds(150));
+        boundedSw.Stop();
+
+        Assert.Equal(TimeSpan.Zero, exhausted);
+        Assert.True(boundedSw.Elapsed < TimeSpan.FromSeconds(1));
+    }
+
+    private static PendingDetailEntry CreatePendingDetail(ulong listingId, DateTime nowUtc) {
         var detail = new UploadablePartyDetail {
             ListingId = listingId,
             LeaderContentId = 5000UL + listingId,
@@ -800,7 +905,7 @@ public sealed class Phase3AHardeningTests {
         );
     }
 
-    private static UploadableListing CreateStubListing(uint id, string name) {
+    private static UploadableListing CreateStubListing(ulong id, string name) {
         var listing = (UploadableListing)RuntimeHelpers.GetUninitializedObject(typeof(UploadableListing));
         typeof(UploadableListing)
             .GetField("<Id>k__BackingField", BindingFlags.Instance | BindingFlags.NonPublic)!

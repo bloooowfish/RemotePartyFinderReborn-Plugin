@@ -1,7 +1,9 @@
 using System;
 using System.Runtime.CompilerServices;
+using System.Threading;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
+using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 
 #nullable enable
@@ -21,6 +23,17 @@ internal enum ScannerHeadlessBackendKind {
     PopulateCorrelation,
 }
 
+internal sealed record PartyDetailCaptureHookRegistration(
+    IDisposable HookScope,
+    bool HasPopulateHook,
+    bool HasOpenListingHook,
+    bool HasOpenListingByContentIdHook,
+    bool HasOpenAddonHook
+) {
+    internal bool IsScannerCaptureReady =>
+        HasPopulateHook && HasOpenListingHook && HasOpenListingByContentIdHook && HasOpenAddonHook;
+}
+
 internal interface IPartyDetailCaptureHookFactory {
     IDisposable CreateHooks(
         Func<nint, ulong, bool> openListingDetour,
@@ -28,38 +41,62 @@ internal interface IPartyDetailCaptureHookFactory {
         Action<nint, nint> populateListingDataDetour,
         Func<nint, uint, nint, nint, nint, nint, ushort, int, bool> pfDetailOpenDetour
     );
+
+    PartyDetailCaptureHookRegistration CreateHooksWithStatus(
+        Func<nint, ulong, bool> openListingDetour,
+        Func<nint, ulong, bool> openListingByContentIdDetour,
+        Action<nint, nint> populateListingDataDetour,
+        Func<nint, uint, nint, nint, nint, nint, ushort, int, bool> pfDetailOpenDetour,
+        Action<string>? warningSink = null
+    ) {
+        return new PartyDetailCaptureHookRegistration(
+            CreateHooks(
+                openListingDetour,
+                openListingByContentIdDetour,
+                populateListingDataDetour,
+                pfDetailOpenDetour
+            ),
+            HasPopulateHook: true,
+            HasOpenListingHook: true,
+            HasOpenListingByContentIdHook: true,
+            HasOpenAddonHook: true
+        );
+    }
 }
 
 internal sealed class PartyDetailCaptureRuntime : IDisposable {
-    private const string OpenListingSignature =
-        "48 89 5C 24 ?? 57 48 83 EC ?? 48 8B FA 48 8B D9 E8 ?? ?? ?? ?? 48 8B 8B ?? ?? ?? ?? 48 85 C9";
-    private const string OpenListingByContentIdSignature =
-        "40 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 84 C0 74 07 C6 83 ?? ?? ?? ?? ?? 48 83 C4 20 5B C3";
-    private const string OpenAddonSignature =
-        "4C 89 4C 24 20 44 89 44 24 18 53 55 56 57 41 57 48 81 EC ?? ?? ?? ?? 80 B9 ?? ?? ?? ?? ?? 48 8B F9 8B B4 24 ?? ?? ?? ?? 8B DA";
-    private const uint PfDetailAddonId = 275U;
+    internal const uint DefaultPfDetailAddonId = 275U;
     private readonly PartyDetailCaptureState _state;
     private readonly object _gate = new();
     private readonly ScannerHeadlessBackendKind _scannerHeadlessBackendKind;
     private readonly Func<bool> _isCaptureEnabled;
+    private readonly Func<uint?> _pfDetailAddonIdResolver;
     private readonly PartyDetailRequestCoordinator _requestCoordinator;
     private IDisposable? _hookScope;
+    private bool _hasPopulateHook;
+    private bool _isScannerCaptureReady;
+    private int _cachedPfDetailAddonId = -1;
     private long _postRequestPopulationGeneration;
     private RequestPopulationGate? _requestPopulationGate;
     internal PartyDetailCaptureState CaptureState => _state;
+    internal bool IsManualCaptureReady => Volatile.Read(ref _hasPopulateHook) && _hookScope is not null;
+    internal bool IsScannerCaptureReady => Volatile.Read(ref _isScannerCaptureReady) && _hookScope is not null;
 
-    // Scanner-owned PF detail UI suppression is gated on the unique addon-275
-    // OpenAddon seam. Manual request cycles still flow through the shared
-    // request/populate/capture path unchanged.
+    // Scanner-owned PF detail UI suppression is gated on the dynamically resolved
+    // LookingForGroupDetail OpenAddon seam and requires all four capture hooks.
+    // Manual request cycles still flow through the shared request/populate/capture path
+    // whenever PopulateListingData is hooked.
 
     internal PartyDetailCaptureRuntime(
         PartyDetailCaptureState state,
         ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled,
-        Func<bool>? isCaptureEnabled = null
+        Func<bool>? isCaptureEnabled = null,
+        Func<uint?>? pfDetailAddonIdResolver = null
     ) {
         _state = state ?? throw new ArgumentNullException(nameof(state));
         _scannerHeadlessBackendKind = scannerHeadlessBackendKind;
         _isCaptureEnabled = isCaptureEnabled ?? (static () => true);
+        _pfDetailAddonIdResolver = pfDetailAddonIdResolver ?? ResolveLookingForGroupDetailAddonIdFromModule;
         _requestCoordinator = new PartyDetailRequestCoordinator(scannerHeadlessBackendKind);
     }
 
@@ -77,29 +114,37 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         IPartyDetailCaptureHookFactory hookFactory,
         Action<string>? warningSink = null,
         ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled,
-        Func<bool>? isCaptureEnabled = null
-    ) : this(state, scannerHeadlessBackendKind, isCaptureEnabled) {
+        Func<bool>? isCaptureEnabled = null,
+        Func<uint?>? pfDetailAddonIdResolver = null
+    ) : this(state, scannerHeadlessBackendKind, isCaptureEnabled, pfDetailAddonIdResolver) {
         ArgumentNullException.ThrowIfNull(hookFactory);
 
         try {
-            _hookScope = hookFactory.CreateHooks(
+            var registration = hookFactory.CreateHooksWithStatus(
                 OpenListingDetour,
                 OpenListingByContentIdDetour,
                 PopulateListingDataDetour,
-                PfDetailOpenDetour
+                PfDetailOpenDetour,
+                warningSink
             );
+            _hookScope = registration.HookScope;
+            Volatile.Write(ref _hasPopulateHook, registration.HasPopulateHook);
+            Volatile.Write(ref _isScannerCaptureReady, registration.IsScannerCaptureReady);
         } catch (Exception exception) {
             warningSink?.Invoke($"PartyDetailCaptureRuntime: failed to initialize hooks. {exception.Message}");
             _hookScope = null;
+            Volatile.Write(ref _hasPopulateHook, false);
+            Volatile.Write(ref _isScannerCaptureReady, false);
         }
     }
 
     internal static PartyDetailCaptureRuntime CreateForTesting(
         PartyDetailCaptureState state,
         ScannerHeadlessBackendKind scannerHeadlessBackendKind,
-        Func<bool>? isCaptureEnabled = null
+        Func<bool>? isCaptureEnabled = null,
+        Func<uint?>? pfDetailAddonIdResolver = null
     ) {
-        return new PartyDetailCaptureRuntime(state, scannerHeadlessBackendKind, isCaptureEnabled);
+        return new PartyDetailCaptureRuntime(state, scannerHeadlessBackendKind, isCaptureEnabled, pfDetailAddonIdResolver);
     }
 
     internal static PartyDetailCaptureRuntime CreateForTesting(
@@ -107,9 +152,10 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         IPartyDetailCaptureHookFactory hookFactory,
         Action<string>? warningSink = null,
         ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled,
-        Func<bool>? isCaptureEnabled = null
+        Func<bool>? isCaptureEnabled = null,
+        Func<uint?>? pfDetailAddonIdResolver = null
     ) {
-        return new PartyDetailCaptureRuntime(state, hookFactory, warningSink, scannerHeadlessBackendKind, isCaptureEnabled);
+        return new PartyDetailCaptureRuntime(state, hookFactory, warningSink, scannerHeadlessBackendKind, isCaptureEnabled, pfDetailAddonIdResolver);
     }
 
     internal static IDisposable CreateHookScope<TPrimaryHook, TSecondaryHook>(
@@ -141,6 +187,8 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     }
 
     public void Dispose() {
+        Volatile.Write(ref _hasPopulateHook, false);
+        Volatile.Write(ref _isScannerCaptureReady, false);
         _hookScope?.Dispose();
         _hookScope = null;
 
@@ -406,14 +454,17 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         }
 
         try {
-            var suppress = _requestCoordinator.ShouldSuppressScannerPfDetailOpen(_state, addonId);
-            EnsureManualCycleForDetailOpen(addonId, suppress);
+            var pfDetailAddonId = ResolvePfDetailAddonId();
+            var suppress = IsScannerCaptureReady
+                && _requestCoordinator.ShouldSuppressScannerPfDetailOpen(_state, addonId, pfDetailAddonId);
+            EnsureManualCycleForDetailOpen(addonId, pfDetailAddonId, suppress);
 
             var hasScannerAttempt = _requestCoordinator.TryGetScannerAttemptDebugState(out var scannerAttempt);
-            if (Plugin.Log is not null && (addonId == PfDetailAddonId || hasScannerAttempt)) {
+            if (Plugin.Log is not null && (addonId == pfDetailAddonId || hasScannerAttempt)) {
                 Plugin.Log.Debug(
-                    "PartyDetailCaptureRuntime: pf_detail_open addon={AddonId} suppress={Suppress} backend={Backend} currentOwner={CurrentOwner} currentSerial={CurrentSerial} armedSerial={ArmedSerial} allowHeadless={AllowHeadless} listing={ListingId} content={ContentId}",
+                    "PartyDetailCaptureRuntime: pf_detail_open addon={AddonId} expected={ExpectedAddonId} suppress={Suppress} backend={Backend} currentOwner={CurrentOwner} currentSerial={CurrentSerial} armedSerial={ArmedSerial} allowHeadless={AllowHeadless} listing={ListingId} content={ContentId}",
                     addonId,
+                    pfDetailAddonId,
                     suppress,
                     _scannerHeadlessBackendKind,
                     _state.CurrentOwner?.ToString() ?? "none",
@@ -432,6 +483,44 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         }
     }
 
+    internal uint ResolvePfDetailAddonId() {
+        var cached = Volatile.Read(ref _cachedPfDetailAddonId);
+        if (cached >= 0) {
+            return (uint)cached;
+        }
+
+        var resolved = _pfDetailAddonIdResolver();
+        if (resolved is { } addonId) {
+            if (addonId <= int.MaxValue) {
+                Interlocked.CompareExchange(ref _cachedPfDetailAddonId, (int)addonId, -1);
+            }
+
+            return addonId;
+        }
+
+        return DefaultPfDetailAddonId;
+    }
+
+    private static unsafe uint? ResolveLookingForGroupDetailAddonIdFromModule() {
+        try {
+            var raptureAtkModule = RaptureAtkModule.Instance();
+            if (!NativePointerValidator.IsValidUserPointer(raptureAtkModule)) {
+                return null;
+            }
+
+            var addonNames = raptureAtkModule->AddonNames.AsSpan();
+            for (var i = 0; i < addonNames.Length; i++) {
+                if (addonNames[i].AsSpan().SequenceEqual("LookingForGroupDetail"u8)) {
+                    return (uint)i;
+                }
+            }
+        } catch {
+            // Fall back to DefaultPfDetailAddonId if native memory cannot be read.
+        }
+
+        return null;
+    }
+
     private void EnsureRequestCycleForIntercept(ulong listingId, ulong contentId) {
         var previousRequestSerial = _state.CurrentRequestSerial;
         var cycle = _requestCoordinator.EnsureRequestCycleForOpenIntercept(_state, listingId, contentId);
@@ -445,8 +534,8 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         ArmPopulationGate(cycle.RequestSerial);
     }
 
-    private void EnsureManualCycleForDetailOpen(uint addonId, bool suppress) {
-        if (addonId != PfDetailAddonId || suppress) {
+    private void EnsureManualCycleForDetailOpen(uint addonId, uint expectedPfDetailAddonId, bool suppress) {
+        if (addonId != expectedPfDetailAddonId || suppress) {
             return;
         }
 
@@ -613,119 +702,234 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
     private sealed record RequestPopulationGate(long RequestSerial, long SignalGenerationAtRequestStart);
 
-    private sealed class DalamudPartyDetailCaptureHookFactory : IPartyDetailCaptureHookFactory {
+    internal sealed class DalamudPartyDetailCaptureHookFactory : IPartyDetailCaptureHookFactory {
         private readonly IGameInteropProvider _interopProvider;
-
-        private delegate bool OpenListingDelegate(nint agent, ulong listingId);
-        private delegate bool OpenListingByContentIdDelegate(nint agent, ulong contentId);
-        private delegate void PopulateListingDataDelegate(nint agent, nint listingData);
-        private delegate long OpenAddonDelegate(
-            nint raptureAtkModule,
-            uint addonId,
-            nint valueCount,
-            nint atkValues,
-            nint parentAgent,
-            nint unk,
-            ushort addonRowId,
-            int openFlags
-        );
 
         internal DalamudPartyDetailCaptureHookFactory(IGameInteropProvider interopProvider) {
             _interopProvider = interopProvider ?? throw new ArgumentNullException(nameof(interopProvider));
         }
 
-        public unsafe IDisposable CreateHooks(
+        public IDisposable CreateHooks(
             Func<nint, ulong, bool> openListingDetour,
             Func<nint, ulong, bool> openListingByContentIdDetour,
             Action<nint, nint> populateListingDataDetour,
             Func<nint, uint, nint, nint, nint, nint, ushort, int, bool> pfDetailOpenDetour
+        ) {
+            return CreateHooksWithStatus(
+                openListingDetour,
+                openListingByContentIdDetour,
+                populateListingDataDetour,
+                pfDetailOpenDetour
+            ).HookScope;
+        }
+
+        public PartyDetailCaptureHookRegistration CreateHooksWithStatus(
+            Func<nint, ulong, bool> openListingDetour,
+            Func<nint, ulong, bool> openListingByContentIdDetour,
+            Action<nint, nint> populateListingDataDetour,
+            Func<nint, uint, nint, nint, nint, nint, ushort, int, bool> pfDetailOpenDetour,
+            Action<string>? warningSink = null
+        ) {
+            unsafe {
+                return CreateHooksWithStatusFromAddresses(
+                    AgentLookingForGroup.Addresses.OpenListing.Value,
+                    AgentLookingForGroup.Addresses.OpenListingByContentId.Value,
+                    (nint)AgentLookingForGroup.MemberFunctionPointers.PopulateListingData,
+                    RaptureAtkModule.Addresses.OpenAddon.Value,
+                    openListingDetour,
+                    openListingByContentIdDetour,
+                    populateListingDataDetour,
+                    pfDetailOpenDetour,
+                    warningSink
+                );
+            }
+        }
+
+        internal IDisposable CreateHooksFromAddresses(
+            nint openListingAddress,
+            nint openListingByContentIdAddress,
+            nint populateListingDataAddress,
+            nint openAddonAddress,
+            Func<nint, ulong, bool> openListingDetour,
+            Func<nint, ulong, bool> openListingByContentIdDetour,
+            Action<nint, nint> populateListingDataDetour,
+            Func<nint, uint, nint, nint, nint, nint, ushort, int, bool> pfDetailOpenDetour
+        ) {
+            return CreateHooksWithStatusFromAddresses(
+                openListingAddress,
+                openListingByContentIdAddress,
+                populateListingDataAddress,
+                openAddonAddress,
+                openListingDetour,
+                openListingByContentIdDetour,
+                populateListingDataDetour,
+                pfDetailOpenDetour
+            ).HookScope;
+        }
+
+        internal unsafe PartyDetailCaptureHookRegistration CreateHooksWithStatusFromAddresses(
+            nint openListingAddress,
+            nint openListingByContentIdAddress,
+            nint populateListingDataAddress,
+            nint openAddonAddress,
+            Func<nint, ulong, bool> openListingDetour,
+            Func<nint, ulong, bool> openListingByContentIdDetour,
+            Action<nint, nint> populateListingDataDetour,
+            Func<nint, uint, nint, nint, nint, nint, ushort, int, bool> pfDetailOpenDetour,
+            Action<string>? warningSink = null
         ) {
             ArgumentNullException.ThrowIfNull(openListingDetour);
             ArgumentNullException.ThrowIfNull(openListingByContentIdDetour);
             ArgumentNullException.ThrowIfNull(populateListingDataDetour);
             ArgumentNullException.ThrowIfNull(pfDetailOpenDetour);
 
-            Hook<OpenListingDelegate>? openListingHook = null;
-            Hook<OpenListingByContentIdDelegate>? openListingByContentIdHook = null;
-            Hook<PopulateListingDataDelegate>? populateListingDataHook = null;
-            Hook<OpenAddonDelegate>? openAddonHook = null;
+            if (populateListingDataAddress == 0) {
+                throw new InvalidOperationException("AgentLookingForGroup.PopulateListingData address is unavailable.");
+            }
+
+            Hook<AgentLookingForGroup.Delegates.OpenListing>? openListingHook = null;
+            Hook<AgentLookingForGroup.Delegates.OpenListingByContentId>? openListingByContentIdHook = null;
+            Hook<AgentLookingForGroup.Delegates.PopulateListingData>? populateListingDataHook = null;
+            Hook<RaptureAtkModule.Delegates.OpenAddon>? openAddonHook = null;
             var hooks = new InteropHookBundle();
 
             try {
-                var openListingHookScope = CreateHookScope(
-                    createPrimaryHook: () =>
-                        openListingHook = _interopProvider.HookFromSignature<OpenListingDelegate>(
-                            OpenListingSignature,
-                            (agent, listingId) => {
-                                _ = openListingDetour(agent, listingId);
-                                return openListingHook!.Original(agent, listingId);
-                            }
-                        ),
-                    createSecondaryHook: () =>
-                        openListingByContentIdHook = _interopProvider.HookFromSignature<OpenListingByContentIdDelegate>(
-                            OpenListingByContentIdSignature,
-                            (agent, contentId) => {
-                                _ = openListingByContentIdDetour(agent, contentId);
-                                return openListingByContentIdHook!.Original(agent, contentId);
-                            }
-                        ),
-                    enablePrimaryHook: static hook => hook.Enable(),
-                    enableSecondaryHook: static hook => hook.Enable()
-                );
-                hooks.Add(openListingHookScope);
-
-                var populateAddress = (nint)AgentLookingForGroup.MemberFunctionPointers.PopulateListingData;
-                if (populateAddress == 0) {
-                    throw new InvalidOperationException("AgentLookingForGroup.PopulateListingData address is unavailable.");
-                }
-
-                populateListingDataHook = _interopProvider.HookFromAddress<PopulateListingDataDelegate>(
-                    populateAddress,
-                    (agent, listingData) => {
-                        populateListingDataHook!.Original(agent, listingData);
-                        populateListingDataDetour(agent, listingData);
+                populateListingDataHook = _interopProvider.HookFromAddress<AgentLookingForGroup.Delegates.PopulateListingData>(
+                    populateListingDataAddress,
+                    (thisPtr, listingData) => {
+                        populateListingDataHook!.Original(thisPtr, listingData);
+                        populateListingDataDetour((nint)thisPtr, (nint)listingData);
                     }
                 );
                 hooks.AddAndEnable(populateListingDataHook, static hook => hook.Enable());
-                openAddonHook = _interopProvider.HookFromSignature<OpenAddonDelegate>(
-                    OpenAddonSignature,
-                    (
-                        raptureAtkModule,
-                        addonId,
-                        valueCount,
-                        atkValues,
-                        parentAgent,
-                        unk,
-                        addonRowId,
-                        openFlags
-                    ) => pfDetailOpenDetour(
-                        raptureAtkModule,
-                        addonId,
-                        valueCount,
-                        atkValues,
-                        parentAgent,
-                        unk,
-                        addonRowId,
-                        openFlags
-                    )
-                        ? openAddonHook!.Original(
-                            raptureAtkModule,
-                            addonId,
-                            valueCount,
-                            atkValues,
-                            parentAgent,
-                            unk,
-                            addonRowId,
-                            openFlags
-                        )
-                        : 0L
-                );
-                hooks.AddAndEnable(openAddonHook, static hook => hook.Enable());
-                return hooks;
             } catch {
                 hooks.Dispose();
                 throw;
             }
+
+            var hasOpenListingHook = TryAddOptionalHook(
+                hooks,
+                openListingAddress,
+                "AgentLookingForGroup.OpenListing",
+                address => openListingHook = _interopProvider.HookFromAddress<AgentLookingForGroup.Delegates.OpenListing>(
+                    address,
+                    (thisPtr, listingId) => {
+                        _ = openListingDetour((nint)thisPtr, listingId);
+                        return openListingHook!.Original(thisPtr, listingId);
+                    }
+                ),
+                static hook => hook.Enable(),
+                warningSink
+            );
+
+            var hasOpenListingByContentIdHook = TryAddOptionalHook(
+                hooks,
+                openListingByContentIdAddress,
+                "AgentLookingForGroup.OpenListingByContentId",
+                address => openListingByContentIdHook = _interopProvider.HookFromAddress<AgentLookingForGroup.Delegates.OpenListingByContentId>(
+                    address,
+                    (thisPtr, contentId) => {
+                        _ = openListingByContentIdDetour((nint)thisPtr, contentId);
+                        return openListingByContentIdHook!.Original(thisPtr, contentId);
+                    }
+                ),
+                static hook => hook.Enable(),
+                warningSink
+            );
+
+            var hasOpenAddonHook = TryAddOptionalHook(
+                hooks,
+                openAddonAddress,
+                "RaptureAtkModule.OpenAddon",
+                address => openAddonHook = _interopProvider.HookFromAddress<RaptureAtkModule.Delegates.OpenAddon>(
+                    address,
+                    (thisPtr, addonNameId, valueCount, values, eventInterface, eventKind, parentAddonId, depthLayer) =>
+                        InvokeOpenAddonDetour(
+                            pfDetailOpenDetour,
+                            () => openAddonHook!.Original(
+                                thisPtr,
+                                addonNameId,
+                                valueCount,
+                                values,
+                                eventInterface,
+                                eventKind,
+                                parentAddonId,
+                                depthLayer
+                            ),
+                            (nint)thisPtr,
+                            addonNameId,
+                            (nint)valueCount,
+                            (nint)values,
+                            (nint)eventInterface,
+                            unchecked((nint)eventKind),
+                            parentAddonId,
+                            depthLayer
+                        )
+                ),
+                static hook => hook.Enable(),
+                warningSink
+            );
+
+            return new PartyDetailCaptureHookRegistration(
+                hooks,
+                HasPopulateHook: true,
+                HasOpenListingHook: hasOpenListingHook,
+                HasOpenListingByContentIdHook: hasOpenListingByContentIdHook,
+                HasOpenAddonHook: hasOpenAddonHook
+            );
+        }
+
+        private static bool TryAddOptionalHook<THook>(
+            InteropHookBundle hooks,
+            nint address,
+            string hookName,
+            Func<nint, THook> createHook,
+            Action<THook> enableHook,
+            Action<string>? warningSink
+        )
+            where THook : class, IDisposable {
+            if (address == 0) {
+                warningSink?.Invoke($"PartyDetailCaptureRuntime: optional {hookName} address is unavailable; scanner capture disabled.");
+                return false;
+            }
+
+            THook? hook = null;
+            try {
+                hook = createHook(address);
+                enableHook(hook);
+                hooks.Add(hook);
+                return true;
+            } catch (Exception exception) {
+                hook?.Dispose();
+                warningSink?.Invoke($"PartyDetailCaptureRuntime: optional {hookName} hook failed; scanner capture disabled. {exception.Message}");
+                return false;
+            }
+        }
+
+        internal static ushort InvokeOpenAddonDetour(
+            Func<nint, uint, nint, nint, nint, nint, ushort, int, bool> pfDetailOpenDetour,
+            Func<ushort> callOriginal,
+            nint raptureAtkModule,
+            uint addonNameId,
+            nint valueCount,
+            nint values,
+            nint eventInterface,
+            nint eventKind,
+            ushort parentAddonId,
+            int depthLayer
+        ) {
+            return pfDetailOpenDetour(
+                raptureAtkModule,
+                addonNameId,
+                valueCount,
+                values,
+                eventInterface,
+                eventKind,
+                parentAddonId,
+                depthLayer
+            )
+                ? callOriginal()
+                : (ushort)0;
         }
     }
 }

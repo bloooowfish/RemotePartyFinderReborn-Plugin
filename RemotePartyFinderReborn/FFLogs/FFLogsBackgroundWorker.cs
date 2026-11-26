@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
@@ -23,6 +24,9 @@ internal sealed class FFLogsBackgroundWorker
     private readonly Action<string> _debugLog;
     private readonly Func<bool> _isPluginOperational;
     private UploadUrl _lastSessionUploadUrl;
+    private FFLogsLeaseSession _activeLeaseSession;
+    private IReadOnlyList<ParseResult> _activeProcessedResults = [];
+    private readonly List<AbandonFflogsLease> _activeExplicitlyAbandoned = [];
 
     public FFLogsBackgroundWorker(
         Configuration configuration,
@@ -159,11 +163,16 @@ internal sealed class FFLogsBackgroundWorker
             return 0;
         }
 
+        _activeLeaseSession = leaseSession;
+        _activeProcessedResults = [];
+        _activeExplicitlyAbandoned.Clear();
+
         var jobs = leaseSession.Jobs;
         _debugLog($"Received {jobs.Count} players to fetch from FFLogs.");
 
         var processResult = await _batchProcessor.ProcessLeaseSessionAsync(leaseSession, cancellationToken);
         hadTransientFailure |= processResult.HadTransientFailure;
+        _activeProcessedResults = processResult.ProcessedResults;
 
         var submitAttempt = await _resultSubmitter.TrySubmitResultsAsync(
             _configuration,
@@ -175,11 +184,6 @@ internal sealed class FFLogsBackgroundWorker
             _errorLog,
             _debugLog);
         hadTransientFailure |= submitAttempt.HadTransientFailure;
-        if (submitAttempt.ShouldUseBaseDelayBeforeNextPoll)
-        {
-            await _workerPolicy.DelayAsync(_workerPolicy.WorkerBaseDelayMs, cancellationToken);
-            return 0;
-        }
 
         if (processResult.AbandonedLeases is { Count: > 0 })
         {
@@ -190,6 +194,7 @@ internal sealed class FFLogsBackgroundWorker
                 cancellationToken,
                 _warningLog,
                 _debugLog);
+            _activeExplicitlyAbandoned.AddRange(processResult.AbandonedLeases);
         }
 
         if (processResult.ShouldAbandonRemainingLeases || processResult.HadTransientFailure)
@@ -207,6 +212,14 @@ internal sealed class FFLogsBackgroundWorker
                 _warningLog,
                 _debugLog,
                 processResult.AbandonedLeases);
+        }
+
+        ClearActiveLeaseSession();
+
+        if (submitAttempt.ShouldUseBaseDelayBeforeNextPoll)
+        {
+            await _workerPolicy.DelayAsync(_workerPolicy.WorkerBaseDelayMs, cancellationToken);
+            return 0;
         }
 
         if (processResult.HitRateLimitCooldown)
@@ -252,56 +265,99 @@ internal sealed class FFLogsBackgroundWorker
             _debugLog).ConfigureAwait(false);
     }
 
+    private void ClearActiveLeaseSession()
+    {
+        _activeLeaseSession = null;
+        _activeProcessedResults = [];
+        _activeExplicitlyAbandoned.Clear();
+    }
+
     private async Task FlushOrAbandonOnShutdownAsync()
     {
-        if (!_resultSubmitter.HasPendingResults)
-        {
-            return;
-        }
-
-        var targetUrl = _lastSessionUploadUrl
-                        ?? _jobLeaseClient.SelectAvailableUploadUrl(_configuration, _warningLog);
-        if (targetUrl == null)
-        {
-            _resultSubmitter.DrainPendingResults();
-            return;
-        }
-
-        using var shutdownCts = new CancellationTokenSource(ShutdownFlushTimeout);
-        try
-        {
-            await _resultSubmitter.TryFlushPendingAsync(
-                _configuration,
-                targetUrl,
-                shutdownCts.Token,
-                _infoLog,
-                _warningLog,
-                _errorLog,
-                _debugLog).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is OperationCanceledException or HttpRequestException)
-        {
-            // Fall through to abandon remaining unsubmitted leases.
-        }
+        var activeSession = _activeLeaseSession;
+        var activeProcessedResults = _activeProcessedResults;
+        var activeExplicitlyAbandoned = _activeExplicitlyAbandoned.ToArray();
+        ClearActiveLeaseSession();
 
         if (_resultSubmitter.HasPendingResults)
         {
-            var remaining = _resultSubmitter.DrainPendingResults();
-            try
+            var targetUrl = _lastSessionUploadUrl
+                            ?? activeSession?.UploadUrl
+                            ?? _jobLeaseClient.SelectAvailableUploadUrl(_configuration, _warningLog);
+            if (targetUrl == null)
             {
-                using var abandonCts = new CancellationTokenSource(ShutdownAbandonTimeout);
-                await _leaseAbandoner.AbandonResultLeasesAsync(
-                    _configuration,
-                    targetUrl,
-                    remaining,
-                    "worker_shutdown",
-                    abandonCts.Token,
-                    _warningLog,
-                    _debugLog).ConfigureAwait(false);
+                _resultSubmitter.DrainPendingResults();
             }
-            catch (Exception ex)
+            else
             {
-                _debugLog($"FFLogsCollector: shutdown lease abandon skipped: {ex.Message}");
+                using var shutdownCts = new CancellationTokenSource(ShutdownFlushTimeout);
+                try
+                {
+                    await _resultSubmitter.TryFlushPendingAsync(
+                        _configuration,
+                        targetUrl,
+                        shutdownCts.Token,
+                        _infoLog,
+                        _warningLog,
+                        _errorLog,
+                        _debugLog).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is OperationCanceledException or HttpRequestException)
+                {
+                    // Fall through to abandon remaining unsubmitted leases.
+                }
+
+                if (_resultSubmitter.HasPendingResults)
+                {
+                    var remaining = _resultSubmitter.DrainPendingResults();
+                    try
+                    {
+                        using var abandonCts = new CancellationTokenSource(ShutdownAbandonTimeout);
+                        await _leaseAbandoner.AbandonResultLeasesAsync(
+                            _configuration,
+                            targetUrl,
+                            remaining,
+                            "worker_shutdown",
+                            abandonCts.Token,
+                            _warningLog,
+                            _debugLog).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        _debugLog($"FFLogsCollector: shutdown lease abandon skipped: {ex.Message}");
+                    }
+                }
+            }
+        }
+
+        if (activeSession != null && activeSession.HasJobs)
+        {
+            var sessionTargetUrl = activeSession.UploadUrl
+                                   ?? _lastSessionUploadUrl
+                                   ?? _jobLeaseClient.SelectAvailableUploadUrl(_configuration, _warningLog);
+            if (sessionTargetUrl != null)
+            {
+                var sessionForAbandon = activeSession.UploadUrl != null
+                    ? activeSession
+                    : new FFLogsLeaseSession(sessionTargetUrl, activeSession.Jobs, activeSession.UseBaseDelayWhenNoWork);
+                try
+                {
+                    using var abandonCts = new CancellationTokenSource(ShutdownAbandonTimeout);
+                    await _leaseAbandoner.AbandonUnprocessedLeasesAsync(
+                        _configuration,
+                        sessionForAbandon,
+                        activeSession.Jobs,
+                        activeProcessedResults,
+                        "worker_shutdown",
+                        abandonCts.Token,
+                        _warningLog,
+                        _debugLog,
+                        activeExplicitlyAbandoned).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _debugLog($"FFLogsCollector: shutdown in-flight lease abandon skipped: {ex.Message}");
+                }
             }
         }
     }

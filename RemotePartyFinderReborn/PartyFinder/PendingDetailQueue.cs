@@ -9,8 +9,8 @@ using System.Linq;
 namespace RemotePartyFinderReborn;
 
 internal sealed class PendingDetailQueue {
-    private readonly ConcurrentDictionary<uint, PendingDetailEntry> _pendingDetails = new();
-    private readonly ConcurrentDictionary<uint, byte> _inFlightDetails = new();
+    private readonly ConcurrentDictionary<ulong, PendingDetailEntry> _pendingDetails = new();
+    private readonly ConcurrentDictionary<ulong, byte> _inFlightDetails = new();
 
     internal int Count => _pendingDetails.Count;
     internal int InFlightCount => _inFlightDetails.Count;
@@ -136,7 +136,7 @@ internal sealed class PendingDetailQueue {
         TryRemoveExact(pending.Detail.ListingId, current);
     }
 
-    internal bool TryGet(uint listingId, out PendingDetailEntry pending) {
+    internal bool TryGet(ulong listingId, out PendingDetailEntry pending) {
         return _pendingDetails.TryGetValue(listingId, out pending!);
     }
 
@@ -144,7 +144,7 @@ internal sealed class PendingDetailQueue {
         return _pendingDetails.Values.ToArray();
     }
 
-    internal bool IsInFlight(uint listingId) {
+    internal bool IsInFlight(ulong listingId) {
         return _inFlightDetails.ContainsKey(listingId);
     }
 
@@ -153,9 +153,9 @@ internal sealed class PendingDetailQueue {
             && _pendingDetails.TryUpdate(current.Detail.ListingId, updated, current);
     }
 
-    private bool TryRemoveExact(uint listingId, PendingDetailEntry current) {
-        return ((ICollection<KeyValuePair<uint, PendingDetailEntry>>)_pendingDetails)
-            .Remove(new KeyValuePair<uint, PendingDetailEntry>(listingId, current));
+    private bool TryRemoveExact(ulong listingId, PendingDetailEntry current) {
+        return ((ICollection<KeyValuePair<ulong, PendingDetailEntry>>)_pendingDetails)
+            .Remove(new KeyValuePair<ulong, PendingDetailEntry>(listingId, current));
     }
 }
 

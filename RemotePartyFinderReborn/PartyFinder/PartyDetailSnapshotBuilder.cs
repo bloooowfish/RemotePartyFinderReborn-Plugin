@@ -35,12 +35,8 @@ internal static class PartyDetailSnapshotBuilder {
             return false;
         }
 
-        var effectiveParties = Math.Max(1, (int)viewedListing.NumberOfParties);
-        var declaredSlots = Math.Max((int)viewedListing.TotalSlots, effectiveParties * 8);
-        var slotCount = Math.Clamp(declaredSlots, 0, 48);
-        if (slotCount <= 0) {
-            return false;
-        }
+        var slotCount = ComputeSlotCount(viewedListing.TotalSlots, viewedListing.NumberOfParties);
+        var leaderName = ResolveLeaderName(viewedListing.LeaderString, lookingForGroupAgent->LastLeader.ToString());
 
         var memberContentIds = new List<ulong>(slotCount);
         var memberJobs = new List<byte>(slotCount);
@@ -66,7 +62,7 @@ internal static class PartyDetailSnapshotBuilder {
         snapshot = new UploadablePartyDetail {
             ListingId = listingId,
             LeaderContentId = viewedListing.LeaderContentId,
-            LeaderName = lookingForGroupAgent->LastLeader.ToString(),
+            LeaderName = leaderName,
             HomeWorld = viewedListing.HomeWorld,
             CreatedWorld = viewedListing.World,
             LastServerRestart = viewedListing.LastPatchHotfixTimestamp,
@@ -83,7 +79,7 @@ internal static class PartyDetailSnapshotBuilder {
             UploadListingId = listingId,
             LeaderAccountId = viewedListing.LeaderAccountId,
             LeaderContentId = viewedListing.LeaderContentId,
-            LeaderName = lookingForGroupAgent->LastLeader.ToString(),
+            LeaderName = leaderName,
             Comment = lookingForGroupAgent->LastComment.ToString(),
             Category = (uint)viewedListing.Category,
             DutyId = viewedListing.DutyId,
@@ -115,5 +111,22 @@ internal static class PartyDetailSnapshotBuilder {
         };
 
         return true;
+    }
+
+    internal static int ComputeSlotCount(byte totalSlots, byte numberOfParties) {
+        if (totalSlots > 0) {
+            return Math.Clamp((int)totalSlots, 1, 48);
+        }
+
+        var effectiveParties = Math.Max(1, (int)numberOfParties);
+        return Math.Clamp(effectiveParties * 8, 1, 48);
+    }
+
+    internal static string ResolveLeaderName(string? viewedLeaderName, string? fallbackLastLeader) {
+        if (!string.IsNullOrWhiteSpace(viewedLeaderName)) {
+            return viewedLeaderName;
+        }
+
+        return fallbackLastLeader ?? string.Empty;
     }
 }

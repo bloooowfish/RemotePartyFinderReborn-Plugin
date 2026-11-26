@@ -1,8 +1,11 @@
+#nullable enable
+
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
@@ -19,12 +22,20 @@ internal sealed class Gatherer : IDisposable {
     private static readonly TimeSpan UploadedListingGrace = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan ShutdownWaitTimeout = TimeSpan.FromSeconds(2);
 
-    private readonly Plugin _plugin;
+    private readonly Plugin? _plugin;
+    private readonly Configuration _configuration;
     private readonly object _batchesLock = new();
     private Dictionary<int, List<UploadableListing>> _batches = new();
-    private readonly ConcurrentDictionary<uint, DateTime> _lastUploadedListingAtUtc = new();
+    private readonly ConcurrentDictionary<ulong, DateTime> _lastUploadedListingAtUtc = new();
     private readonly Stopwatch _uploadTimer = new();
-    private readonly HttpClient _httpClient = PluginHttpClientFactory.CreateIngestClient();
+    private readonly HttpClient _httpClient;
+    private readonly bool _ownsHttpClient;
+    private readonly Func<bool> _isOperational;
+    private readonly Func<DateTime> _utcNow;
+    private readonly Action<string> _debugLog;
+    private readonly Action<string> _warningLog;
+    private readonly Action<string> _errorLog;
+    private readonly Action<UploadablePlayer>? _onLeaderObserved;
     private readonly CancellationTokenSource _disposeCts = new();
 
     private int _uploadWorkerRunning;
@@ -46,12 +57,66 @@ internal sealed class Gatherer : IDisposable {
         }
     }
 
-    internal Gatherer(Plugin plugin) {
-        _plugin = plugin;
-
-        _uploadTimer.Start();
-        _plugin.PartyFinderGui.ReceiveListing += OnListing;
+    internal Gatherer(Plugin plugin)
+        : this(
+            plugin ?? throw new ArgumentNullException(nameof(plugin)),
+            plugin.Configuration,
+            httpClient: null,
+            utcNow: null,
+            isOperational: () => plugin.IsPluginOperational,
+            debugLog: null,
+            warningLog: null,
+            errorLog: null,
+            onLeaderObserved: player => plugin.PlayerCollector.EnqueueObservedPlayer(player)
+        ) {
+        _plugin!.PartyFinderGui.ReceiveListing += OnListing;
         _plugin.Framework.Update += OnUpdate;
+    }
+
+    internal Gatherer(
+        Configuration configuration,
+        HttpClient? httpClient = null,
+        Func<DateTime>? utcNow = null,
+        Func<bool>? isOperational = null,
+        Action<string>? debugLog = null,
+        Action<string>? warningLog = null,
+        Action<string>? errorLog = null,
+        Action<UploadablePlayer>? onLeaderObserved = null
+    ) : this(
+        plugin: null,
+        configuration,
+        httpClient,
+        utcNow,
+        isOperational,
+        debugLog,
+        warningLog,
+        errorLog,
+        onLeaderObserved
+    ) {
+    }
+
+    private Gatherer(
+        Plugin? plugin,
+        Configuration configuration,
+        HttpClient? httpClient,
+        Func<DateTime>? utcNow,
+        Func<bool>? isOperational,
+        Action<string>? debugLog,
+        Action<string>? warningLog,
+        Action<string>? errorLog,
+        Action<UploadablePlayer>? onLeaderObserved
+    ) {
+        _plugin = plugin;
+        _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
+        _httpClient = httpClient ?? PluginHttpClientFactory.CreateIngestClient();
+        _ownsHttpClient = httpClient is null;
+        _utcNow = utcNow ?? (static () => DateTime.UtcNow);
+        _isOperational = isOperational ?? (static () => true);
+        _debugLog = debugLog ?? (static message => Plugin.Log?.Debug(message));
+        _warningLog = warningLog ?? (static message => Plugin.Log?.Warning(message));
+        _errorLog = errorLog ?? (static message => Plugin.Log?.Error(message));
+        _onLeaderObserved = onLeaderObserved;
+        _uploadTimer.Start();
     }
 
     internal void BeginShutdown() {
@@ -65,9 +130,28 @@ internal sealed class Gatherer : IDisposable {
         }
     }
 
+    internal void CollectShutdownTasks(List<Task> tasks) {
+        ArgumentNullException.ThrowIfNull(tasks);
+        Task activeTask;
+        lock (_batchesLock) {
+            activeTask = _activeUploadTask;
+        }
+
+        if (!activeTask.IsCompleted) {
+            tasks.Add(activeTask);
+        }
+    }
+
     public void Dispose() {
-        _plugin.Framework.Update -= OnUpdate;
-        _plugin.PartyFinderGui.ReceiveListing -= OnListing;
+        Dispose(ShutdownWaitTimeout);
+    }
+
+    internal void Dispose(TimeSpan waitTimeout) {
+        if (_plugin is not null) {
+            _plugin.Framework.Update -= OnUpdate;
+            _plugin.PartyFinderGui.ReceiveListing -= OnListing;
+        }
+
         BeginShutdown();
         if (Interlocked.Exchange(ref _disposed, 1) != 0) {
             return;
@@ -78,16 +162,21 @@ internal sealed class Gatherer : IDisposable {
             activeTask = _activeUploadTask;
         }
 
-        try {
-            activeTask.Wait(ShutdownWaitTimeout);
-        } catch (Exception) {
+        if (waitTimeout > TimeSpan.Zero && !activeTask.IsCompleted) {
+            try {
+                activeTask.Wait(waitTimeout);
+            } catch (Exception) {
+            }
         }
 
-        _httpClient.Dispose();
+        if (_ownsHttpClient) {
+            _httpClient.Dispose();
+        }
+
         _disposeCts.Dispose();
     }
 
-    internal bool WasListingUploadedAfter(uint listingId, DateTime observedAtUtc) {
+    internal bool WasListingUploadedAfter(ulong listingId, DateTime observedAtUtc) {
         if (!_lastUploadedListingAtUtc.TryGetValue(listingId, out var uploadedAtUtc)) {
             return false;
         }
@@ -107,9 +196,19 @@ internal sealed class Gatherer : IDisposable {
     }
 
     private void OnListing(IPartyFinderListing listing, IPartyFinderListingEventArgs args) {
-        if (!_plugin.IsPluginOperational) {
+        if (!_isOperational()) {
             ClearPendingBatches();
             return;
+        }
+
+        if (_onLeaderObserved is not null
+            && TryBuildLeaderObservation(
+                listing.ContentId,
+                listing.Name?.TextValue,
+                (ushort)listing.HomeWorld.RowId,
+                (ushort)listing.CurrentWorld.RowId,
+                out var leaderObservation)) {
+            _onLeaderObserved(leaderObservation);
         }
 
         if (!UploadableListing.IsSourceClientHighEndDuty(listing)) {
@@ -121,7 +220,7 @@ internal sealed class Gatherer : IDisposable {
         try {
             uploadableListing = new UploadableListing(listing);
         } catch (ArgumentOutOfRangeException exception) {
-            Plugin.Log.Warning($"Gatherer: skipped listing with unsupported API15 id {listing.Id}. {exception.Message}");
+            _warningLog($"Gatherer: skipped listing with unsupported API15 id {listing.Id}. {exception.Message}");
             return;
         }
 
@@ -139,8 +238,60 @@ internal sealed class Gatherer : IDisposable {
         }
     }
 
+    internal static bool TryBuildLeaderObservation(
+        ulong contentId,
+        string? name,
+        ushort homeWorld,
+        ushort currentWorld,
+        [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out UploadablePlayer? player
+    ) {
+        if (contentId == 0 || contentId > long.MaxValue || homeWorld == 0 || homeWorld >= 1000 || string.IsNullOrWhiteSpace(name)) {
+            player = null;
+            return false;
+        }
+
+        var normalizedCurrentWorld = currentWorld > 0 && currentWorld < 1000 ? currentWorld : homeWorld;
+        player = new UploadablePlayer {
+            ContentId = contentId,
+            Name = name.Trim(),
+            HomeWorld = homeWorld,
+            CurrentWorld = normalizedCurrentWorld,
+            AccountId = 0,
+        };
+        return true;
+    }
+
+    internal void ForwardListingLeaderForTesting(ulong contentId, string? name, ushort homeWorld, ushort currentWorld = 0) {
+        if (_onLeaderObserved is not null
+            && TryBuildLeaderObservation(contentId, name, homeWorld, currentWorld, out var leader)) {
+            _onLeaderObserved(leader);
+        }
+    }
+
+    internal void EnqueueListingForTesting(UploadableListing listing, int batchNumber = 0) {
+        ArgumentNullException.ThrowIfNull(listing);
+        lock (_batchesLock) {
+            if (!_batches.TryGetValue(batchNumber, out var list)) {
+                list = [];
+                _batches[batchNumber] = list;
+            }
+
+            list.Add(listing);
+        }
+    }
+
+    internal Task TriggerImmediateUploadAndWaitForTestingAsync() {
+        TriggerImmediateUpload();
+        Task activeTask;
+        lock (_batchesLock) {
+            activeTask = _activeUploadTask;
+        }
+
+        return activeTask;
+    }
+
     internal void TriggerImmediateUpload() {
-        if (!_plugin.IsPluginOperational) {
+        if (!_isOperational()) {
             ClearPendingBatches();
             return;
         }
@@ -150,7 +301,7 @@ internal sealed class Gatherer : IDisposable {
     }
 
     private void OnUpdate(IFramework framework) {
-        if (!_plugin.IsPluginOperational) {
+        if (!_isOperational()) {
             ClearPendingBatches();
             return;
         }
@@ -164,6 +315,10 @@ internal sealed class Gatherer : IDisposable {
     }
 
     private void TryStartUploadWorker() {
+        if (!UploadAttemptRecorder.HasAnyAttemptableEndpoint(_configuration, IngestRoutes.ListingsMultiple, _utcNow())) {
+            return;
+        }
+
         CancellationToken cancellationToken;
         lock (_batchesLock) {
             if (_shutdownSignaled != 0 || _uploadWorkerRunning != 0 || _batches.Count == 0) {
@@ -180,7 +335,12 @@ internal sealed class Gatherer : IDisposable {
         return Task.Run(async () => {
             var exitedUnderLock = false;
             try {
-                while (!cancellationToken.IsCancellationRequested && _plugin.IsPluginOperational) {
+                while (!cancellationToken.IsCancellationRequested && _isOperational()) {
+                    if (!UploadAttemptRecorder.HasAnyAttemptableEndpoint(_configuration, IngestRoutes.ListingsMultiple, _utcNow())) {
+                        _debugLog("Gatherer: skipping upload because all enabled endpoints are unavailable or have open circuits.");
+                        return;
+                    }
+
                     var listingsToUpload = DrainBatchesOrExitWorker();
                     if (listingsToUpload.Count == 0) {
                         exitedUnderLock = true;
@@ -192,14 +352,14 @@ internal sealed class Gatherer : IDisposable {
                     var uploadSucceeded = await UploadBatchToEnabledEndpointsAsync(payload, listingsToUpload.Count, cancellationToken);
 
                     if (!uploadSucceeded) {
-                        if (!cancellationToken.IsCancellationRequested && _plugin.IsPluginOperational) {
+                        if (!cancellationToken.IsCancellationRequested && _isOperational()) {
                             RequeueFailedListings(listingsToUpload);
                         }
 
                         return;
                     }
 
-                    var now = DateTime.UtcNow;
+                    var now = _utcNow();
                     foreach (var listingId in uploadedListingIds) {
                         _lastUploadedListingAtUtc[listingId] = now;
                     }
@@ -242,7 +402,7 @@ internal sealed class Gatherer : IDisposable {
             return;
         }
 
-        var byId = new Dictionary<uint, UploadableListing>();
+        var byId = new Dictionary<ulong, UploadableListing>();
         foreach (var listing in failedListings) {
             byId[listing.Id] = listing;
         }
@@ -288,7 +448,7 @@ internal sealed class Gatherer : IDisposable {
     private async Task<bool> UploadBatchToEnabledEndpointsAsync(string jsonPayload, int listingCount, CancellationToken cancellationToken) {
         var anySuccess = false;
 
-        foreach (var uploadUrl in _plugin.Configuration.UploadUrls.Where(static candidate => candidate.IsEnabled)) {
+        foreach (var uploadUrl in _configuration.GetUploadUrlsSnapshot().Where(static candidate => candidate.IsEnabled)) {
             if (cancellationToken.IsCancellationRequested) {
                 break;
             }
@@ -297,7 +457,7 @@ internal sealed class Gatherer : IDisposable {
                 continue;
             }
 
-            if (!UploadAttemptRecorder.TryBeginAttempt(uploadUrl, _plugin.Configuration, DateTime.UtcNow, out var attemptLease)) {
+            if (!UploadAttemptRecorder.TryBeginAttempt(uploadUrl, _configuration, _utcNow(), out var attemptLease)) {
                 continue;
             }
 
@@ -312,20 +472,23 @@ internal sealed class Gatherer : IDisposable {
                     anySuccess = true;
                     attemptLease.RecordSuccess();
                     IngestResponseParser.CaptureMultipleResponse(uploadUrl, attempt.ResponseBody);
+                } else if (attempt.StatusCode == (int)HttpStatusCode.NotFound) {
+                    attemptLease.RecordRouteNotFoundFailure(_utcNow());
+                    _warningLog($"Gatherer: {endpoint.Url} returned 404 NotFound; backing off for {UploadCircuitState.DefaultRouteNotFoundCooldown.TotalMinutes:F0} minutes.");
                 } else {
-                    attemptLease.RecordFailure(DateTime.UtcNow);
+                    attemptLease.RecordFailure(_utcNow());
 
                     if (!string.IsNullOrEmpty(attempt.ErrorMessage)) {
-                        Plugin.Log.Error($"Gatherer upload error to {endpoint.Url}: {attempt.ErrorMessage}");
+                        _errorLog($"Gatherer upload error to {endpoint.Url}: {attempt.ErrorMessage}");
                     }
 
                     if (attempt.RetryAfterSeconds.HasValue) {
-                        Plugin.Log.Warning($"Gatherer: rate limited by {endpoint.Url}, retry_after={attempt.RetryAfterSeconds.Value}s");
+                        _warningLog($"Gatherer: rate limited by {endpoint.Url}, retry_after={attempt.RetryAfterSeconds.Value}s");
                     }
                 }
 
                 var statusForLog = attempt.StatusCode?.ToString() ?? "Exception";
-                Plugin.Log.Debug($"Gatherer: {endpoint.Url}: {statusForLog} ({listingCount} listings)");
+                _debugLog($"Gatherer: {endpoint.Url}: {statusForLog} ({listingCount} listings)");
             }
         }
 
@@ -335,7 +498,7 @@ internal sealed class Gatherer : IDisposable {
     private async Task<UploadAttemptResult> TryUploadAsync(IngestEndpoint endpoint, string jsonPayload, CancellationToken cancellationToken) {
         try {
             using var request = IngestRequestFactory.CreatePostJsonRequest(
-                _plugin.Configuration,
+                _configuration,
                 endpoint,
                 jsonPayload
             );
@@ -376,7 +539,7 @@ internal sealed class Gatherer : IDisposable {
         bool Success,
         int? StatusCode,
         int? RetryAfterSeconds,
-        string ErrorMessage,
+        string? ErrorMessage,
         string ResponseBody,
         bool Canceled
     );

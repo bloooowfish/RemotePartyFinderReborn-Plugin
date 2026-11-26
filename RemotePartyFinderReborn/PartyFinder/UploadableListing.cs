@@ -11,7 +11,7 @@ namespace RemotePartyFinderReborn;
 [Serializable]
 [JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
 internal sealed class UploadableListing {
-    public uint Id { get; }
+    public ulong Id { get; }
     public uint ContentIdLower { get; }
     public byte[] Name { get; }
     public byte[] Description { get; }
@@ -71,9 +71,9 @@ internal sealed class UploadableListing {
         return timestamp <= 0 ? 0U : (uint)timestamp;
     }
 
-    internal static bool TryNormalizeListingIdForUpload(ulong sourceId, out uint listingId) {
-        if (sourceId <= uint.MaxValue) {
-            listingId = (uint)sourceId;
+    internal static bool TryNormalizeListingIdForUpload(ulong sourceId, out ulong listingId) {
+        if (sourceId > 0 && sourceId <= long.MaxValue) {
+            listingId = sourceId;
             return true;
         }
 
@@ -81,7 +81,7 @@ internal sealed class UploadableListing {
         return false;
     }
 
-    internal static uint NormalizeListingIdForUpload(ulong sourceId) {
+    internal static ulong NormalizeListingIdForUpload(ulong sourceId) {
         if (TryNormalizeListingIdForUpload(sourceId, out var listingId)) {
             return listingId;
         }

@@ -242,4 +242,99 @@ public sealed class UploadTargetStateTests {
         Assert.True(uploadUrl.DetailBatchUnsupported);
         Assert.Equal(0, uploadUrl.FailureCount);
     }
+
+    [Fact]
+    public void Recorder_route_not_found_opens_circuit_for_15_minutes_and_recovers() {
+        var nowUtc = new DateTime(2026, 5, 10, 5, 0, 0, DateTimeKind.Utc);
+        var configuration = new Configuration {
+            CircuitBreakerFailureThreshold = 3,
+            CircuitBreakerBreakDurationMinutes = 1,
+        };
+        var uploadUrl = new UploadUrl("https://upload.example");
+
+        UploadAttemptRecorder.RecordRouteNotFoundFailure(uploadUrl, nowUtc);
+
+        Assert.Equal(1, uploadUrl.FailureCount);
+        Assert.True(UploadAttemptRecorder.PeekIsCircuitOpen(uploadUrl, configuration, nowUtc));
+        Assert.True(UploadAttemptRecorder.PeekIsCircuitOpen(uploadUrl, configuration, nowUtc.AddMinutes(14).AddSeconds(59)));
+        Assert.False(UploadAttemptRecorder.TryBeginAttempt(uploadUrl, configuration, nowUtc.AddMinutes(14), out _));
+
+        var statusAt5Min = UploadAttemptRecorder.GetCircuitStatus(uploadUrl, configuration, nowUtc.AddMinutes(5));
+        Assert.True(statusAt5Min.IsOpen);
+        Assert.Equal(1, statusAt5Min.FailureCount);
+        Assert.Equal(TimeSpan.FromMinutes(10), statusAt5Min.RemainingBreakDuration);
+
+        Assert.False(UploadAttemptRecorder.PeekIsCircuitOpen(uploadUrl, configuration, nowUtc.AddMinutes(15)));
+        var statusAt15Min = UploadAttemptRecorder.GetCircuitStatus(uploadUrl, configuration, nowUtc.AddMinutes(15));
+        Assert.False(statusAt15Min.IsOpen);
+        Assert.Equal(TimeSpan.Zero, statusAt15Min.RemainingBreakDuration);
+        Assert.True(UploadAttemptRecorder.TryBeginAttempt(uploadUrl, configuration, nowUtc.AddMinutes(15), out var lease));
+        lease.Dispose();
+    }
+
+    [Fact]
+    public void Recorder_route_not_found_resets_cleanly_on_success() {
+        var nowUtc = new DateTime(2026, 5, 10, 6, 0, 0, DateTimeKind.Utc);
+        var configuration = new Configuration {
+            CircuitBreakerFailureThreshold = 3,
+            CircuitBreakerBreakDurationMinutes = 1,
+        };
+        var uploadUrl = new UploadUrl("https://upload.example");
+
+        UploadAttemptRecorder.RecordRouteNotFoundFailure(uploadUrl, nowUtc);
+        Assert.True(UploadAttemptRecorder.PeekIsCircuitOpen(uploadUrl, configuration, nowUtc.AddMinutes(1)));
+
+        UploadAttemptRecorder.RecordSuccess(uploadUrl);
+
+        Assert.Equal(0, uploadUrl.FailureCount);
+        Assert.False(UploadAttemptRecorder.PeekIsCircuitOpen(uploadUrl, configuration, nowUtc.AddMinutes(1)));
+        Assert.Equal(TimeSpan.Zero, UploadAttemptRecorder.GetCircuitStatus(uploadUrl, configuration, nowUtc.AddMinutes(1)).RemainingBreakDuration);
+    }
+
+    [Fact]
+    public void Lease_record_route_not_found_failure_releases_half_open_probe_and_applies_15_minute_cooldown() {
+        var startUtc = new DateTime(2026, 5, 10, 7, 0, 0, DateTimeKind.Utc);
+        var configuration = new Configuration {
+            CircuitBreakerFailureThreshold = 1,
+            CircuitBreakerBreakDurationMinutes = 1,
+        };
+        var uploadUrl = new UploadUrl("https://upload.example");
+        UploadAttemptRecorder.RecordFailure(uploadUrl, startUtc);
+
+        var probeUtc = startUtc.AddMinutes(1);
+        Assert.True(UploadAttemptRecorder.TryBeginAttempt(uploadUrl, configuration, probeUtc, out var lease));
+        Assert.True(lease.ClaimedHalfOpenProbe);
+
+        lease.RecordRouteNotFoundFailure(probeUtc);
+
+        Assert.True(UploadAttemptRecorder.PeekIsCircuitOpen(uploadUrl, configuration, probeUtc.AddMinutes(14)));
+        Assert.False(UploadAttemptRecorder.TryBeginAttempt(uploadUrl, configuration, probeUtc.AddMinutes(14), out _));
+        Assert.False(UploadAttemptRecorder.PeekIsCircuitOpen(uploadUrl, configuration, probeUtc.AddMinutes(15)));
+        Assert.True(UploadAttemptRecorder.TryBeginAttempt(uploadUrl, configuration, probeUtc.AddMinutes(15), out var retryLease));
+        Assert.True(retryLease.ClaimedHalfOpenProbe);
+        retryLease.Dispose();
+    }
+
+    [Fact]
+    public void HasAnyAttemptableEndpoint_checks_enabled_validity_and_open_circuits_without_consuming_half_open_probe() {
+        var nowUtc = new DateTime(2026, 5, 10, 8, 0, 0, DateTimeKind.Utc);
+        var openUrl = new UploadUrl("https://open.example");
+        var disabledUrl = new UploadUrl("https://disabled.example") { IsEnabled = false };
+        var insecureUrl = new UploadUrl("http://remote-insecure.example");
+        var configuration = new Configuration {
+            CircuitBreakerFailureThreshold = 1,
+            CircuitBreakerBreakDurationMinutes = 1,
+            UploadUrls = [openUrl, disabledUrl, insecureUrl],
+        };
+        UploadAttemptRecorder.RecordFailure(openUrl, nowUtc);
+
+        Assert.False(UploadAttemptRecorder.HasAnyAttemptableEndpoint(configuration, IngestRoutes.Players, nowUtc.AddSeconds(30)));
+
+        // At 1 minute, Half-Open becomes eligible and HasAnyAttemptableEndpoint must not consume the probe slot.
+        var probeUtc = nowUtc.AddMinutes(1);
+        Assert.True(UploadAttemptRecorder.HasAnyAttemptableEndpoint(configuration, IngestRoutes.Players, probeUtc));
+        Assert.True(UploadAttemptRecorder.TryBeginAttempt(openUrl, configuration, probeUtc, out var lease));
+        Assert.True(lease.ClaimedHalfOpenProbe);
+        lease.Dispose();
+    }
 }

@@ -2,8 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Text;
 using Dalamud.Game.Chat;
-using Dalamud.Game.Addon.Lifecycle;
-using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Game.Gui.Toast;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
@@ -36,28 +34,23 @@ internal interface ISelectOkDialogSuppressionRuntime : IDisposable {
 }
 
 internal sealed class DalamudSelectOkDialogSuppressionRuntime : ISelectOkDialogSuppressionRuntime {
-    private readonly IAddonLifecycle _addonLifecycle;
     private readonly IChatGui _chatGui;
     private readonly IToastGui _toastGui;
     private readonly HashSet<string> _charaCardErrorToastTexts;
     private readonly Action<string>? _warningSink;
     private readonly Action<string>? _debugSink;
-    private readonly IAddonLifecycle.AddonEventDelegate _addonEventHandler;
     private readonly IChatGui.OnLogMessageDelegate _logMessageHandler;
     private readonly IToastGui.OnErrorToastDelegate _errorToastHandler;
-    private readonly List<AddonEvent> _registeredAddonEvents = [];
     private Func<string, bool>? _selectOkHandler;
     private bool _disposed;
 
     internal DalamudSelectOkDialogSuppressionRuntime(
-        IAddonLifecycle addonLifecycle,
         IChatGui chatGui,
         IToastGui toastGui,
         IDataManager? dataManager = null,
         Action<string>? warningSink = null,
         Action<string>? debugSink = null
     ) : this(
-        addonLifecycle,
         chatGui,
         toastGui,
         LoadCharaCardErrorToastTexts(dataManager, warningSink),
@@ -67,20 +60,17 @@ internal sealed class DalamudSelectOkDialogSuppressionRuntime : ISelectOkDialogS
     }
 
     internal DalamudSelectOkDialogSuppressionRuntime(
-        IAddonLifecycle addonLifecycle,
         IChatGui chatGui,
         IToastGui toastGui,
         IEnumerable<string>? charaCardErrorToastTexts,
         Action<string>? warningSink = null,
         Action<string>? debugSink = null
     ) {
-        _addonLifecycle = addonLifecycle ?? throw new ArgumentNullException(nameof(addonLifecycle));
         _chatGui = chatGui ?? throw new ArgumentNullException(nameof(chatGui));
         _toastGui = toastGui ?? throw new ArgumentNullException(nameof(toastGui));
         _charaCardErrorToastTexts = NormalizeErrorToastTexts(charaCardErrorToastTexts);
         _warningSink = warningSink;
         _debugSink = debugSink;
-        _addonEventHandler = OnSelectOkAddonEvent;
         _logMessageHandler = OnLogMessage;
         _errorToastHandler = OnErrorToast;
     }
@@ -89,14 +79,9 @@ internal sealed class DalamudSelectOkDialogSuppressionRuntime : ISelectOkDialogS
         ObjectDisposedException.ThrowIf(_disposed, this);
         _selectOkHandler = selectOkHandler ?? throw new ArgumentNullException(nameof(selectOkHandler));
 
-        foreach (var eventType in CharaCardResolver.SelectOkSuppressionEvents) {
-            _addonLifecycle.RegisterListener(eventType, CharaCardResolver.SelectOkAddonNames, _addonEventHandler);
-            _registeredAddonEvents.Add(eventType);
-        }
-
         _chatGui.LogMessage += _logMessageHandler;
         _toastGui.ErrorToast += _errorToastHandler;
-        _debugSink?.Invoke("CharaCardResolver: SelectOk addon/chat/error-toast suppression runtime initialized.");
+        _debugSink?.Invoke("CharaCardResolver: chat/error-toast suppression runtime initialized.");
     }
 
     public void Dispose() {
@@ -107,23 +92,6 @@ internal sealed class DalamudSelectOkDialogSuppressionRuntime : ISelectOkDialogS
         _disposed = true;
         _chatGui.LogMessage -= _logMessageHandler;
         _toastGui.ErrorToast -= _errorToastHandler;
-
-        foreach (var eventType in _registeredAddonEvents) {
-            _addonLifecycle.UnregisterListener(eventType, CharaCardResolver.SelectOkAddonNames, _addonEventHandler);
-        }
-
-        _registeredAddonEvents.Clear();
-    }
-
-    private void OnSelectOkAddonEvent(AddonEvent type, AddonArgs args) {
-        try {
-            var addonName = string.IsNullOrWhiteSpace(args.AddonName) ? "SelectOk" : args.AddonName;
-            if (_selectOkHandler?.Invoke($"{addonName}.{type}") == true) {
-                args.PreventOriginal();
-            }
-        } catch (Exception exception) {
-            _warningSink?.Invoke($"CharaCardResolver: failed to process SelectOk addon suppression event. {exception.Message}");
-        }
     }
 
     private void OnLogMessage(ILogMessage message) {
@@ -193,9 +161,6 @@ internal sealed class DalamudSelectOkDialogSuppressionRuntime : ISelectOkDialogS
 }
 
 internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolverRuntime {
-    private const int CharaCardPacketNameOffset = 0x1A9;
-    private const int CharaCardPacketNameLength = 32;
-
     // CharaCard packet handling is exposed by the generated FFXIVClientStructs interop.
     private const string CharaCardUpdateResponseDispatcherSignature =
         "48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 EC 20 41 8B F1 41 8B F8 8B DA";
@@ -633,16 +598,8 @@ internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolve
             return string.Empty;
         }
 
-        // API15 client code reads the CharaCard packet name at 0x1A9. The current generated
-        // FFXIVClientStructs field is four bytes early, so packet->NameString is empty.
-        var remainingBytes = sizeof(CharaCardPacket) - CharaCardPacketNameOffset;
-        if (remainingBytes <= 0) {
-            return string.Empty;
-        }
-
-        var boundedLength = Math.Min(CharaCardPacketNameLength, remainingBytes);
-        var bytes = new ReadOnlySpan<byte>((byte*)packet + CharaCardPacketNameOffset, boundedLength);
-        return DecodeNullTerminatedUtf8(bytes);
+        // FFXIVClientStructs exposes the 32-byte UTF-8 name buffer directly on CharaCardPacket.
+        return DecodeNullTerminatedUtf8(packet->Name);
     }
 
     private static bool IsValidPointer(void* pointer) {

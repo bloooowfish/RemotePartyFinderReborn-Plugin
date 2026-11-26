@@ -39,7 +39,7 @@ internal sealed class ProtectedEndpointCapabilities
 [JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
 internal sealed class ListingDetailCapability
 {
-    public uint ListingId { get; set; }
+    public ulong ListingId { get; set; }
     public string Token { get; set; } = string.Empty;
     public long ExpiresAt { get; set; }
 }

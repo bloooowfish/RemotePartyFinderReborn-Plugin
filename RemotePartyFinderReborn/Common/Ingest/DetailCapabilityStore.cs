@@ -9,7 +9,7 @@ internal sealed class DetailCapabilityStore
     private sealed record CachedCapability(string Token, DateTimeOffset ExpiresAtUtc);
 
     private readonly object _lock = new();
-    private readonly Dictionary<uint, CachedCapability> _capabilities = new();
+    private readonly Dictionary<ulong, CachedCapability> _capabilities = new();
     private bool _requiresCapabilities;
 
     internal void ApplyDetailCapabilities(
@@ -45,7 +45,7 @@ internal sealed class DetailCapabilityStore
         }
     }
 
-    internal bool ShouldDeferDetailRequest(uint listingId, DateTimeOffset? now = null)
+    internal bool ShouldDeferDetailRequest(ulong listingId, DateTimeOffset? now = null)
     {
         var observedNow = now ?? DateTimeOffset.UtcNow;
         lock (_lock)
@@ -56,7 +56,7 @@ internal sealed class DetailCapabilityStore
     }
 
     internal bool TryGetDetailCapability(
-        uint listingId,
+        ulong listingId,
         out string token,
         DateTimeOffset? now = null)
     {
@@ -75,7 +75,7 @@ internal sealed class DetailCapabilityStore
         return false;
     }
 
-    internal void InvalidateDetailCapability(uint listingId)
+    internal void InvalidateDetailCapability(ulong listingId)
     {
         lock (_lock)
         {

@@ -2,8 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Net.Http;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using Xunit;
 
 namespace RemotePartyFinderReborn.Tests;
@@ -429,6 +433,282 @@ public sealed class PartyDetailCollectorCaptureTests {
         Assert.Same(state, collector.CaptureState);
     }
 
+    [Fact]
+    public void DalamudPartyDetailCaptureHookFactory_uses_expected_ffxiv_client_structs_delegate_signatures_and_rejects_zero_addresses() {
+        var ffxivAsm = Assembly.Load("FFXIVClientStructs");
+        var openListingDelegate = ffxivAsm.GetType("FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentLookingForGroup+Delegates+OpenListing");
+        var openListingByContentIdDelegate = ffxivAsm.GetType("FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentLookingForGroup+Delegates+OpenListingByContentId");
+        var populateDelegate = ffxivAsm.GetType("FFXIVClientStructs.FFXIV.Client.UI.Agent.AgentLookingForGroup+Delegates+PopulateListingData");
+        var openAddonDelegate = ffxivAsm.GetType("FFXIVClientStructs.FFXIV.Client.UI.RaptureAtkModule+Delegates+OpenAddon");
+
+        Assert.NotNull(openListingDelegate);
+        Assert.NotNull(openListingByContentIdDelegate);
+        Assert.NotNull(populateDelegate);
+        Assert.NotNull(openAddonDelegate);
+        Assert.Equal(typeof(bool), openListingDelegate.GetMethod("Invoke")?.ReturnType);
+        Assert.Equal(typeof(bool), openListingByContentIdDelegate.GetMethod("Invoke")?.ReturnType);
+        Assert.Equal(typeof(void), populateDelegate.GetMethod("Invoke")?.ReturnType);
+        Assert.Equal(typeof(ushort), openAddonDelegate.GetMethod("Invoke")?.ReturnType);
+
+        var openAddonParams = openAddonDelegate.GetMethod("Invoke")!.GetParameters();
+        Assert.Equal(8, openAddonParams.Length);
+        Assert.Equal(typeof(uint), openAddonParams[1].ParameterType);
+        Assert.Equal(typeof(uint), openAddonParams[2].ParameterType);
+        Assert.Equal(typeof(ulong), openAddonParams[5].ParameterType);
+        Assert.Equal(typeof(ushort), openAddonParams[6].ParameterType);
+        Assert.Equal(typeof(int), openAddonParams[7].ParameterType);
+
+        var dalamudAsm = Assembly.Load("Dalamud");
+        var interopProviderType = dalamudAsm.GetType("Dalamud.Plugin.Services.IGameInteropProvider");
+        Assert.NotNull(interopProviderType);
+
+        var createMethod = typeof(DispatchProxy).GetMethod(
+            "Create",
+            BindingFlags.Public | BindingFlags.Static,
+            null,
+            [typeof(Type), typeof(Type)],
+            null
+        );
+        Assert.NotNull(createMethod);
+        var proxyInteropProvider = createMethod.Invoke(null, [interopProviderType, typeof(NoOpInteropProxy)])!;
+        var factoryCtor = typeof(PartyDetailCaptureRuntime.DalamudPartyDetailCaptureHookFactory).GetConstructor(
+            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public,
+            null,
+            [interopProviderType],
+            null
+        );
+        Assert.NotNull(factoryCtor);
+        var factory = (PartyDetailCaptureRuntime.DalamudPartyDetailCaptureHookFactory)factoryCtor.Invoke([proxyInteropProvider]);
+
+        var zeroPopulateEx = Assert.Throws<InvalidOperationException>(() =>
+            factory.CreateHooksFromAddresses(
+                0x1000,
+                0x2000,
+                0,
+                0x4000,
+                static (_, _) => true,
+                static (_, _) => true,
+                static (_, _) => { },
+                static (_, _, _, _, _, _, _, _) => true
+            ));
+        Assert.Contains("PopulateListingData", zeroPopulateEx.Message);
+
+        var warnings = new List<string>();
+        using var runtime = PartyDetailCaptureRuntime.CreateForTesting(
+            new PartyDetailCaptureState(),
+            factory,
+            warnings.Add
+        );
+        var warning = Assert.Single(warnings);
+        Assert.Contains("failed to initialize hooks", warning);
+        Assert.False(runtime.IsManualCaptureReady);
+        Assert.False(runtime.IsScannerCaptureReady);
+    }
+
+    [Fact]
+    public void Decoupled_hooks_keep_manual_capture_active_when_optional_scanner_hooks_fail() {
+        var state = new PartyDetailCaptureState();
+        var partialFactory = new CapturingFullHookFactory(
+            hasOpenListingHook: false,
+            hasOpenListingByContentIdHook: true,
+            hasOpenAddonHook: true
+        );
+        using var runtime = PartyDetailCaptureRuntime.CreateForTesting(
+            state,
+            partialFactory,
+            warningSink: null,
+            scannerHeadlessBackendKind: ScannerHeadlessBackendKind.NativeSuppression
+        );
+
+        Assert.True(runtime.IsManualCaptureReady);
+        Assert.False(runtime.IsScannerCaptureReady);
+
+        // Even with an armed scanner attempt, OpenAddon suppression stays disabled when IsScannerCaptureReady is false.
+        var attemptId = Guid.NewGuid();
+        runtime.ArmScannerRequest(attemptId, 9001UL, 44UL, allowHeadless: true);
+        runtime.BeginScannerOpenAttempt(attemptId);
+        runtime.TestInterceptOpenListing(9001UL, 44UL);
+        runtime.EndScannerOpenAttempt(attemptId);
+
+        Assert.True(partialFactory.PfDetailOpenDetour(0, PartyDetailCaptureRuntime.DefaultPfDetailAddonId, 0, 0, 0, 0, 0, 0));
+
+        // Manual capture via PopulateListingData still triggers population signal and captures snapshot.
+        runtime.TestBeginManualRequestCycle(9001UL, 44UL);
+        partialFactory.RaisePopulateListingData(0, 0);
+        runtime.TestFrameworkTick(CreateCompleteSnapshot());
+
+        Assert.True(state.TryGetNextUnconsumedArrival(out var arrival));
+        Assert.Equal(9001UL, arrival.Payload.ListingId);
+    }
+
+    [Fact]
+    public void Dynamic_pf_detail_addon_id_falls_back_to_275_when_unavailable_then_caches_resolved_id() {
+        var state = new PartyDetailCaptureState();
+        var hookFactory = new CapturingFullHookFactory();
+        uint? resolvedId = null;
+        var resolverCalls = 0;
+        using var runtime = PartyDetailCaptureRuntime.CreateForTesting(
+            state,
+            hookFactory,
+            warningSink: null,
+            scannerHeadlessBackendKind: ScannerHeadlessBackendKind.NativeSuppression,
+            pfDetailAddonIdResolver: () => {
+                resolverCalls++;
+                return resolvedId;
+            }
+        );
+
+        Assert.True(runtime.IsScannerCaptureReady);
+        Assert.Equal(275U, runtime.ResolvePfDetailAddonId());
+        Assert.Equal(1, resolverCalls);
+
+        // Once AddonNames becomes available, the resolved addon ID is cached.
+        resolvedId = 281U;
+        Assert.Equal(281U, runtime.ResolvePfDetailAddonId());
+        Assert.Equal(281U, runtime.ResolvePfDetailAddonId());
+        Assert.Equal(2, resolverCalls);
+
+        // Scanner suppression now targets the resolved addon ID (281U), not stale 275U.
+        var attemptId = Guid.NewGuid();
+        runtime.ArmScannerRequest(attemptId, 9001UL, 44UL, allowHeadless: true);
+        runtime.BeginScannerOpenAttempt(attemptId);
+        Assert.True(hookFactory.RaiseOpenListing(0, 9001UL));
+        runtime.EndScannerOpenAttempt(attemptId);
+
+        Assert.True(hookFactory.PfDetailOpenDetour(0, 275U, 0, 0, 0, 0, 0, 0));
+        Assert.False(hookFactory.PfDetailOpenDetour(0, 281U, 0, 0, 0, 0, 0, 0));
+    }
+
+    [Fact]
+    public unsafe void PartyDetailSnapshotBuilder_respects_4_man_total_slots_and_prefers_viewed_listing_leader_name() {
+        Assert.Equal(4, PartyDetailSnapshotBuilder.ComputeSlotCount(totalSlots: 4, numberOfParties: 1));
+        Assert.Equal(8, PartyDetailSnapshotBuilder.ComputeSlotCount(totalSlots: 0, numberOfParties: 1));
+        Assert.Equal(24, PartyDetailSnapshotBuilder.ComputeSlotCount(totalSlots: 24, numberOfParties: 3));
+        Assert.Equal(48, PartyDetailSnapshotBuilder.ComputeSlotCount(totalSlots: 64, numberOfParties: 6));
+
+        var agent = (AgentLookingForGroup*)NativeMemory.AllocZeroed((nuint)sizeof(AgentLookingForGroup));
+        try {
+            agent->LastViewedListing.ListingId = 5_000_000_001UL;
+            agent->LastViewedListing.LeaderContentId = 101UL;
+            agent->LastViewedListing.HomeWorld = 74;
+            agent->LastViewedListing.World = 74;
+            agent->LastViewedListing.TotalSlots = 4;
+            agent->LastViewedListing.NumberOfParties = 1;
+            for (var i = 0; i < 8; i++) {
+                agent->LastViewedListing.MemberContentIds[i] = 101UL + (ulong)i;
+                agent->LastViewedListing.Jobs[i] = (byte)(19 + i);
+            }
+
+            Encoding.UTF8.GetBytes("Viewed Leader").CopyTo(agent->LastViewedListing.Leader);
+
+            Assert.True(PartyDetailSnapshotBuilder.TryBuildFromAgent(agent, out var snapshot, out var debugSnapshot));
+            Assert.Equal(5_000_000_001UL, snapshot.ListingId);
+            Assert.Equal(4, snapshot.MemberContentIds.Count);
+            Assert.Equal(4, snapshot.MemberJobs.Count);
+            Assert.Equal(4, snapshot.SlotFlags.Count);
+            Assert.Equal("Viewed Leader", snapshot.LeaderName);
+            Assert.Equal("Viewed Leader", debugSnapshot!.LeaderName);
+
+            // When viewedListing.Leader is empty, fall back to LastLeader.
+            agent->LastViewedListing.Leader.Clear();
+            var fallbackBytes = Encoding.UTF8.GetBytes("Fallback Leader\0");
+            var fallbackBuf = (byte*)NativeMemory.AllocZeroed((nuint)fallbackBytes.Length);
+            try {
+                Marshal.Copy(fallbackBytes, 0, (nint)fallbackBuf, fallbackBytes.Length);
+                agent->LastLeader.StringPtr = fallbackBuf;
+                agent->LastLeader.BufSize = fallbackBytes.Length;
+                agent->LastLeader.BufUsed = fallbackBytes.Length;
+                agent->LastLeader.StringLength = fallbackBytes.Length - 1;
+
+                Assert.True(PartyDetailSnapshotBuilder.TryBuildFromAgent(agent, out var fallbackSnapshot, out var fallbackDebug));
+                Assert.Equal("Fallback Leader", fallbackSnapshot.LeaderName);
+                Assert.Equal("Fallback Leader", fallbackDebug!.LeaderName);
+            } finally {
+                NativeMemory.Free(fallbackBuf);
+            }
+        } finally {
+            NativeMemory.Free(agent);
+        }
+    }
+
+    [Fact]
+    public void OpenAddon_wrapper_returns_zero_ushort_when_suppressed_and_original_ushort_when_allowed() {
+        var state = new PartyDetailCaptureState();
+        var hookFactory = new CapturingFullHookFactory();
+        using var runtime = PartyDetailCaptureRuntime.CreateForTesting(
+            state,
+            hookFactory,
+            warningSink: null,
+            scannerHeadlessBackendKind: ScannerHeadlessBackendKind.NativeSuppression
+        );
+
+        var attemptId = Guid.NewGuid();
+        runtime.ArmScannerRequest(attemptId, 9001UL, 44UL, allowHeadless: true);
+        runtime.BeginScannerOpenAttempt(attemptId);
+        Assert.True(hookFactory.RaiseOpenListing(0, 9001UL));
+        runtime.EndScannerOpenAttempt(attemptId);
+
+        var originalCalls = 0;
+        var suppressedResult = PartyDetailCaptureRuntime.DalamudPartyDetailCaptureHookFactory.InvokeOpenAddonDetour(
+            hookFactory.PfDetailOpenDetour,
+            () => {
+                originalCalls++;
+                return (ushort)77;
+            },
+            0,
+            275U,
+            0,
+            0,
+            0,
+            0,
+            0,
+            4
+        );
+
+        Assert.Equal((ushort)0, suppressedResult);
+        Assert.Equal(0, originalCalls);
+
+        runtime.CompleteScannerRequest(attemptId, PartyDetailScannerAttemptOutcome.Succeeded);
+
+        var allowedResult = PartyDetailCaptureRuntime.DalamudPartyDetailCaptureHookFactory.InvokeOpenAddonDetour(
+            hookFactory.PfDetailOpenDetour,
+            () => {
+                originalCalls++;
+                return (ushort)77;
+            },
+            0,
+            275U,
+            0,
+            0,
+            0,
+            0,
+            0,
+            4
+        );
+
+        Assert.Equal((ushort)77, allowedResult);
+        Assert.Equal(1, originalCalls);
+    }
+
+    [Fact]
+    public void OpenListing_and_OpenListingByContentId_hook_detours_begin_capture_cycles() {
+        var state = new PartyDetailCaptureState();
+        var hookFactory = new CapturingFullHookFactory();
+        using var runtime = PartyDetailCaptureRuntime.CreateForTesting(state, hookFactory);
+
+        Assert.True(hookFactory.RaiseOpenListing(0, 9001UL));
+        Assert.True(state.TryGetCurrentRequestCycle(out var firstCycle));
+        Assert.Equal(PartyDetailRequestOwner.Manual, firstCycle.Owner);
+        Assert.Equal(9001UL, firstCycle.ListingId);
+        Assert.Equal(0UL, firstCycle.ContentId);
+
+        Assert.True(hookFactory.RaiseOpenListingByContentId(0, 44UL));
+        Assert.True(state.TryGetCurrentRequestCycle(out var secondCycle));
+        Assert.Equal(PartyDetailRequestOwner.Manual, secondCycle.Owner);
+        Assert.Equal(0UL, secondCycle.ListingId);
+        Assert.Equal(44UL, secondCycle.ContentId);
+    }
+
     private static UploadablePartyDetail CreateCompleteSnapshot() {
         return new UploadablePartyDetail {
             ListingId = 9001U,
@@ -754,6 +1034,73 @@ public sealed class PartyDetailCollectorCaptureTests {
 
         public void Dispose() {
         }
+    }
+
+    private sealed class CapturingFullHookFactory(
+        bool hasPopulateHook = true,
+        bool hasOpenListingHook = true,
+        bool hasOpenListingByContentIdHook = true,
+        bool hasOpenAddonHook = true
+    ) : IPartyDetailCaptureHookFactory, IDisposable {
+        private Func<nint, ulong, bool>? _openListingDetour;
+        private Func<nint, ulong, bool>? _openListingByContentIdDetour;
+        private Action<nint, nint>? _populateListingDataDetour;
+        private Func<nint, uint, nint, nint, nint, nint, ushort, int, bool>? _pfDetailOpenDetour;
+
+        internal Func<nint, uint, nint, nint, nint, nint, ushort, int, bool> PfDetailOpenDetour =>
+            _pfDetailOpenDetour ?? throw new InvalidOperationException("Hooks not initialized.");
+
+        public IDisposable CreateHooks(
+            Func<nint, ulong, bool> openListingDetour,
+            Func<nint, ulong, bool> openListingByContentIdDetour,
+            Action<nint, nint> populateListingDataDetour,
+            Func<nint, uint, nint, nint, nint, nint, ushort, int, bool> pfDetailOpenDetour
+        ) {
+            _openListingDetour = openListingDetour;
+            _openListingByContentIdDetour = openListingByContentIdDetour;
+            _populateListingDataDetour = populateListingDataDetour;
+            _pfDetailOpenDetour = pfDetailOpenDetour;
+            return this;
+        }
+
+        public PartyDetailCaptureHookRegistration CreateHooksWithStatus(
+            Func<nint, ulong, bool> openListingDetour,
+            Func<nint, ulong, bool> openListingByContentIdDetour,
+            Action<nint, nint> populateListingDataDetour,
+            Func<nint, uint, nint, nint, nint, nint, ushort, int, bool> pfDetailOpenDetour,
+            Action<string>? warningSink = null
+        ) {
+            return new PartyDetailCaptureHookRegistration(
+                CreateHooks(openListingDetour, openListingByContentIdDetour, populateListingDataDetour, pfDetailOpenDetour),
+                HasPopulateHook: hasPopulateHook,
+                HasOpenListingHook: hasOpenListingHook,
+                HasOpenListingByContentIdHook: hasOpenListingByContentIdHook,
+                HasOpenAddonHook: hasOpenAddonHook
+            );
+        }
+
+        internal bool RaiseOpenListing(nint agent, ulong listingId) {
+            ArgumentNullException.ThrowIfNull(_openListingDetour);
+            return _openListingDetour(agent, listingId);
+        }
+
+        internal bool RaiseOpenListingByContentId(nint agent, ulong contentId) {
+            ArgumentNullException.ThrowIfNull(_openListingByContentIdDetour);
+            return _openListingByContentIdDetour(agent, contentId);
+        }
+
+        internal void RaisePopulateListingData(nint agent, nint listingData) {
+            ArgumentNullException.ThrowIfNull(_populateListingDataDetour);
+            _populateListingDataDetour(agent, listingData);
+        }
+
+        public void Dispose() {
+        }
+    }
+
+    public class NoOpInteropProxy : DispatchProxy {
+        protected override object? Invoke(MethodInfo? targetMethod, object?[]? args) =>
+            throw new NotSupportedException(targetMethod?.Name);
     }
 
     private sealed class StubHttpMessageHandler : HttpMessageHandler {

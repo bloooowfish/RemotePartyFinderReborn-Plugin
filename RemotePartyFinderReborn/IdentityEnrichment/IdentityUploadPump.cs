@@ -127,10 +127,20 @@ internal sealed class IdentityUploadPump {
         }
     }
 
-    internal void WaitForActiveWorker(TimeSpan timeout) {
-        Task activeTask;
+    internal Task GetActiveWorkerTask() {
         lock (_sync) {
-            activeTask = _activeWorkerTask;
+            return _activeWorkerTask;
+        }
+    }
+
+    internal void WaitForActiveWorker(TimeSpan timeout) {
+        if (timeout <= TimeSpan.Zero) {
+            return;
+        }
+
+        var activeTask = GetActiveWorkerTask();
+        if (activeTask.IsCompleted) {
+            return;
         }
 
         try {

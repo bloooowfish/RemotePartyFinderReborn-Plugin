@@ -177,6 +177,77 @@ internal sealed class TomestoneLeaseAbandoner
             debugLog);
     }
 
+    public async Task AbandonUnprocessedLeasesAsync(
+        Configuration configuration,
+        TomestoneLeaseSession leaseSession,
+        IEnumerable<TomestoneJob> leasedJobs,
+        IEnumerable<TomestoneResult> processedResults,
+        string reason,
+        string failureCode,
+        CancellationToken cancellationToken,
+        Action<string> warningLog,
+        Action<string> debugLog,
+        IEnumerable<AbandonTomestoneLease> alreadyAbandonedLeases = null)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentNullException.ThrowIfNull(leaseSession);
+        ArgumentNullException.ThrowIfNull(leasedJobs);
+        ArgumentNullException.ThrowIfNull(processedResults);
+        ArgumentNullException.ThrowIfNull(reason);
+        ArgumentNullException.ThrowIfNull(warningLog);
+        ArgumentNullException.ThrowIfNull(debugLog);
+
+        var excludedKeys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var result in processedResults)
+        {
+            if (result != null)
+            {
+                excludedKeys.Add($"{result.ContentId}:{result.ZoneId}:{result.DifficultyId}:{result.EncounterId}");
+            }
+        }
+
+        if (alreadyAbandonedLeases is not null)
+        {
+            foreach (var abandoned in alreadyAbandonedLeases)
+            {
+                if (abandoned != null)
+                {
+                    excludedKeys.Add($"{abandoned.ContentId}:{abandoned.ZoneId}:{abandoned.DifficultyId}:{abandoned.EncounterId}");
+                }
+            }
+        }
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var batch = new List<AbandonTomestoneLease>();
+        foreach (var job in leasedJobs)
+        {
+            if (job == null || string.IsNullOrWhiteSpace(job.LeaseToken))
+            {
+                continue;
+            }
+
+            var key = $"{job.ContentId}:{job.ZoneId}:{job.DifficultyId}:{job.EncounterId}";
+            if (excludedKeys.Contains(key) || !seen.Add(key))
+            {
+                continue;
+            }
+
+            batch.Add(CreateJobAbandonment(
+                job,
+                reason,
+                failureCode,
+                $"Abandoning unprocessed Tomestone lease: {reason}."));
+        }
+
+        await SendAbandonBatchAsync(
+            configuration,
+            leaseSession.UploadUrl,
+            batch,
+            cancellationToken,
+            warningLog,
+            debugLog).ConfigureAwait(false);
+    }
+
     internal static AbandonTomestoneLease CreateJobAbandonment(
         TomestoneJob job,
         string reason,

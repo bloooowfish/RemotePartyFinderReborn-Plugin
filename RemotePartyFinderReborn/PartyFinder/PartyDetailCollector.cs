@@ -34,25 +34,25 @@ internal sealed class PartyDetailCollector : IDisposable {
     private int _shutdownSignaled;
     private int _disposed;
 
-    private uint _lastQueuedListingId;
+    private long _lastQueuedListingId;
     private long _lastQueuedAckVersion;
 
-    private volatile uint _lastSuccessfulUploadListingId;
+    private long _lastSuccessfulUploadListingId;
     private long _lastSuccessfulUploadAtUtcTicks;
     private long _lastSuccessfulUploadAckVersion;
 
-    private volatile uint _lastTerminalUploadListingId;
+    private long _lastTerminalUploadListingId;
     private long _lastTerminalUploadAtUtcTicks;
     private long _lastTerminalUploadAckVersion;
 
     private int _activeUploadWorkers;
 
-    internal uint LastUploadedListingId => _lastQueuedListingId;
+    internal ulong LastUploadedListingId => unchecked((ulong)Interlocked.Read(ref _lastQueuedListingId));
     internal long LastQueuedAckVersion => Interlocked.Read(ref _lastQueuedAckVersion);
-    internal uint LastSuccessfulUploadListingId => _lastSuccessfulUploadListingId;
+    internal ulong LastSuccessfulUploadListingId => unchecked((ulong)Interlocked.Read(ref _lastSuccessfulUploadListingId));
     internal DateTime LastSuccessfulUploadAtUtc => new(Interlocked.Read(ref _lastSuccessfulUploadAtUtcTicks), DateTimeKind.Utc);
     internal long LastSuccessfulUploadAckVersion => Interlocked.Read(ref _lastSuccessfulUploadAckVersion);
-    internal uint LastTerminalUploadListingId => _lastTerminalUploadListingId;
+    internal ulong LastTerminalUploadListingId => unchecked((ulong)Interlocked.Read(ref _lastTerminalUploadListingId));
     internal DateTime LastTerminalUploadAtUtc => new(Interlocked.Read(ref _lastTerminalUploadAtUtcTicks), DateTimeKind.Utc);
     internal long LastTerminalUploadAckVersion => Interlocked.Read(ref _lastTerminalUploadAckVersion);
     internal int PendingQueueCount => _pendingDetailQueue.Count;
@@ -132,7 +132,22 @@ internal sealed class PartyDetailCollector : IDisposable {
         }
     }
 
+    internal void CollectShutdownTasks(List<Task> tasks) {
+        ArgumentNullException.ThrowIfNull(tasks);
+        lock (_activeTasksLock) {
+            foreach (var task in _activeUploadTasks) {
+                if (!task.IsCompleted) {
+                    tasks.Add(task);
+                }
+            }
+        }
+    }
+
     public void Dispose() {
+        Dispose(ShutdownWaitTimeout);
+    }
+
+    internal void Dispose(TimeSpan waitTimeout) {
         if (_plugin is not null) {
             DetachFrameworkUpdateHandler(_plugin);
         }
@@ -147,9 +162,9 @@ internal sealed class PartyDetailCollector : IDisposable {
             activeTasks = _activeUploadTasks.ToArray();
         }
 
-        if (activeTasks.Length > 0) {
+        if (activeTasks.Length > 0 && waitTimeout > TimeSpan.Zero) {
             try {
-                Task.WhenAll(activeTasks).Wait(ShutdownWaitTimeout);
+                Task.WhenAll(activeTasks).Wait(waitTimeout);
             } catch (Exception) {
             }
         }
@@ -208,7 +223,7 @@ internal sealed class PartyDetailCollector : IDisposable {
             PartyDetailContentIdEnrichment.TryEnqueueForResolve(payload, _plugin.CharaCardResolver.EnqueueMany, LogWarning);
         }
 
-        _lastQueuedListingId = payload.ListingId;
+        Interlocked.Exchange(ref _lastQueuedListingId, unchecked((long)payload.ListingId));
         Interlocked.Increment(ref _lastQueuedAckVersion);
         return true;
     }
@@ -389,17 +404,17 @@ internal sealed class PartyDetailCollector : IDisposable {
         }
     }
 
-    private void RecordSuccessfulUpload(uint listingId) {
+    private void RecordSuccessfulUpload(ulong listingId) {
         var successAt = _utcNow();
         Interlocked.Exchange(ref _lastSuccessfulUploadAtUtcTicks, successAt.Ticks);
-        _lastSuccessfulUploadListingId = listingId;
+        Interlocked.Exchange(ref _lastSuccessfulUploadListingId, unchecked((long)listingId));
         Interlocked.Increment(ref _lastSuccessfulUploadAckVersion);
     }
 
-    private void RecordTerminalUpload(uint listingId) {
+    private void RecordTerminalUpload(ulong listingId) {
         var terminalAt = _utcNow();
         Interlocked.Exchange(ref _lastTerminalUploadAtUtcTicks, terminalAt.Ticks);
-        _lastTerminalUploadListingId = listingId;
+        Interlocked.Exchange(ref _lastTerminalUploadListingId, unchecked((long)listingId));
         Interlocked.Increment(ref _lastTerminalUploadAckVersion);
     }
 
@@ -695,7 +710,7 @@ internal sealed class PartyDetailCollector : IDisposable {
         );
     }
 
-    internal PendingDetailDebugState? GetPendingDetailForTesting(uint listingId) {
+    internal PendingDetailDebugState? GetPendingDetailForTesting(ulong listingId) {
         if (!_pendingDetailQueue.TryGet(listingId, out var pending)) {
             return null;
         }

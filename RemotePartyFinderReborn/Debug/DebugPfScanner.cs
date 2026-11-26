@@ -188,7 +188,7 @@ internal sealed class DebugPfScanner : IDisposable {
     private readonly Func<DebugPfListingCandidate, bool> _openListingInGame;
     private readonly Action _triggerGathererImmediateUpload;
     private readonly Func<bool> _hasGathererPendingUploadWork;
-    private readonly Func<uint, DateTime, bool> _wasListingUploadedAfter;
+    private readonly Func<ulong, DateTime, bool> _wasListingUploadedAfter;
     private readonly Action<string> _debugLog;
 
     private readonly CollectedListingBuffer _collectedBuffer = new();
@@ -240,7 +240,7 @@ internal sealed class DebugPfScanner : IDisposable {
         Func<DebugPfListingCandidate, bool> openListingInGame,
         Action triggerGathererImmediateUpload = null,
         Func<bool> hasGathererPendingUploadWork = null,
-        Func<uint, DateTime, bool> wasListingUploadedAfter = null,
+        Func<ulong, DateTime, bool> wasListingUploadedAfter = null,
         Action<string> debugLog = null
     ) {
         _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
@@ -676,9 +676,7 @@ internal sealed class DebugPfScanner : IDisposable {
         }
 
         ref var detailed = ref agent->LastViewedListing;
-        var effectiveParties = Math.Max(1, (int)detailed.NumberOfParties);
-        var declaredSlots = Math.Max((int)detailed.TotalSlots, effectiveParties * 8);
-        var totalSlots = Math.Clamp(declaredSlots, 0, 48);
+        var totalSlots = PartyDetailSnapshotBuilder.ComputeSlotCount(detailed.TotalSlots, detailed.NumberOfParties);
         var nonZeroMembers = 0;
 
         for (var i = 0; i < totalSlots; i++) {

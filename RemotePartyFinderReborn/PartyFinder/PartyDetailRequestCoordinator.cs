@@ -166,10 +166,14 @@ internal sealed class PartyDetailRequestCoordinator {
         }
     }
 
-    internal bool ShouldSuppressScannerPfDetailOpen(PartyDetailCaptureState state, uint addonId) {
+    internal bool ShouldSuppressScannerPfDetailOpen(
+        PartyDetailCaptureState state,
+        uint addonId,
+        uint expectedAddonId = PfDetailAddonId
+    ) {
         ArgumentNullException.ThrowIfNull(state);
 
-        if (_scannerHeadlessBackendKind != ScannerHeadlessBackendKind.NativeSuppression || addonId != PfDetailAddonId) {
+        if (_scannerHeadlessBackendKind != ScannerHeadlessBackendKind.NativeSuppression || addonId != expectedAddonId) {
             return false;
         }
 

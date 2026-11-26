@@ -31,7 +31,7 @@ internal readonly record struct PartyDetailDebugMember(
 internal sealed class PartyDetailDebugSnapshot {
     public DateTime CapturedAtUtc { get; init; }
     public ulong RawListingId { get; init; }
-    public uint UploadListingId { get; init; }
+    public ulong UploadListingId { get; init; }
     public ulong LeaderAccountId { get; init; }
     public ulong LeaderContentId { get; init; }
     public string LeaderName { get; init; } = string.Empty;

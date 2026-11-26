@@ -118,4 +118,45 @@ public sealed class FFLogsWorkerRegionProviderTests
         var warning = Assert.Single(warnings);
         Assert.Contains("current world id 999 is not mapped", warning, StringComparison.Ordinal);
     }
+
+    [Theory]
+    [InlineData(1u, "JP")]
+    [InlineData(2u, "NA")]
+    [InlineData(3u, "EU")]
+    [InlineData(4u, "OC")]
+    public void Data_center_region_id_maps_to_fflogs_worker_region(uint regionId, string expected)
+    {
+        Assert.True(FFLogsWorkerRegionResolver.TryMapDataCenterRegionId(regionId, out var region));
+        Assert.Equal(expected, region);
+    }
+
+    [Theory]
+    [InlineData(0u)]
+    [InlineData(5u)]
+    public void Unknown_data_center_region_id_does_not_map(uint regionId)
+    {
+        Assert.False(FFLogsWorkerRegionResolver.TryMapDataCenterRegionId(regionId, out var region));
+        Assert.Null(region);
+    }
+
+    [Fact]
+    public void Cached_provider_uses_fallback_resolver_for_new_unmapped_world_id()
+    {
+        var warnings = new List<string>();
+        var provider = new CachedFFLogsWorkerRegionProvider(
+            warnings.Add,
+            fallbackRegionResolver: worldId => worldId == 999 ? "NA" : null);
+
+        provider.UpdateCurrentWorld(999);
+
+        Assert.True(provider.TryGetWorkerRegion(out var region));
+        Assert.Equal("NA", region);
+        Assert.Empty(warnings);
+
+        provider.UpdateCurrentWorld(998);
+
+        Assert.False(provider.TryGetWorkerRegion(out _));
+        var warning = Assert.Single(warnings);
+        Assert.Contains("current world id 998 is not mapped", warning, StringComparison.Ordinal);
+    }
 }

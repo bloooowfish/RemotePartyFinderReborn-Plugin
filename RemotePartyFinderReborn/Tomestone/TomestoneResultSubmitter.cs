@@ -108,15 +108,24 @@ internal sealed class TomestoneResultSubmitter
             }
 
             var jsonContent = JsonConvert.SerializeObject(chunk);
-            var result = await _protectedExecutor.ExecuteAsync(
-                configuration,
-                leaseSession.UploadUrl,
-                IngestRoutes.TomestoneResults,
-                ProtectedEndpointCapabilityKind.TomestoneResults,
-                HttpMethod.Post,
-                jsonContent,
-                recordUploadAttempt: false,
-                cancellationToken).ConfigureAwait(false);
+            ProtectedIngestResult result;
+            try
+            {
+                result = await _protectedExecutor.ExecuteAsync(
+                    configuration,
+                    leaseSession.UploadUrl,
+                    IngestRoutes.TomestoneResults,
+                    ProtectedEndpointCapabilityKind.TomestoneResults,
+                    HttpMethod.Post,
+                    jsonContent,
+                    recordUploadAttempt: false,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                RequeueRemainingChunks(chunk, pendingChunks);
+                throw;
+            }
 
             if (result.Deferred)
             {

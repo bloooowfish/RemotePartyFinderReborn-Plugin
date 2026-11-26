@@ -53,16 +53,16 @@ internal static class DetailUploadResponseMapper {
 
     internal static void ApplyBatchResponse(
         ContributeDetailBatchResponse batchResponse,
-        IEnumerable<uint> sendableListingIds,
-        HashSet<uint> applied,
-        HashSet<uint> missing,
-        Dictionary<uint, string> terminalRejected,
-        Dictionary<uint, int?> retryAfterByListing,
-        HashSet<uint>? capabilityForbidden = null,
-        HashSet<uint>? retryableFailed = null
+        IEnumerable<ulong> sendableListingIds,
+        HashSet<ulong> applied,
+        HashSet<ulong> missing,
+        Dictionary<ulong, string> terminalRejected,
+        Dictionary<ulong, int?> retryAfterByListing,
+        HashSet<ulong>? capabilityForbidden = null,
+        HashSet<ulong>? retryableFailed = null
     ) {
         var sendableByListingId = sendableListingIds.ToHashSet();
-        var seen = new HashSet<uint>();
+        var seen = new HashSet<ulong>();
 
         foreach (var result in batchResponse.Results ?? []) {
             if (!sendableByListingId.Contains(result.ListingId) || !seen.Add(result.ListingId)) {
@@ -119,14 +119,14 @@ internal static class DetailUploadResponseMapper {
     }
 
     internal static void MergeUploadOutcome(
-        uint listingId,
+        ulong listingId,
         DetailUploadOutcome outcome,
-        HashSet<uint> applied,
-        HashSet<uint> missing,
-        Dictionary<uint, string> terminalRejected,
-        Dictionary<uint, int?> retryAfterByListing,
-        HashSet<uint>? deferred = null,
-        HashSet<uint>? retryableFailed = null
+        HashSet<ulong> applied,
+        HashSet<ulong> missing,
+        Dictionary<ulong, string> terminalRejected,
+        Dictionary<ulong, int?> retryAfterByListing,
+        HashSet<ulong>? deferred = null,
+        HashSet<ulong>? retryableFailed = null
     ) {
         switch (outcome.Result) {
             case DetailUploadResult.Applied:
@@ -178,7 +178,7 @@ internal sealed record ContributeDetailBatchResponse {
 
 internal sealed record ContributeDetailBatchItemResponse {
     [JsonProperty("listing_id")]
-    public uint ListingId { get; init; }
+    public ulong ListingId { get; init; }
 
     [JsonProperty("status")]
     public string Status { get; init; } = string.Empty;

@@ -148,7 +148,7 @@ public sealed class PartyDetailUploadResponseMapperTests {
         Assert.Empty(state.TerminalRejected);
     }
 
-    private static BatchMapperState ApplyBatchResponse(string rawBody, uint[] sendableListingIds) {
+    private static BatchMapperState ApplyBatchResponse(string rawBody, ulong[] sendableListingIds) {
         Assert.True(DetailUploadResponseMapper.TryParseDetailBatchResponse(rawBody, out var batchResponse));
         var state = new BatchMapperState();
 
@@ -167,11 +167,11 @@ public sealed class PartyDetailUploadResponseMapperTests {
     }
 
     private sealed class BatchMapperState {
-        internal HashSet<uint> Applied { get; } = [];
-        internal HashSet<uint> Missing { get; } = [];
-        internal Dictionary<uint, string> TerminalRejected { get; } = [];
-        internal Dictionary<uint, int?> RetryAfterByListing { get; } = [];
-        internal HashSet<uint> CapabilityForbidden { get; } = [];
-        internal HashSet<uint> RetryableFailed { get; } = [];
+        internal HashSet<ulong> Applied { get; } = [];
+        internal HashSet<ulong> Missing { get; } = [];
+        internal Dictionary<ulong, string> TerminalRejected { get; } = [];
+        internal Dictionary<ulong, int?> RetryAfterByListing { get; } = [];
+        internal HashSet<ulong> CapabilityForbidden { get; } = [];
+        internal HashSet<ulong> RetryableFailed { get; } = [];
     }
 }

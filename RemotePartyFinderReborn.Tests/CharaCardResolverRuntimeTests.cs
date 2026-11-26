@@ -1,6 +1,9 @@
 using Microsoft.Data.Sqlite;
 using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
+using FFXIVClientStructs.FFXIV.Client.Game.Network;
 using Xunit;
 
 namespace RemotePartyFinderReborn.Tests;
@@ -746,7 +749,18 @@ public sealed class CharaCardResolverRuntimeTests {
     }
 
     [Fact]
-    public void Resolver_registers_select_ok_addon_lifecycle_handlers() {
+    public unsafe void ReadPacketName_reads_name_from_ffxiv_client_structs_chara_card_packet() {
+        var packet = (CharaCardPacket*)NativeMemory.AllocZeroed((nuint)sizeof(CharaCardPacket));
+        try {
+            Encoding.UTF8.GetBytes("Chara Card Tester").CopyTo(packet->Name);
+            Assert.Equal("Chara Card Tester", DalamudCharaCardResolverRuntime.ReadPacketName(packet));
+        } finally {
+            NativeMemory.Free(packet);
+        }
+    }
+
+    [Fact]
+    public void Resolver_initializes_and_disposes_suppression_runtime_cleanly() {
         using var harness = new TempPlayerCacheDatabase();
         using var database = new PlayerLocalDatabase(harness.DatabasePath);
 
@@ -1219,13 +1233,11 @@ public sealed class CharaCardResolverRuntimeTests {
     }
 
     [Fact]
-    public void DalamudSelectOkDialogSuppressionRuntime_only_subscribes_error_toast_and_never_normal_or_quest() {
-        var addonCalls = new List<string>();
+    public void DalamudSelectOkDialogSuppressionRuntime_only_subscribes_chat_log_and_error_toast_without_addon_lifecycle() {
         var chatCalls = new List<string>();
         var toastCalls = new List<string>();
         var suppressionRuntime = CreateSuppressionRuntime(
             ["Plate unavailable."],
-            addonCalls,
             chatCalls,
             toastCalls
         );
@@ -1235,14 +1247,12 @@ public sealed class CharaCardResolverRuntimeTests {
         Assert.DoesNotContain("add_Toast", toastCalls);
         Assert.DoesNotContain("add_QuestToast", toastCalls);
         Assert.Contains("add_LogMessage", chatCalls);
-        Assert.Contains("RegisterListener", addonCalls);
 
         suppressionRuntime.Dispose();
         Assert.Contains("remove_ErrorToast", toastCalls);
         Assert.DoesNotContain("remove_Toast", toastCalls);
         Assert.DoesNotContain("remove_QuestToast", toastCalls);
         Assert.Contains("remove_LogMessage", chatCalls);
-        Assert.Contains("UnregisterListener", addonCalls);
     }
 
     [Fact]
@@ -1251,7 +1261,6 @@ public sealed class CharaCardResolverRuntimeTests {
         var shouldSuppress = true;
         var suppressionRuntime = CreateSuppressionRuntime(
             ["  アドベンチャラープレートの情報を取得できませんでした。  ", "公開設定にされていないため表示できません。"],
-            [],
             [],
             []
         );
@@ -1281,7 +1290,6 @@ public sealed class CharaCardResolverRuntimeTests {
         var suppressionRuntime = CreateSuppressionRuntime(
             charaCardErrorToastTexts: null,
             [],
-            [],
             []
         );
         suppressionRuntime.Initialize(source => {
@@ -1296,19 +1304,16 @@ public sealed class CharaCardResolverRuntimeTests {
 
     private static DalamudSelectOkDialogSuppressionRuntime CreateSuppressionRuntime(
         IEnumerable<string>? charaCardErrorToastTexts,
-        List<string> addonCalls,
         List<string> chatCalls,
         List<string> toastCalls
     ) {
         var ctor = typeof(DalamudSelectOkDialogSuppressionRuntime).GetConstructors(BindingFlags.Instance | BindingFlags.NonPublic)
-            .Single(c => c.GetParameters()[3].ParameterType == typeof(IEnumerable<string>));
+            .Single(c => c.GetParameters()[2].ParameterType == typeof(IEnumerable<string>));
         var parameters = ctor.GetParameters();
-        var addonLifecycle = CreateInterfaceProxy(parameters[0].ParameterType, addonCalls);
-        var chatGui = CreateInterfaceProxy(parameters[1].ParameterType, chatCalls);
-        var toastGui = CreateInterfaceProxy(parameters[2].ParameterType, toastCalls);
+        var chatGui = CreateInterfaceProxy(parameters[0].ParameterType, chatCalls);
+        var toastGui = CreateInterfaceProxy(parameters[1].ParameterType, toastCalls);
 
         return (DalamudSelectOkDialogSuppressionRuntime)ctor.Invoke([
-            addonLifecycle,
             chatGui,
             toastGui,
             charaCardErrorToastTexts,

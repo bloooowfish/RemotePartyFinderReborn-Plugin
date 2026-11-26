@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Threading;
@@ -66,7 +67,7 @@ public class Plugin : IDalamudPlugin {
 
     internal Gatherer Gatherer { get; }
     internal PlayerLocalDatabase PlayerDatabase { get; }
-    private PlayerCollector PlayerCollector { get; }
+    internal PlayerCollector PlayerCollector { get; }
     internal CharaCardResolver CharaCardResolver { get; }
     internal PartyDetailCaptureState PartyDetailCaptureState { get; }
     internal PartyDetailCaptureRuntime PartyDetailCaptureRuntime { get; }
@@ -94,9 +95,11 @@ public class Plugin : IDalamudPlugin {
     internal DateTime FFLogsRateLimitCooldownUntilUtc => this.FFLogsCollector.RateLimitCooldownUntilUtc;
     internal DateTime TomestoneRateLimitCooldownUntilUtc => this.TomestoneApiClient.RateLimitCooldownUntilUtc;
 
+    private static readonly TimeSpan ShutdownWaitBudget = TimeSpan.FromSeconds(2);
+
     private readonly CancellationTokenSource _shutdownCts = new();
     private readonly List<Action> _shutdownSignalActions = [];
-    private readonly Stack<Action> _cleanupActions = new();
+    private readonly Stack<Action<TimeSpan>> _cleanupActions = new();
     private int _disposed;
 
     public Plugin() {
@@ -116,22 +119,22 @@ public class Plugin : IDalamudPlugin {
                 Configuration.Save();
             }
 
-            _cleanupActions.Push(() => _shutdownCts.Dispose());
+            _cleanupActions.Push(_ => _shutdownCts.Dispose());
             _shutdownSignalActions.Add(() => _shutdownCts.Cancel());
             this.ActivationGate = new FFLogsActivationGate(Configuration, ApiCredentialStatus, Configuration.Save);
             _shutdownSignalActions.Add(() => this.ActivationGate.BeginShutdown());
-            _cleanupActions.Push(() => this.ActivationGate.Dispose());
-
-            this.Gatherer = new Gatherer(this);
-            _shutdownSignalActions.Add(() => this.Gatherer.BeginShutdown());
-            _cleanupActions.Push(() => this.Gatherer.Dispose());
+            _cleanupActions.Push(remainingTimeout => this.ActivationGate.Dispose(remainingTimeout));
 
             this.PlayerDatabase = new PlayerLocalDatabase(Path.Combine(PluginInterface.ConfigDirectory.FullName, "player_cache.db"));
-            _cleanupActions.Push(() => this.PlayerDatabase.Dispose());
+            _cleanupActions.Push(remainingTimeout => this.PlayerDatabase.Dispose(remainingTimeout));
 
             this.PlayerCollector = new PlayerCollector(this, this.PlayerDatabase);
             _shutdownSignalActions.Add(() => this.PlayerCollector.BeginShutdown());
-            _cleanupActions.Push(() => this.PlayerCollector.Dispose());
+            _cleanupActions.Push(remainingTimeout => this.PlayerCollector.Dispose(remainingTimeout));
+
+            this.Gatherer = new Gatherer(this);
+            _shutdownSignalActions.Add(() => this.Gatherer.BeginShutdown());
+            _cleanupActions.Push(remainingTimeout => this.Gatherer.Dispose(remainingTimeout));
 
             this.CharaCardResolver = new CharaCardResolver(
                 this.PlayerDatabase,
@@ -139,7 +142,6 @@ public class Plugin : IDalamudPlugin {
                 warningSink: message => Log.Warning(message),
                 configuration: this.Configuration,
                 selectOkDialogSuppressionRuntime: new DalamudSelectOkDialogSuppressionRuntime(
-                    this.AddonLifecycle,
                     this.ChatGui,
                     this.ToastGui,
                     this.DataManager,
@@ -149,18 +151,18 @@ public class Plugin : IDalamudPlugin {
                 isOperational: () => this.IsPluginOperational
             );
             _shutdownSignalActions.Add(() => this.CharaCardResolver.BeginShutdown());
-            _cleanupActions.Push(() => this.CharaCardResolver.Dispose());
+            _cleanupActions.Push(remainingTimeout => this.CharaCardResolver.Dispose(remainingTimeout));
 
             this.Framework.Update += this.CharaCardResolver.OnFrameworkUpdate;
-            _cleanupActions.Push(() => this.Framework.Update -= this.CharaCardResolver.OnFrameworkUpdate);
+            _cleanupActions.Push(_ => this.Framework.Update -= this.CharaCardResolver.OnFrameworkUpdate);
 
             var partyDetailCapture = ComposePartyDetailCapture(this, warningSink: message => Log.Warning(message));
             this.PartyDetailCaptureState = partyDetailCapture.CaptureState;
             this.PartyDetailCaptureRuntime = partyDetailCapture.CaptureRuntime;
-            _cleanupActions.Push(() => this.PartyDetailCaptureRuntime.Dispose());
+            _cleanupActions.Push(_ => this.PartyDetailCaptureRuntime.Dispose());
             this.PartyDetailCollector = partyDetailCapture.PartyDetailCollector;
             _shutdownSignalActions.Add(() => this.PartyDetailCollector.BeginShutdown());
-            _cleanupActions.Push(() => this.PartyDetailCollector.Dispose());
+            _cleanupActions.Push(remainingTimeout => this.PartyDetailCollector.Dispose(remainingTimeout));
 
             this.PartyDetailGameLogSuppressionRuntime = new DalamudGameLogSuppressionRuntime(
                 this.ChatGui,
@@ -169,44 +171,45 @@ public class Plugin : IDalamudPlugin {
                 message => Log.Warning(message),
                 message => Log.Debug(message)
             );
-            _cleanupActions.Push(() => this.PartyDetailGameLogSuppressionRuntime.Dispose());
+            _cleanupActions.Push(_ => this.PartyDetailGameLogSuppressionRuntime.Dispose());
 
             this.DebugPfScanner = new DebugPfScanner(this, this.PartyDetailCollector, this.PartyDetailCaptureRuntime, this.Gatherer);
-            _cleanupActions.Push(() => this.DebugPfScanner.Dispose());
+            _cleanupActions.Push(_ => this.DebugPfScanner.Dispose());
 
             this.TomestoneApiClient = new TomestoneApiClient(this.Configuration, this.ApiCredentialStatus.ReportTomestone);
-            _cleanupActions.Push(() => this.TomestoneApiClient.Dispose());
+            _cleanupActions.Push(_ => this.TomestoneApiClient.Dispose());
 
             this.WorkerRegionProvider = new DalamudFFLogsWorkerRegionProvider(
                 this.Framework,
                 this.ObjectTable,
+                this.DataManager,
                 message => Log.Warning(message));
-            _cleanupActions.Push(() => this.WorkerRegionProvider.Dispose());
+            _cleanupActions.Push(_ => this.WorkerRegionProvider.Dispose());
 
             this.TomestoneCollector = new TomestoneCollector(this, this.WorkerRegionProvider);
             _shutdownSignalActions.Add(() => this.TomestoneCollector.BeginShutdown());
-            _cleanupActions.Push(() => this.TomestoneCollector.Dispose());
+            _cleanupActions.Push(remainingTimeout => this.TomestoneCollector.Dispose(remainingTimeout));
 
             this.FFLogsCollector = new FFLogsCollector(this, this.WorkerRegionProvider);
             _shutdownSignalActions.Add(() => this.FFLogsCollector.BeginShutdown());
-            _cleanupActions.Push(() => this.FFLogsCollector.Dispose());
+            _cleanupActions.Push(remainingTimeout => this.FFLogsCollector.Dispose(remainingTimeout));
 
             ValidateGameLogMessageCatalog();
 
             ConfigWindow = new ConfigWindow(this);
-            _cleanupActions.Push(() => ConfigWindow.Dispose());
+            _cleanupActions.Push(_ => ConfigWindow.Dispose());
             WindowSystem.AddWindow(ConfigWindow);
-            _cleanupActions.Push(() => WindowSystem.RemoveAllWindows());
+            _cleanupActions.Push(_ => WindowSystem.RemoveAllWindows());
 
             PluginInterface.UiBuilder.Draw += DrawUI;
-            _cleanupActions.Push(() => PluginInterface.UiBuilder.Draw -= DrawUI);
+            _cleanupActions.Push(_ => PluginInterface.UiBuilder.Draw -= DrawUI);
             PluginInterface.UiBuilder.OpenConfigUi += ToggleConfigUI;
-            _cleanupActions.Push(() => PluginInterface.UiBuilder.OpenConfigUi -= ToggleConfigUI);
+            _cleanupActions.Push(_ => PluginInterface.UiBuilder.OpenConfigUi -= ToggleConfigUI);
 
             CommandManager.AddHandler("/rpr", new CommandInfo(OnCommand) {
                 HelpMessage = "Open config UI. Args: players-upload, players-resync, details-upload"
             });
-            _cleanupActions.Push(() => CommandManager.RemoveHandler("/rpr"));
+            _cleanupActions.Push(_ => CommandManager.RemoveHandler("/rpr"));
 
             if (!Configuration.HasFFLogsCredentialsConfigured) {
                 ConfigWindow.IsOpen = true;
@@ -240,11 +243,26 @@ public class Plugin : IDalamudPlugin {
             }
         }
 
+        var shutdownStopwatch = Stopwatch.StartNew();
+        var workerTasks = new List<Task>();
+        this.ActivationGate?.CollectShutdownTasks(workerTasks);
+        this.FFLogsCollector?.CollectShutdownTasks(workerTasks);
+        this.TomestoneCollector?.CollectShutdownTasks(workerTasks);
+        this.PartyDetailCollector?.CollectShutdownTasks(workerTasks);
+        this.CharaCardResolver?.CollectShutdownTasks(workerTasks);
+        this.PlayerCollector?.CollectShutdownTasks(workerTasks);
+        this.Gatherer?.CollectShutdownTasks(workerTasks);
+
+        var remainingTimeout = WaitForShutdownTasksConcurrently(workerTasks, ShutdownWaitBudget, shutdownStopwatch);
+
         try {
-            this.ActivationGate?.WaitForPendingVerifications(TimeSpan.FromSeconds(2));
+            this.PlayerDatabase?.BeginShutdown();
+            var dbTasks = new List<Task>();
+            this.PlayerDatabase?.CollectShutdownTasks(dbTasks);
+            remainingTimeout = WaitForShutdownTasksConcurrently(dbTasks, ShutdownWaitBudget, shutdownStopwatch);
         } catch (Exception ex) {
             try {
-                Log?.Error(ex, "Plugin: failed waiting for FFLogs credential verification shutdown.");
+                Log?.Error(ex, "Plugin: failed waiting for player database shutdown.");
             } catch {
                 // Ignore logging failures during teardown.
             }
@@ -253,7 +271,7 @@ public class Plugin : IDalamudPlugin {
         while (_cleanupActions.Count > 0) {
             var action = _cleanupActions.Pop();
             try {
-                action();
+                action(remainingTimeout);
             } catch (Exception ex) {
                 try {
                     Log?.Error(ex, "Plugin: failed to clean up resource during disposal or rollback.");
@@ -262,6 +280,29 @@ public class Plugin : IDalamudPlugin {
                 }
             }
         }
+    }
+
+    internal static TimeSpan WaitForShutdownTasksConcurrently(
+        IReadOnlyList<Task> tasks,
+        TimeSpan totalBudget,
+        Stopwatch elapsedStopwatch = null
+    ) {
+        elapsedStopwatch ??= Stopwatch.StartNew();
+        var remaining = totalBudget - elapsedStopwatch.Elapsed;
+        if (remaining <= TimeSpan.Zero) {
+            return TimeSpan.Zero;
+        }
+
+        if (tasks.Count > 0) {
+            try {
+                Task.WhenAll(tasks).Wait(remaining);
+            } catch (Exception) {
+                // Cancellation/timeout during shutdown is expected; callers have already signaled shutdown.
+            }
+        }
+
+        var afterWait = totalBudget - elapsedStopwatch.Elapsed;
+        return afterWait > TimeSpan.Zero ? afterWait : TimeSpan.Zero;
     }
 
     private void OnCommand(string command, string args) {

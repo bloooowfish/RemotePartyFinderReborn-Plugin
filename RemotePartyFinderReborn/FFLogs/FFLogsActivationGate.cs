@@ -64,7 +64,23 @@ internal sealed class FFLogsActivationGate : IDisposable {
         }
     }
 
+    internal void CollectShutdownTasks(List<Task> tasks) {
+        ArgumentNullException.ThrowIfNull(tasks);
+        lock (_gate) {
+            foreach (var task in _activeVerificationTasks) {
+                if (!task.IsCompleted) {
+                    tasks.Add(task);
+                }
+            }
+        }
+    }
+
     internal void WaitForPendingVerifications(TimeSpan? timeout = null) {
+        var effectiveTimeout = timeout ?? DefaultShutdownWaitTimeout;
+        if (effectiveTimeout <= TimeSpan.Zero) {
+            return;
+        }
+
         Task[] activeTasks;
         lock (_gate) {
             activeTasks = _activeVerificationTasks.ToArray();
@@ -75,19 +91,23 @@ internal sealed class FFLogsActivationGate : IDisposable {
         }
 
         try {
-            Task.WhenAll(activeTasks).Wait(timeout ?? DefaultShutdownWaitTimeout);
+            Task.WhenAll(activeTasks).Wait(effectiveTimeout);
         } catch (Exception) {
             // Cancellation/timeout during shutdown is expected; callers have already signaled shutdown.
         }
     }
 
     public void Dispose() {
+        Dispose(DefaultShutdownWaitTimeout);
+    }
+
+    internal void Dispose(TimeSpan waitTimeout) {
         BeginShutdown();
         if (Interlocked.Exchange(ref _disposed, 1) != 0) {
             return;
         }
 
-        WaitForPendingVerifications(DefaultShutdownWaitTimeout);
+        WaitForPendingVerifications(waitTimeout);
         _verifyLock.Dispose();
         _shutdownCts.Dispose();
     }

@@ -5,7 +5,6 @@ using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 
@@ -101,17 +100,6 @@ internal sealed class CharaCardResolver : IDisposable {
     internal static readonly TimeSpan MinDispatchInterval = TimeSpan.FromMilliseconds(350);
     internal const int MaxDispatchJitterMs = 100;
     internal static IReadOnlySet<uint> PlateFailureMessageIds => GameLogMessageCatalog.CharaCardFailureMessageIds;
-    internal static readonly AddonEvent[] SelectOkSuppressionEvents = [
-        AddonEvent.PreSetup,
-        AddonEvent.PreRequestedUpdate,
-        AddonEvent.PreRefresh,
-        AddonEvent.PreOpen,
-        AddonEvent.PreShow,
-    ];
-    internal static readonly string[] SelectOkAddonNames = [
-        "SelectOk",
-        "SelectOkTitle",
-    ];
 
     internal static int ResolveMaxAttemptsFromRetryCount(int configuredRetries) {
         return Math.Max(1, configuredRetries + 1);
@@ -425,7 +413,19 @@ internal sealed class CharaCardResolver : IDisposable {
         }
     }
 
+    internal void CollectShutdownTasks(List<Task> tasks) {
+        ArgumentNullException.ThrowIfNull(tasks);
+        var workerTask = _identityUploadPump?.GetActiveWorkerTask();
+        if (workerTask is { IsCompleted: false }) {
+            tasks.Add(workerTask);
+        }
+    }
+
     public void Dispose() {
+        Dispose(TimeSpan.FromSeconds(2));
+    }
+
+    internal void Dispose(TimeSpan waitTimeout) {
         BeginShutdown();
         if (_disposed) {
             return;
@@ -434,7 +434,7 @@ internal sealed class CharaCardResolver : IDisposable {
         _disposed = true;
         _selectOkDialogSuppressionRuntime?.Dispose();
         _runtime.Dispose();
-        _identityUploadPump?.WaitForActiveWorker(TimeSpan.FromSeconds(2));
+        _identityUploadPump?.WaitForActiveWorker(waitTimeout);
         _disposeCts.Dispose();
         if (_ownsIdentityUploadHttpClient) {
             _identityUploadHttpClient.Dispose();
@@ -641,11 +641,6 @@ internal sealed class CharaCardResolver : IDisposable {
         }
     }
 
-    private bool ShouldSuppressSelectOkAddon(string source) {
-        _ = source;
-        return false;
-    }
-
     private void DisableEnrichment(string reason) {
         IsEnabled = false;
         LogWarning($"CharaCardResolver: disabled. {reason}");
@@ -679,7 +674,7 @@ internal sealed class CharaCardResolver : IDisposable {
             return ShouldSuppressChatLogMessage(logMessageId, source);
         }
 
-        return ShouldSuppressSelectOkAddon(source);
+        return false;
     }
 
     private bool ShouldSuppressChatLogMessage(uint logMessageId, string source) {

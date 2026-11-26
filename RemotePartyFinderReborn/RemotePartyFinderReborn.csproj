@@ -65,4 +65,16 @@
         <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="9.0.4" />
     </ItemGroup>
 
+    <Target Name="PruneUnusedSqliteRuntimes"
+            AfterTargets="Build"
+            BeforeTargets="DefaultDalamudPackagerDebug;DefaultDalamudPackagerRelease"
+            Condition="Exists('$(OutputPath)runtimes')">
+        <ItemGroup>
+            <_AllRuntimeDirs Include="$([System.IO.Directory]::GetDirectories('$(OutputPath)runtimes'))" />
+            <_UnusedRuntimeDirs Include="@(_AllRuntimeDirs)"
+                                Condition="'$([System.IO.Path]::GetFileName(&quot;%(_AllRuntimeDirs.Identity)&quot;))' != 'win-x64'" />
+        </ItemGroup>
+        <RemoveDir Directories="@(_UnusedRuntimeDirs)" />
+    </Target>
+
 </Project>

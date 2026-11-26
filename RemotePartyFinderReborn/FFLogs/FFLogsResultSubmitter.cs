@@ -100,15 +100,24 @@ internal sealed class FFLogsResultSubmitter
             }
 
             var jsonContent = JsonConvert.SerializeObject(chunk);
-            var result = await _protectedExecutor.ExecuteAsync(
-                configuration,
-                leaseSession.UploadUrl,
-                IngestRoutes.FflogsResults,
-                ProtectedEndpointCapabilityKind.FflogsResults,
-                HttpMethod.Post,
-                jsonContent,
-                recordUploadAttempt: false,
-                cancellationToken).ConfigureAwait(false);
+            ProtectedIngestResult result;
+            try
+            {
+                result = await _protectedExecutor.ExecuteAsync(
+                    configuration,
+                    leaseSession.UploadUrl,
+                    IngestRoutes.FflogsResults,
+                    ProtectedEndpointCapabilityKind.FflogsResults,
+                    HttpMethod.Post,
+                    jsonContent,
+                    recordUploadAttempt: false,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                RequeueRemainingChunks(chunk, pendingChunks);
+                throw;
+            }
 
             if (result.Deferred)
             {

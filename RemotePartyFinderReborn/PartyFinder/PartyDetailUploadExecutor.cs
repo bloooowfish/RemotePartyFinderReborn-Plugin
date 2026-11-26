@@ -35,14 +35,14 @@ internal sealed class PartyDetailUploadExecutor {
         _errorLog = errorLog ?? throw new ArgumentNullException(nameof(errorLog));
     }
 
-    internal async Task<Dictionary<uint, DetailUploadOutcome>> UploadBatchToAllTargetsAsync(
+    internal async Task<Dictionary<ulong, DetailUploadOutcome>> UploadBatchToAllTargetsAsync(
         IReadOnlyList<PendingDetailEntry> pendingBatch,
         CancellationToken cancellationToken = default
     ) {
         var enabledTargets = _configuration.GetUploadUrlsSnapshot()
             .Where(static candidate => candidate.IsEnabled)
             .ToArray();
-        var aggregations = new Dictionary<uint, ListingBatchAggregation>(pendingBatch.Count);
+        var aggregations = new Dictionary<ulong, ListingBatchAggregation>(pendingBatch.Count);
         foreach (var pending in pendingBatch) {
             aggregations[pending.Detail.ListingId] = new ListingBatchAggregation();
         }
@@ -160,7 +160,7 @@ internal sealed class PartyDetailUploadExecutor {
             }
         }
 
-        var outcomes = new Dictionary<uint, DetailUploadOutcome>(pendingBatch.Count);
+        var outcomes = new Dictionary<ulong, DetailUploadOutcome>(pendingBatch.Count);
         foreach (var pending in pendingBatch) {
             var listingId = pending.Detail.ListingId;
             outcomes[listingId] = BuildFinalOutcome(pending, enabledTargets, aggregations[listingId]);
@@ -176,15 +176,15 @@ internal sealed class PartyDetailUploadExecutor {
         string body,
         IReadOnlyList<SendableDetailBatchItem> sendable,
         UploadAttemptLease attemptLease,
-        Dictionary<uint, ListingBatchAggregation> aggregations
+        Dictionary<ulong, ListingBatchAggregation> aggregations
     ) {
         if (DetailUploadResponseMapper.TryParseDetailBatchResponse(body, out var batchResponse) && batchResponse.Results.Count > 0) {
-            var targetApplied = new HashSet<uint>();
-            var targetMissing = new HashSet<uint>();
-            var targetRejected = new Dictionary<uint, string>();
-            var targetRetryAfter = new Dictionary<uint, int?>();
-            var targetCapabilityForbidden = new HashSet<uint>();
-            var targetRetryableFailed = new HashSet<uint>();
+            var targetApplied = new HashSet<ulong>();
+            var targetMissing = new HashSet<ulong>();
+            var targetRejected = new Dictionary<ulong, string>();
+            var targetRetryAfter = new Dictionary<ulong, int?>();
+            var targetCapabilityForbidden = new HashSet<ulong>();
+            var targetRetryableFailed = new HashSet<ulong>();
 
             DetailUploadResponseMapper.ApplyBatchResponse(
                 batchResponse,
@@ -240,7 +240,7 @@ internal sealed class PartyDetailUploadExecutor {
         UploadUrl uploadTarget,
         IReadOnlyList<PendingDetailEntry> candidates,
         DateTimeOffset nowOffset,
-        Dictionary<uint, ListingBatchAggregation> aggregations
+        Dictionary<ulong, ListingBatchAggregation> aggregations
     ) {
         var sendable = new List<PendingDetailEntry>(candidates.Count);
         foreach (var pending in candidates) {
@@ -321,7 +321,7 @@ internal sealed class PartyDetailUploadExecutor {
     private async Task UploadSinglesToTargetAsync(
         UploadUrl uploadTarget,
         IReadOnlyList<PendingDetailEntry> pendingEntries,
-        Dictionary<uint, ListingBatchAggregation> aggregations,
+        Dictionary<ulong, ListingBatchAggregation> aggregations,
         CancellationToken cancellationToken
     ) {
         foreach (var pending in pendingEntries) {

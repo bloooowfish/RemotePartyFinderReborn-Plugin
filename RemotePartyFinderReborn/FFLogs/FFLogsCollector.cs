@@ -159,6 +159,7 @@ public class FFLogsCollector : IDisposable
         workerRegionProvider ??= new DalamudFFLogsWorkerRegionProvider(
             plugin.Framework,
             plugin.ObjectTable,
+            plugin.DataManager,
             message => Plugin.Log.Warning(message));
         var seams = CreateSeams(
             new HttpClientIngestHttpSender(httpClient),
@@ -208,7 +209,21 @@ public class FFLogsCollector : IDisposable
         }
     }
 
+    internal void CollectShutdownTasks(List<Task> tasks)
+    {
+        ArgumentNullException.ThrowIfNull(tasks);
+        if (!_workerTask.IsCompleted)
+        {
+            tasks.Add(_workerTask);
+        }
+    }
+
     public void Dispose()
+    {
+        Dispose(TimeSpan.FromSeconds(2));
+    }
+
+    internal void Dispose(TimeSpan waitTimeout)
     {
         BeginShutdown();
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -216,13 +231,16 @@ public class FFLogsCollector : IDisposable
             return;
         }
 
-        try
+        if (waitTimeout > TimeSpan.Zero && !_workerTask.IsCompleted)
         {
-            _workerTask.Wait(TimeSpan.FromSeconds(2));
-        }
-        catch (Exception)
-        {
-            // Ignore cancellation/timeout during shutdown before tearing down HTTP clients.
+            try
+            {
+                _workerTask.Wait(waitTimeout);
+            }
+            catch (Exception)
+            {
+                // Ignore cancellation/timeout during shutdown before tearing down HTTP clients.
+            }
         }
 
         foreach (var disposable in OwnedDisposables)

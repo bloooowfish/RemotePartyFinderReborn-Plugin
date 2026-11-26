@@ -28,6 +28,7 @@ internal sealed class PlayerLocalDatabase : IDisposable {
     private static readonly TimeSpan CleanPlayerRetention = TimeSpan.FromDays(14);
     private static readonly TimeSpan CleanPruneInterval = TimeSpan.FromMinutes(15);
     private static readonly TimeSpan WriteCoalesceDelay = TimeSpan.FromMilliseconds(200);
+    private static readonly TimeSpan ShutdownWaitTimeout = TimeSpan.FromSeconds(2);
 
     private readonly string _connectionString;
     private readonly object _stateLock = new();
@@ -42,7 +43,7 @@ internal sealed class PlayerLocalDatabase : IDisposable {
     private readonly HashSet<ulong> _absentIdentities = new();
 
     private Dictionary<ulong, CachedPlayerEntry> _pendingPlayerMutations = new();
-    private Dictionary<ulong, DateTime> _pendingPlayerMarkUploadedOnly = new();
+    private Dictionary<ulong, PendingMarkUploadedEntry> _pendingPlayerMarkUploadedOnly = new();
     private Dictionary<ulong, CachedIdentityEntry> _pendingIdentityUpserts = new();
     private Dictionary<ulong, DateTime> _pendingIdentitySubmittedOnly = new();
     private Dictionary<ulong, PartialCharacterIdentitySnapshot> _pendingPartialUpserts = new();
@@ -58,6 +59,7 @@ internal sealed class PlayerLocalDatabase : IDisposable {
     private bool _flushScheduled;
     private bool _disposing;
     private bool _disposed;
+    private int _disposeCompleted;
 
     public PlayerLocalDatabase(string databasePath) {
         ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
@@ -136,15 +138,16 @@ internal sealed class PlayerLocalDatabase : IDisposable {
             foreach (var player in playerList) {
                 CachedPlayerEntry nextEntry;
                 if (_players.TryGetValue(player.ContentId, out var existing)) {
-                    if (HasSameObservedPayload(existing.Player, player)) {
+                    var normalizedPlayer = MergePlayerObservation(existing.Player, player);
+                    if (HasSameObservedPayload(existing.Player, normalizedPlayer)) {
                         nextEntry = existing with {
                             LastSeenUtc = observedAtUtc,
                         };
                     } else {
-                        var payloadHash = ComputePayloadHash(player);
+                        var payloadHash = ComputePayloadHash(normalizedPlayer);
                         var dirty = existing.Dirty || !string.Equals(existing.PayloadHash, payloadHash, StringComparison.Ordinal);
                         nextEntry = new CachedPlayerEntry(
-                            ClonePlayer(player),
+                            normalizedPlayer,
                             payloadHash,
                             dirty,
                             existing.FirstSeenUtc,
@@ -177,6 +180,16 @@ internal sealed class PlayerLocalDatabase : IDisposable {
             EnforcePlayerCacheLimitLocked(observedAtUtc);
             SignalFlushLocked();
         }
+    }
+
+    private static UploadablePlayer MergePlayerObservation(UploadablePlayer existing, UploadablePlayer candidate) {
+        return new UploadablePlayer {
+            ContentId = candidate.ContentId,
+            Name = candidate.Name,
+            HomeWorld = candidate.HomeWorld,
+            CurrentWorld = candidate.CurrentWorld != 0 ? candidate.CurrentWorld : existing.CurrentWorld,
+            AccountId = candidate.AccountId != 0 ? candidate.AccountId : existing.AccountId,
+        };
     }
 
     private static bool HasSameObservedPayload(UploadablePlayer existing, UploadablePlayer candidate) {
@@ -321,12 +334,23 @@ internal sealed class PlayerLocalDatabase : IDisposable {
     public void MarkBatchUploaded(IEnumerable<UploadablePlayer> uploadedPlayers) {
         ArgumentNullException.ThrowIfNull(uploadedPlayers);
 
-        var contentIds = uploadedPlayers
-            .Select(static player => player.ContentId)
-            .Distinct()
-            .ToArray();
+        var uploadedHashes = new Dictionary<ulong, string>();
+        foreach (var player in uploadedPlayers) {
+            if (player is null) {
+                continue;
+            }
 
-        if (contentIds.Length == 0) {
+            uploadedHashes[player.ContentId] = ComputePayloadHash(player);
+        }
+
+        MarkBatchUploaded(uploadedHashes);
+    }
+
+    internal void MarkBatchUploaded(IEnumerable<KeyValuePair<ulong, string>> uploadedHashes) {
+        ArgumentNullException.ThrowIfNull(uploadedHashes);
+
+        var hashList = uploadedHashes as ICollection<KeyValuePair<ulong, string>> ?? uploadedHashes.ToArray();
+        if (hashList.Count == 0) {
             return;
         }
 
@@ -334,8 +358,12 @@ internal sealed class PlayerLocalDatabase : IDisposable {
         lock (_stateLock) {
             ThrowIfDisposedLocked();
 
-            foreach (var contentId in contentIds) {
+            foreach (var (contentId, uploadedHash) in hashList) {
                 if (_players.TryGetValue(contentId, out var existing)) {
+                    if (!string.Equals(existing.PayloadHash, uploadedHash, StringComparison.Ordinal)) {
+                        continue;
+                    }
+
                     var updated = existing with {
                         Dirty = false,
                         LastUploadedUtc = uploadedAtUtc,
@@ -344,8 +372,13 @@ internal sealed class PlayerLocalDatabase : IDisposable {
                     _pendingPlayerMutations[contentId] = updated;
                     _pendingPlayerMarkUploadedOnly.Remove(contentId);
                 } else {
+                    if (_pendingPlayerMutations.TryGetValue(contentId, out var pendingMutation)
+                        && !string.Equals(pendingMutation.PayloadHash, uploadedHash, StringComparison.Ordinal)) {
+                        continue;
+                    }
+
                     _pendingPlayerMutations.Remove(contentId);
-                    _pendingPlayerMarkUploadedOnly[contentId] = uploadedAtUtc;
+                    _pendingPlayerMarkUploadedOnly[contentId] = new PendingMarkUploadedEntry(uploadedHash, uploadedAtUtc);
                 }
             }
 
@@ -355,7 +388,6 @@ internal sealed class PlayerLocalDatabase : IDisposable {
 
     public int MarkAllPlayersDirty() {
         int requeuedCount;
-        bool queryTotalCount;
         lock (_stateLock) {
             ThrowIfDisposedLocked();
 
@@ -376,25 +408,10 @@ internal sealed class PlayerLocalDatabase : IDisposable {
             _pendingPlayerMarkUploadedOnly.Clear();
             _pendingMarkAllDirty = true;
             requeuedCount = _players.Count;
-            queryTotalCount = _playersMayBeIncomplete;
+            SignalFlushLocked();
         }
 
-        FlushPendingWrites();
-
-        if (!queryTotalCount) {
-            return requeuedCount;
-        }
-
-        lock (_dbLock) {
-            if (_disposed) {
-                throw new ObjectDisposedException(nameof(PlayerLocalDatabase));
-            }
-
-            using var connection = OpenConnection();
-            using var command = connection.CreateCommand();
-            command.CommandText = "SELECT COUNT(*) FROM players;";
-            return Convert.ToInt32(command.ExecuteScalar());
-        }
+        return requeuedCount;
     }
 
     public bool TryGetIdentity(ulong contentId, [NotNullWhen(true)] out CharacterIdentitySnapshot? snapshot) {
@@ -684,7 +701,7 @@ internal sealed class PlayerLocalDatabase : IDisposable {
             _identities[snapshot.ContentId] = entry;
             _pendingIdentityUpserts[snapshot.ContentId] = entry;
             _pendingIdentitySubmittedOnly.Remove(snapshot.ContentId);
-            _absentIdentities.Clear();
+            _absentIdentities.Remove(snapshot.ContentId);
 
             _partialIdentities.Remove(snapshot.ContentId);
             _pendingPartialUpserts.Remove(snapshot.ContentId);
@@ -827,7 +844,7 @@ internal sealed class PlayerLocalDatabase : IDisposable {
         FlushPendingWrites();
     }
 
-    public void Dispose() {
+    internal void BeginShutdown() {
         lock (_stateLock) {
             if (_disposed || _disposing) {
                 return;
@@ -836,26 +853,59 @@ internal sealed class PlayerLocalDatabase : IDisposable {
             _disposing = true;
         }
 
-        _disposeCts.Cancel();
         try {
-            _flushTask.GetAwaiter().GetResult();
-        } catch (OperationCanceledException) {
-        } catch (Exception ex) {
-            Plugin.Log?.Error($"PlayerLocalDatabase background flush failed during shutdown: {ex}");
+            _disposeCts.Cancel();
+        } catch (ObjectDisposedException) {
+        }
+    }
+
+    internal void CollectShutdownTasks(List<Task> tasks) {
+        ArgumentNullException.ThrowIfNull(tasks);
+        if (!_flushTask.IsCompleted) {
+            tasks.Add(_flushTask);
+        }
+    }
+
+    public void Dispose() {
+        Dispose(ShutdownWaitTimeout);
+    }
+
+    internal void Dispose(TimeSpan waitTimeout) {
+        BeginShutdown();
+        if (Interlocked.Exchange(ref _disposeCompleted, 1) != 0) {
+            return;
         }
 
-        try {
-            FlushPendingWrites();
-        } catch (Exception ex) {
-            Plugin.Log?.Error($"PlayerLocalDatabase final flush failed during shutdown: {ex}");
+        var flushCompleted = _flushTask.IsCompleted;
+        if (!flushCompleted && waitTimeout > TimeSpan.Zero) {
+            try {
+                flushCompleted = _flushTask.Wait(waitTimeout);
+            } catch (Exception ex) when (ex is OperationCanceledException or AggregateException { InnerException: OperationCanceledException }) {
+                flushCompleted = true;
+            } catch (Exception ex) {
+                flushCompleted = true;
+                Plugin.Log?.Error($"PlayerLocalDatabase background flush failed during shutdown: {ex}");
+            }
+        }
+
+        if (flushCompleted) {
+            try {
+                FlushPendingWrites();
+            } catch (Exception ex) {
+                Plugin.Log?.Error($"PlayerLocalDatabase final flush failed during shutdown: {ex}");
+            }
+        } else {
+            Plugin.Log?.Warning("PlayerLocalDatabase: background flush did not finish within shutdown timeout; skipping final synchronous flush.");
         }
 
         lock (_stateLock) {
             _disposed = true;
         }
 
-        _disposeCts.Dispose();
-        _flushSignal.Dispose();
+        if (flushCompleted) {
+            _disposeCts.Dispose();
+            _flushSignal.Dispose();
+        }
 
         try {
             SqliteConnection.ClearPool(new SqliteConnection(_connectionString));
@@ -1008,11 +1058,17 @@ internal sealed class PlayerLocalDatabase : IDisposable {
     }
 
     private async Task FlushLoopAsync() {
-        while (!_disposeCts.IsCancellationRequested) {
+        while (true) {
             try {
+                if (_disposeCts.IsCancellationRequested) {
+                    break;
+                }
+
                 await _flushSignal.WaitAsync(_disposeCts.Token).ConfigureAwait(false);
                 await Task.Delay(WriteCoalesceDelay, _disposeCts.Token).ConfigureAwait(false);
             } catch (OperationCanceledException) {
+                break;
+            } catch (ObjectDisposedException) {
                 break;
             }
 
@@ -1073,7 +1129,7 @@ internal sealed class PlayerLocalDatabase : IDisposable {
         _pendingMarkAllDirty = false;
         _pendingPruneCleanPlayers = false;
         _pendingPlayerMutations = new Dictionary<ulong, CachedPlayerEntry>();
-        _pendingPlayerMarkUploadedOnly = new Dictionary<ulong, DateTime>();
+        _pendingPlayerMarkUploadedOnly = new Dictionary<ulong, PendingMarkUploadedEntry>();
         _pendingIdentityUpserts = new Dictionary<ulong, CachedIdentityEntry>();
         _pendingIdentitySubmittedOnly = new Dictionary<ulong, DateTime>();
         _pendingPartialUpserts = new Dictionary<ulong, PartialCharacterIdentitySnapshot>();
@@ -1101,9 +1157,9 @@ internal sealed class PlayerLocalDatabase : IDisposable {
             }
         }
 
-        foreach (var (id, uploadedAtUtc) in batch.PlayerMarkUploadedOnly) {
+        foreach (var (id, uploadedEntry) in batch.PlayerMarkUploadedOnly) {
             if (!_pendingPlayerMutations.ContainsKey(id) && !_pendingPlayerMarkUploadedOnly.ContainsKey(id)) {
-                _pendingPlayerMarkUploadedOnly[id] = uploadedAtUtc;
+                _pendingPlayerMarkUploadedOnly[id] = uploadedEntry;
             }
         }
 
@@ -1217,15 +1273,18 @@ internal sealed class PlayerLocalDatabase : IDisposable {
                 UPDATE players
                 SET dirty = 0,
                     last_uploaded_utc = @uploaded_at
-                WHERE content_id = @content_id;
+                WHERE content_id = @content_id
+                  AND payload_hash = @payload_hash;
                 """;
 
             var uploadedAtParam = markUploadedCommand.Parameters.Add("@uploaded_at", SqliteType.Text);
             var contentIdParam = markUploadedCommand.Parameters.Add("@content_id", SqliteType.Integer);
+            var payloadHashParam = markUploadedCommand.Parameters.Add("@payload_hash", SqliteType.Text);
 
-            foreach (var (contentId, uploadedAtUtc) in batch.PlayerMarkUploadedOnly) {
-                uploadedAtParam.Value = uploadedAtUtc.ToString("O");
+            foreach (var (contentId, uploadedEntry) in batch.PlayerMarkUploadedOnly) {
+                uploadedAtParam.Value = uploadedEntry.UploadedAtUtc.ToString("O");
                 contentIdParam.Value = (long)contentId;
+                payloadHashParam.Value = uploadedEntry.PayloadHash;
                 markUploadedCommand.ExecuteNonQuery();
             }
         }
@@ -1733,11 +1792,16 @@ internal sealed class PlayerLocalDatabase : IDisposable {
         DateTime? LastUploadedUtc
     );
 
+    private readonly record struct PendingMarkUploadedEntry(
+        string PayloadHash,
+        DateTime UploadedAtUtc
+    );
+
     private sealed record PendingWriteBatch(
         bool MarkAllDirty,
         bool PruneCleanPlayers,
         Dictionary<ulong, CachedPlayerEntry> PlayerMutations,
-        Dictionary<ulong, DateTime> PlayerMarkUploadedOnly,
+        Dictionary<ulong, PendingMarkUploadedEntry> PlayerMarkUploadedOnly,
         Dictionary<ulong, CachedIdentityEntry> IdentityUpserts,
         Dictionary<ulong, DateTime> IdentitySubmittedOnly,
         Dictionary<ulong, PartialCharacterIdentitySnapshot> PartialUpserts,

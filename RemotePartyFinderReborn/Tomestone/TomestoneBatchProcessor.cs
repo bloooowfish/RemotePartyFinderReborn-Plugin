@@ -12,7 +12,10 @@ internal sealed record TomestoneBatchProcessResult(
     bool HadTransientFailure,
     bool HitRateLimitCooldown,
     bool HitApiKeyRejected,
-    TimeSpan CooldownRemaining);
+    TimeSpan CooldownRemaining)
+{
+    public bool ShouldAbandonRemainingLeases => HitRateLimitCooldown || HitApiKeyRejected;
+}
 
 internal sealed class TomestoneBatchProcessor
 {

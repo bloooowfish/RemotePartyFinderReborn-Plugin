@@ -371,6 +371,114 @@ public sealed class TomestoneBackgroundWorkerTests
         Assert.Equal("worker_shutdown", payloadObj["failure_code"]!.Value<string>());
     }
 
+    [Fact]
+    public async Task Worker_shutdown_mid_batch_abandons_in_flight_leased_jobs_with_worker_shutdown()
+    {
+        var requests = new List<(string Path, string Body)>();
+        var sender = new StubFFLogsIngestHttpSender
+        {
+            OnSendAsync = async (request, ct) =>
+            {
+                var path = request.RequestUri!.AbsolutePath;
+                var body = request.Content != null ? await request.Content.ReadAsStringAsync(ct) : string.Empty;
+                requests.Add((path, body));
+
+                if (path == "/contribute/tomestone/jobs")
+                {
+                    return new HttpResponseMessage(HttpStatusCode.OK)
+                    {
+                        Content = new StringContent(
+                            """
+                            [
+                              {
+                                "content_id": 3001,
+                                "name": "Alpha",
+                                "server": "Tonberry",
+                                "region": "JP",
+                                "zone_id": 73,
+                                "difficulty_id": 0,
+                                "encounter_id": 101,
+                                "lease_token": "lease-3001"
+                              },
+                              {
+                                "content_id": 3002,
+                                "name": "Beta",
+                                "server": "Tonberry",
+                                "region": "JP",
+                                "zone_id": 73,
+                                "difficulty_id": 0,
+                                "encounter_id": 102,
+                                "lease_token": "lease-3002"
+                              }
+                            ]
+                            """,
+                            Encoding.UTF8,
+                            "application/json"),
+                    };
+                }
+
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""{"status":"ok","submitted":2,"released":2,"rejected":0}""", Encoding.UTF8, "application/json"),
+                };
+            },
+        };
+
+        using var cts = new CancellationTokenSource();
+        var progression = new StubTomestoneProgressionService
+        {
+            OnFetchProgressionDataOutcomeAsync = (_, _, _, _, _) =>
+            {
+                cts.Cancel();
+                return Task.FromCanceled<OperationOutcome<TomestoneProgressData>>(cts.Token);
+            },
+        };
+
+        var configuration = CreateOperationalConfiguration();
+        var timeProvider = new ManualFFLogsTimeProvider
+        {
+            UtcNow = new DateTime(2026, 5, 12, 4, 30, 0, DateTimeKind.Utc),
+        };
+        var seams = TomestoneCollector.CreateSeams(
+            sender,
+            progression,
+            timeProvider,
+            configuration,
+            new ApiCredentialStatusStore(),
+            static (_, _) => Task.CompletedTask);
+        var workerPolicy = new FFLogsWorkerPolicy(configuration, static _ => { }, timeProvider);
+        var submitBuffer = new TomestoneSubmitBuffer();
+        var abandoner = new TomestoneLeaseAbandoner(seams);
+        var worker = new TomestoneBackgroundWorker(
+            configuration,
+            progression,
+            new ApiCredentialStatusStore(),
+            timeProvider,
+            workerPolicy,
+            new TomestoneJobLeaseClient(seams),
+            new TomestoneBatchProcessor(seams),
+            new TomestoneResultSubmitter(seams, submitBuffer, abandoner),
+            abandoner,
+            static _ => { },
+            static _ => { },
+            static _ => { },
+            static _ => { },
+            static () => true);
+
+        await worker.RunAsync(cts.Token);
+
+        var abandonReq = Assert.Single(requests, r => r.Path == "/contribute/tomestone/leases/abandon");
+        var abandoned = JArray.Parse(abandonReq.Body);
+        Assert.Equal(2, abandoned.Count);
+        Assert.Contains(abandoned, t => t["content_id"]!.Value<ulong>() == 3001UL && t["lease_token"]!.Value<string>() == "lease-3001");
+        Assert.Contains(abandoned, t => t["content_id"]!.Value<ulong>() == 3002UL && t["lease_token"]!.Value<string>() == "lease-3002");
+        Assert.All(abandoned, token =>
+        {
+            Assert.Equal("worker_shutdown", token["reason"]!.Value<string>());
+            Assert.Equal("worker_shutdown", token["failure_code"]!.Value<string>());
+        });
+    }
+
     private static Configuration CreateOperationalConfiguration() => new()
     {
         IngestClientId = Guid.NewGuid().ToString("N"),

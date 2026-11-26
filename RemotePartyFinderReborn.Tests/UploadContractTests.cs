@@ -17,10 +17,67 @@ public sealed class UploadContractTests {
     }
 
     [Fact]
-    public void Upload_models_keep_existing_uint_listing_id_contract() {
-        Assert.Equal(typeof(uint), RequiredPropertyType<UploadableListing>(nameof(UploadableListing.Id)));
-        Assert.Equal(typeof(uint), RequiredPropertyType<UploadablePartyDetail>(nameof(UploadablePartyDetail.ListingId)));
-        Assert.Equal(typeof(uint), RequiredPropertyType<ListingDetailCapability>(nameof(ListingDetailCapability.ListingId)));
+    public void Upload_models_use_ulong_listing_id_contract() {
+        Assert.Equal(typeof(ulong), RequiredPropertyType<UploadableListing>(nameof(UploadableListing.Id)));
+        Assert.Equal(typeof(ulong), RequiredPropertyType<UploadablePartyDetail>(nameof(UploadablePartyDetail.ListingId)));
+        Assert.Equal(typeof(ulong), RequiredPropertyType<UploadablePartyDetailBatchItem>(nameof(UploadablePartyDetailBatchItem.ListingId)));
+        Assert.Equal(typeof(ulong), RequiredPropertyType<ListingDetailCapability>(nameof(ListingDetailCapability.ListingId)));
+    }
+
+    [Fact]
+    public void Listing_id_normalization_accepts_u64_up_to_int64_max_and_rejects_zero_or_overflow() {
+        Assert.False(UploadableListing.TryNormalizeListingIdForUpload(0UL, out var zeroId));
+        Assert.Equal(0UL, zeroId);
+        Assert.Throws<ArgumentOutOfRangeException>(() => UploadableListing.NormalizeListingIdForUpload(0UL));
+
+        const ulong largeListingId = (ulong)uint.MaxValue + 42UL;
+        Assert.True(UploadableListing.TryNormalizeListingIdForUpload(largeListingId, out var normalizedLarge));
+        Assert.Equal(largeListingId, normalizedLarge);
+        Assert.Equal(largeListingId, UploadableListing.NormalizeListingIdForUpload(largeListingId));
+
+        Assert.True(UploadableListing.TryNormalizeListingIdForUpload((ulong)long.MaxValue, out var maxSigned));
+        Assert.Equal((ulong)long.MaxValue, maxSigned);
+
+        var overflow = (ulong)long.MaxValue + 1UL;
+        Assert.False(UploadableListing.TryNormalizeListingIdForUpload(overflow, out var overflowOut));
+        Assert.Equal(0UL, overflowOut);
+        Assert.Throws<ArgumentOutOfRangeException>(() => UploadableListing.NormalizeListingIdForUpload(overflow));
+    }
+
+    [Fact]
+    public void Uploadable_party_detail_and_capabilities_preserve_large_u64_listing_ids() {
+        const ulong largeListingId = 5_000_000_007UL;
+        var detail = new UploadablePartyDetail {
+            ListingId = largeListingId,
+            LeaderContentId = 44UL,
+            LeaderName = "Leader",
+            HomeWorld = 77,
+            CreatedWorld = 74,
+            MemberContentIds = [44UL],
+            MemberJobs = [19],
+            SlotFlags = ["0x0000000000000001"],
+        };
+
+        var detailJson = JObject.Parse(JsonConvert.SerializeObject(detail));
+        Assert.Equal(largeListingId, detailJson.Value<ulong>("listing_id"));
+
+        var batchItem = UploadablePartyDetailBatchItem.FromDetail(detail, "tok-u64");
+        var batchJson = JObject.Parse(JsonConvert.SerializeObject(batchItem));
+        Assert.Equal(largeListingId, batchJson.Value<ulong>("listing_id"));
+
+        var now = new DateTimeOffset(2026, 6, 1, 0, 0, 0, TimeSpan.Zero);
+        var store = new DetailCapabilityStore();
+        store.ApplyDetailCapabilities([
+            new ListingDetailCapability {
+                ListingId = largeListingId,
+                Token = "cap-u64",
+                ExpiresAt = now.AddMinutes(5).ToUnixTimeSeconds(),
+            },
+        ], now);
+
+        Assert.False(store.ShouldDeferDetailRequest(largeListingId, now));
+        Assert.True(store.TryGetDetailCapability(largeListingId, out var token, now));
+        Assert.Equal("cap-u64", token);
     }
 
     [Fact]

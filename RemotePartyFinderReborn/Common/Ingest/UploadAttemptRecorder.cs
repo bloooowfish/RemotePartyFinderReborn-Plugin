@@ -37,6 +37,12 @@ internal sealed class UploadAttemptLease : IDisposable
         UploadAttemptRecorder.RecordFailure(_uploadUrl, utcNow);
     }
 
+    internal void RecordRouteNotFoundFailure(DateTime utcNow, TimeSpan? cooldownDuration = null)
+    {
+        Interlocked.Exchange(ref _settledOrDisposed, 1);
+        UploadAttemptRecorder.RecordRouteNotFoundFailure(_uploadUrl, utcNow, cooldownDuration);
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _settledOrDisposed, 1) == 0)
@@ -63,6 +69,45 @@ internal static class UploadAttemptRecorder
     {
         ArgumentNullException.ThrowIfNull(uploadUrl);
         uploadUrl.RecordFailure(utcNow);
+    }
+
+    internal static void RecordRouteNotFoundFailure(
+        UploadUrl uploadUrl,
+        DateTime utcNow,
+        TimeSpan? cooldownDuration = null)
+    {
+        ArgumentNullException.ThrowIfNull(uploadUrl);
+        uploadUrl.RecordRouteNotFoundFailure(utcNow, cooldownDuration);
+    }
+
+    internal static bool HasAnyAttemptableEndpoint(
+        Configuration configuration,
+        IngestRoute route,
+        DateTime utcNow)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+
+        foreach (var candidate in configuration.GetUploadUrlsSnapshot())
+        {
+            if (!candidate.IsEnabled)
+            {
+                continue;
+            }
+
+            if (PeekIsCircuitOpen(candidate, configuration, utcNow))
+            {
+                continue;
+            }
+
+            if (!IngestEndpointResolver.TryBuildEndpoint(candidate, route, out _))
+            {
+                continue;
+            }
+
+            return true;
+        }
+
+        return false;
     }
 
     internal static bool TryBeginAttempt(
@@ -122,19 +167,11 @@ internal static class UploadAttemptRecorder
         ArgumentNullException.ThrowIfNull(uploadUrl);
         ArgumentNullException.ThrowIfNull(configuration);
 
-        var effectiveThreshold = Math.Max(1, configuration.CircuitBreakerFailureThreshold);
         var isOpen = PeekIsCircuitOpen(uploadUrl, configuration, utcNow);
-        var remaining = TimeSpan.Zero;
-        if (uploadUrl.FailureCount >= effectiveThreshold)
-        {
-            var breakDuration = TimeSpan.FromMinutes(configuration.CircuitBreakerBreakDurationMinutes);
-            var elapsed = utcNow - uploadUrl.LastFailureTime;
-            remaining = breakDuration - elapsed;
-            if (remaining < TimeSpan.Zero)
-            {
-                remaining = TimeSpan.Zero;
-            }
-        }
+        var remaining = uploadUrl.GetRemainingBreakDuration(
+            configuration.CircuitBreakerFailureThreshold,
+            configuration.CircuitBreakerBreakDurationMinutes,
+            utcNow);
 
         return new CircuitStatus(uploadUrl.FailureCount, isOpen, remaining);
     }

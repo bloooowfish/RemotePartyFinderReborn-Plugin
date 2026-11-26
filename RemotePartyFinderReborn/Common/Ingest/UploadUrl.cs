@@ -73,6 +73,11 @@ public record UploadUrl(string Url)
         _circuitState.RecordFailure(utcNow);
     }
 
+    internal void RecordRouteNotFoundFailure(DateTime utcNow, TimeSpan? cooldownDuration = null)
+    {
+        _circuitState.RecordRouteNotFoundFailure(utcNow, cooldownDuration);
+    }
+
     internal void MarkDetailBatchUnsupported()
     {
         lock (_capabilityLock)
@@ -119,6 +124,17 @@ public record UploadUrl(string Url)
             halfOpenProbeTimeout);
     }
 
+    internal TimeSpan GetRemainingBreakDuration(
+        int failureThreshold,
+        int breakDurationMinutes,
+        DateTime utcNow)
+    {
+        return _circuitState.GetRemainingBreakDuration(
+            failureThreshold,
+            breakDurationMinutes,
+            utcNow);
+    }
+
     internal void ApplyIngestCapabilities(
         ProtectedEndpointCapabilities protectedEndpoints,
         IEnumerable<ListingDetailCapability> detailCapabilities,
@@ -143,7 +159,7 @@ public record UploadUrl(string Url)
         return _protectedCapabilities.ShouldDeferProtectedRequest(kind, now);
     }
 
-    internal bool ShouldDeferDetailRequest(uint listingId, DateTimeOffset? now = null)
+    internal bool ShouldDeferDetailRequest(ulong listingId, DateTimeOffset? now = null)
     {
         return _detailCapabilities.ShouldDeferDetailRequest(listingId, now);
     }
@@ -171,12 +187,12 @@ public record UploadUrl(string Url)
         _protectedCapabilities.InvalidateProtectedCapability(kind);
     }
 
-    internal bool TryGetDetailCapability(uint listingId, out string token, DateTimeOffset? now = null)
+    internal bool TryGetDetailCapability(ulong listingId, out string token, DateTimeOffset? now = null)
     {
         return _detailCapabilities.TryGetDetailCapability(listingId, out token, now);
     }
 
-    internal void InvalidateDetailCapability(uint listingId)
+    internal void InvalidateDetailCapability(ulong listingId)
     {
         _detailCapabilities.InvalidateDetailCapability(listingId);
     }

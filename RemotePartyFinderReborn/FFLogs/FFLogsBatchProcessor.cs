@@ -60,6 +60,7 @@ internal sealed class FFLogsBatchProcessor
                 (int)zoneId,
                 difficultyId,
                 cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
 
             if (!fetchedOutcome.Succeeded)
             {

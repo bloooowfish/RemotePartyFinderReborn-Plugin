@@ -121,7 +121,21 @@ public sealed class DetailUploadResponseMapperTests {
         Assert.Empty(state.TerminalRejected);
     }
 
-    private static BatchMapperState ApplyBatchResponse(string rawBody, uint[] sendableListingIds) {
+    [Fact]
+    public void Batch_status_ok_maps_large_u64_listing_id_to_applied() {
+        const ulong largeListingId = 5_000_000_001UL;
+        var state = ApplyBatchResponse($$"""
+            {"status":"ok","results":[
+                {"listing_id":{{largeListingId}},"status":"ok","matched_count":1,"modified_count":1}
+            ]}
+            """, [largeListingId]);
+
+        Assert.Contains(largeListingId, state.Applied);
+        Assert.Empty(state.Missing);
+        Assert.Empty(state.TerminalRejected);
+    }
+
+    private static BatchMapperState ApplyBatchResponse(string rawBody, ulong[] sendableListingIds) {
         Assert.True(DetailUploadResponseMapper.TryParseDetailBatchResponse(rawBody, out var batchResponse));
         var state = new BatchMapperState();
 
@@ -140,11 +154,11 @@ public sealed class DetailUploadResponseMapperTests {
     }
 
     private sealed class BatchMapperState {
-        internal HashSet<uint> Applied { get; } = [];
-        internal HashSet<uint> Missing { get; } = [];
-        internal Dictionary<uint, string> TerminalRejected { get; } = [];
-        internal Dictionary<uint, int?> RetryAfterByListing { get; } = [];
-        internal HashSet<uint> CapabilityForbidden { get; } = [];
-        internal HashSet<uint> RetryableFailed { get; } = [];
+        internal HashSet<ulong> Applied { get; } = [];
+        internal HashSet<ulong> Missing { get; } = [];
+        internal Dictionary<ulong, string> TerminalRejected { get; } = [];
+        internal Dictionary<ulong, int?> RetryAfterByListing { get; } = [];
+        internal HashSet<ulong> CapabilityForbidden { get; } = [];
+        internal HashSet<ulong> RetryableFailed { get; } = [];
     }
 }

@@ -10,7 +10,7 @@ namespace RemotePartyFinderReborn;
 [Serializable]
 [JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
 internal sealed class UploadablePartyDetailBatchItem {
-    public uint ListingId { get; set; }
+    public ulong ListingId { get; set; }
     public ulong LeaderContentId { get; set; }
     public string LeaderName { get; set; } = string.Empty;
     public ushort HomeWorld { get; set; }
