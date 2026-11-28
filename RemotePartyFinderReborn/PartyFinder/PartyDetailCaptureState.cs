@@ -256,7 +256,7 @@ internal sealed class PartyDetailCaptureState {
         }
     }
 
-    private static UploadablePartyDetail CloneSnapshot(UploadablePartyDetail snapshot) {
+    internal static UploadablePartyDetail CloneSnapshot(UploadablePartyDetail snapshot) {
         return new UploadablePartyDetail {
             ListingId = snapshot.ListingId,
             LeaderContentId = snapshot.LeaderContentId,

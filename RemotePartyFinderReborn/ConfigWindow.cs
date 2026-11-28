@@ -126,11 +126,16 @@ public class ConfigWindow : Window, IDisposable {
         }
 
         var style = ImGui.GetStyle();
-        var footerHeight = ImGui.GetFrameHeight() + (style.ItemSpacing.Y * 2f) + 2f;
+        var footerHeight = (ImGui.GetFrameHeight() * 2f) + (style.ItemSpacing.Y * 4f) + 6f;
         var remainingY = ImGui.GetContentRegionAvail().Y;
         if (remainingY > footerHeight) {
             ImGui.Dummy(new Vector2(0f, remainingY - footerHeight));
         }
+
+        if (ImGui.Button("PF UI Prototype (/rpr ui)", new Vector2(-1f, 0f))) {
+            _plugin.TogglePfBrowserUI();
+        }
+        ImGui.Spacing();
 
         ImGui.Separator();
         var advancedEnabled = _configuration.AdvancedSettingsEnabled;

@@ -84,6 +84,8 @@ public class FFLogsCollector : IDisposable
     private FFLogsBatchProcessor BatchProcessor { get; set; }
     private FFLogsBackgroundWorker BackgroundWorker { get; set; }
     private IReadOnlyList<IDisposable> OwnedDisposables { get; set; } = [];
+    private Func<bool> IsPluginOperational { get; set; } = static () => true;
+    private readonly SemaphoreSlim _executionGate = new(1, 1);
     private CancellationTokenSource Cts { get; set; } = new();
     private Task _workerTask = Task.CompletedTask;
     private int _shutdownSignaled;
@@ -110,7 +112,8 @@ public class FFLogsCollector : IDisposable
         FFLogsWorkerPolicy workerPolicy,
         FFLogsJobLeaseClient jobLeaseClient = null,
         FFLogsResultSubmitter resultSubmitter = null,
-        FFLogsBatchProcessor batchProcessor = null)
+        FFLogsBatchProcessor batchProcessor = null,
+        Func<bool> isPluginOperational = null)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(seams);
@@ -133,7 +136,8 @@ public class FFLogsCollector : IDisposable
             jobLeaseClient ?? new FFLogsJobLeaseClient(seams),
             batchProcessor ?? new FFLogsBatchProcessor(seams),
             [],
-            startWorker: false);
+            startWorker: false,
+            isPluginOperational: isPluginOperational);
         return collector;
     }
 
@@ -288,6 +292,7 @@ public class FFLogsCollector : IDisposable
         JobLeaseClient = jobLeaseClient ?? throw new ArgumentNullException(nameof(jobLeaseClient));
         BatchProcessor = batchProcessor ?? throw new ArgumentNullException(nameof(batchProcessor));
         OwnedDisposables = ownedDisposables ?? throw new ArgumentNullException(nameof(ownedDisposables));
+        IsPluginOperational = isPluginOperational ?? (static () => true);
         BackgroundWorker = new FFLogsBackgroundWorker(
             Configuration,
             Seams.ApiClient,
@@ -300,10 +305,131 @@ public class FFLogsCollector : IDisposable
             WarningLog,
             ErrorLog,
             DebugLog,
-            isPluginOperational);
+            isPluginOperational,
+            _executionGate);
         if (startWorker)
         {
             StartWorker();
+        }
+    }
+
+    internal bool IsSelfLeaseAvailable
+    {
+        get
+        {
+            if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _shutdownSignaled) != 0)
+            {
+                return false;
+            }
+
+            if (IsPluginOperational != null && !IsPluginOperational())
+            {
+                return false;
+            }
+
+            if (Configuration == null || Seams == null)
+            {
+                return false;
+            }
+
+            if (!Configuration.EnableFFLogsWorker || !Configuration.HasFFLogsCredentialsConfigured)
+            {
+                return false;
+            }
+
+            return !Seams.ApiClient.TryGetRateLimitRemaining(out _);
+        }
+    }
+
+    internal async Task<bool> ExecuteSelfLeasedJobsAsync(
+        UploadUrl uploadUrl,
+        IReadOnlyList<ParseJob> jobs,
+        CancellationToken cancellationToken)
+    {
+        if (jobs == null || jobs.Count == 0 || !IsSelfLeaseAvailable)
+        {
+            return false;
+        }
+
+        var targetUrl = uploadUrl
+                        ?? ProtectedIngestEndpointExecutor.SelectAvailableUploadUrl(
+                            Configuration,
+                            Seams.TimeProvider.UtcNow,
+                            WarningLog);
+        if (targetUrl == null)
+        {
+            return false;
+        }
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, Cts.Token);
+        var ct = linkedCts.Token;
+
+        await _executionGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var leaseSession = new FFLogsLeaseSession(
+                targetUrl,
+                jobs is List<ParseJob> list ? list : new List<ParseJob>(jobs));
+
+            if (!IsSelfLeaseAvailable)
+            {
+                await LeaseAbandoner.AbandonUnprocessedLeasesAsync(
+                    Configuration,
+                    leaseSession,
+                    leaseSession.Jobs,
+                    [],
+                    "fflogs_rate_limit_cooldown",
+                    ct,
+                    WarningLog,
+                    DebugLog).ConfigureAwait(false);
+                return false;
+            }
+
+            var processResult = await BatchProcessor.ProcessLeaseSessionAsync(leaseSession, ct).ConfigureAwait(false);
+            var submitAttempt = await ResultSubmitter.TrySubmitResultsAsync(
+                Configuration,
+                leaseSession,
+                processResult.ProcessedResults,
+                ct,
+                InfoLog,
+                WarningLog,
+                ErrorLog,
+                DebugLog).ConfigureAwait(false);
+
+            if (processResult.AbandonedLeases is { Count: > 0 })
+            {
+                await LeaseAbandoner.AbandonExplicitLeasesAsync(
+                    Configuration,
+                    leaseSession,
+                    processResult.AbandonedLeases,
+                    ct,
+                    WarningLog,
+                    DebugLog).ConfigureAwait(false);
+            }
+
+            if (processResult.ShouldAbandonRemainingLeases || processResult.HadTransientFailure)
+            {
+                var abandonReason = processResult.HitRateLimitCooldown
+                    ? "fflogs_rate_limit_cooldown"
+                    : "worker_transient_failure";
+                await LeaseAbandoner.AbandonUnprocessedLeasesAsync(
+                    Configuration,
+                    leaseSession,
+                    leaseSession.Jobs,
+                    processResult.ProcessedResults,
+                    abandonReason,
+                    ct,
+                    WarningLog,
+                    DebugLog,
+                    processResult.AbandonedLeases).ConfigureAwait(false);
+            }
+
+            return !submitAttempt.HadTransientFailure
+                   && (processResult.ProcessedResults.Count > 0 || processResult.AbandonedLeases.Count > 0);
+        }
+        finally
+        {
+            _executionGate.Release();
         }
     }
 

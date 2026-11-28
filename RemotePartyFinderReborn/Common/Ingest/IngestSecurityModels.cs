@@ -13,6 +13,7 @@ internal enum ProtectedEndpointCapabilityKind
     TomestoneJobs,
     TomestoneResults,
     TomestoneLeasesAbandon,
+    PluginEnrichment,
 }
 
 [Serializable]
@@ -33,6 +34,7 @@ internal sealed class ProtectedEndpointCapabilities
     public ProtectedEndpointCapabilityGrant TomestoneJobs { get; set; } = new();
     public ProtectedEndpointCapabilityGrant TomestoneResults { get; set; } = new();
     public ProtectedEndpointCapabilityGrant TomestoneLeasesAbandon { get; set; } = new();
+    public ProtectedEndpointCapabilityGrant PluginEnrichment { get; set; } = new();
 }
 
 [Serializable]

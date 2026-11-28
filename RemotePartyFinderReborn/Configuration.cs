@@ -83,6 +83,9 @@ public class Configuration : IPluginConfiguration {
     public int AutoDetailScanDetailTimeoutMs { get; set; } = DefaultScanDetailTimeoutMs;
     public int AutoDetailScanRetryCount { get; set; } = DefaultScanRetryCount;
 
+    // In-Game PF Browser UI Settings
+    public PfBlockedDisplayMode PfBlockedDisplayMode { get; set; } = PfBlockedDisplayMode.Dim;
+
     // Ingest security metadata
     public string IngestClientId { get; set; } = string.Empty;
 

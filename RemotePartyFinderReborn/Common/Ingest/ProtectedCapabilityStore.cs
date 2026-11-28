@@ -12,6 +12,7 @@ internal sealed class ProtectedCapabilityStore
     private readonly Dictionary<ProtectedEndpointCapabilityKind, CachedCapability> _capabilities = new();
     private bool _requiresFflogsCapabilities;
     private bool _requiresTomestoneCapabilities;
+    private bool _requiresPluginEnrichmentCapabilities;
 
     internal void ApplyProtectedCapabilities(
         ProtectedEndpointCapabilities protectedEndpoints,
@@ -46,6 +47,11 @@ internal sealed class ProtectedCapabilityStore
             _requiresTomestoneCapabilities |= UpsertCapability(
                 ProtectedEndpointCapabilityKind.TomestoneLeasesAbandon,
                 protectedEndpoints?.TomestoneLeasesAbandon,
+                observedNow);
+
+            _requiresPluginEnrichmentCapabilities |= UpsertCapability(
+                ProtectedEndpointCapabilityKind.PluginEnrichment,
+                protectedEndpoints?.PluginEnrichment,
                 observedNow);
         }
     }
@@ -106,6 +112,9 @@ internal sealed class ProtectedCapabilityStore
                 case ProtectedEndpointCapabilityKind.TomestoneLeasesAbandon:
                     _requiresTomestoneCapabilities = true;
                     break;
+                case ProtectedEndpointCapabilityKind.PluginEnrichment:
+                    _requiresPluginEnrichmentCapabilities = true;
+                    break;
                 default:
                     throw new ArgumentOutOfRangeException(nameof(kind), kind, null);
             }
@@ -122,6 +131,7 @@ internal sealed class ProtectedCapabilityStore
             ProtectedEndpointCapabilityKind.TomestoneJobs or
             ProtectedEndpointCapabilityKind.TomestoneResults or
             ProtectedEndpointCapabilityKind.TomestoneLeasesAbandon => _requiresTomestoneCapabilities,
+            ProtectedEndpointCapabilityKind.PluginEnrichment => _requiresPluginEnrichmentCapabilities,
             _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, null),
         };
     }

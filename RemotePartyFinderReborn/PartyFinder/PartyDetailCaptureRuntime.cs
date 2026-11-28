@@ -78,6 +78,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     private int _cachedPfDetailAddonId = -1;
     private long _postRequestPopulationGeneration;
     private RequestPopulationGate? _requestPopulationGate;
+    internal event Action<UploadablePartyDetail>? DetailCaptured;
     internal PartyDetailCaptureState CaptureState => _state;
     internal bool IsManualCaptureReady => Volatile.Read(ref _hasPopulateHook) && _hookScope is not null;
     internal bool IsScannerCaptureReady => Volatile.Read(ref _isScannerCaptureReady) && _hookScope is not null;
@@ -282,6 +283,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
         ClearPopulationGate(scope.RequestSerial);
         EndScannerHeadlessScope(attemptId);
+        NotifyDetailCaptured(snapshot);
         return true;
     }
 
@@ -656,7 +658,24 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         }
 
         ClearPopulationGate(cycle.RequestSerial);
+        NotifyDetailCaptured(snapshot);
         return true;
+    }
+
+    private void NotifyDetailCaptured(UploadablePartyDetail snapshot) {
+        var handler = DetailCaptured;
+        if (handler is null) {
+            return;
+        }
+
+        var cloned = PartyDetailCaptureState.CloneSnapshot(snapshot);
+        foreach (var listener in handler.GetInvocationList()) {
+            try {
+                ((Action<UploadablePartyDetail>)listener)(cloned);
+            } catch (Exception ex) {
+                Plugin.Log?.Warning(ex, "PartyDetailCaptureRuntime: DetailCaptured listener failed.");
+            }
+        }
     }
 
     internal bool IsScannerConsumedAckReady(long requestSerial, ulong listingId, ulong contentId) {

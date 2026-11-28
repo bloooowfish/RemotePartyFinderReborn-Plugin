@@ -25,6 +25,7 @@ internal sealed class TomestoneBackgroundWorker
     private readonly Action<string> _errorLog;
     private readonly Action<string> _debugLog;
     private readonly Func<bool> _isPluginOperational;
+    private readonly SemaphoreSlim _executionGate;
     private UploadUrl _lastSessionUploadUrl;
     private DateTime _lastCooldownSkipLogUtc = DateTime.MinValue;
     private TomestoneLeaseSession _activeLeaseSession;
@@ -45,7 +46,8 @@ internal sealed class TomestoneBackgroundWorker
         Action<string> warningLog,
         Action<string> errorLog,
         Action<string> debugLog,
-        Func<bool> isPluginOperational = null)
+        Func<bool> isPluginOperational = null,
+        SemaphoreSlim executionGate = null)
     {
         _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
         _progressionService = progressionService ?? throw new ArgumentNullException(nameof(progressionService));
@@ -61,6 +63,7 @@ internal sealed class TomestoneBackgroundWorker
         _errorLog = errorLog ?? throw new ArgumentNullException(nameof(errorLog));
         _debugLog = debugLog ?? throw new ArgumentNullException(nameof(debugLog));
         _isPluginOperational = isPluginOperational;
+        _executionGate = executionGate;
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -184,61 +187,75 @@ internal sealed class TomestoneBackgroundWorker
             return 0;
         }
 
-        _activeLeaseSession = leaseSession;
-        _activeProcessedResults = [];
-        _activeExplicitlyAbandoned.Clear();
-
         var jobs = leaseSession.Jobs;
         _debugLog($"Received {jobs.Count} Tomestone progression job(s) from server.");
 
-        var processResult = await _batchProcessor.ProcessLeaseSessionAsync(leaseSession, cancellationToken);
-        hadTransientFailure |= processResult.HadTransientFailure;
-        _activeProcessedResults = processResult.ProcessedResults;
-
-        var submitAttempt = await _resultSubmitter.TrySubmitResultsAsync(
-            _configuration,
-            leaseSession,
-            processResult.ProcessedResults,
-            cancellationToken,
-            _infoLog,
-            _warningLog,
-            _errorLog,
-            _debugLog);
-        hadTransientFailure |= submitAttempt.HadTransientFailure;
-
-        if (processResult.AbandonedLeases.Count > 0)
+        TomestoneBatchProcessResult processResult;
+        TomestoneResultSubmitAttempt submitAttempt;
+        if (_executionGate != null)
         {
-            await _leaseAbandoner.AbandonLeasesAsync(
-                _configuration,
-                leaseSession.UploadUrl,
-                processResult.AbandonedLeases,
-                cancellationToken,
-                _warningLog,
-                _debugLog);
-            _activeExplicitlyAbandoned.AddRange(processResult.AbandonedLeases);
+            await _executionGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        if (processResult.ShouldAbandonRemainingLeases || processResult.HadTransientFailure)
+        try
         {
-            var (abandonReason, failureCode) = processResult.HitRateLimitCooldown
-                ? ("worker_rate_limit_deferred", "tomestone_rate_limited")
-                : processResult.HitApiKeyRejected
-                    ? ("worker_api_key_rejected", "tomestone_api_key_rejected")
-                    : ("worker_transient_failure", "tomestone_transient_failure");
-            await _leaseAbandoner.AbandonUnprocessedLeasesAsync(
+            _activeLeaseSession = leaseSession;
+            _activeProcessedResults = [];
+            _activeExplicitlyAbandoned.Clear();
+
+            processResult = await _batchProcessor.ProcessLeaseSessionAsync(leaseSession, cancellationToken);
+            hadTransientFailure |= processResult.HadTransientFailure;
+            _activeProcessedResults = processResult.ProcessedResults;
+
+            submitAttempt = await _resultSubmitter.TrySubmitResultsAsync(
                 _configuration,
                 leaseSession,
-                jobs,
                 processResult.ProcessedResults,
-                abandonReason,
-                failureCode,
                 cancellationToken,
+                _infoLog,
                 _warningLog,
-                _debugLog,
-                processResult.AbandonedLeases);
-        }
+                _errorLog,
+                _debugLog);
+            hadTransientFailure |= submitAttempt.HadTransientFailure;
 
-        ClearActiveLeaseSession();
+            if (processResult.AbandonedLeases.Count > 0)
+            {
+                await _leaseAbandoner.AbandonLeasesAsync(
+                    _configuration,
+                    leaseSession.UploadUrl,
+                    processResult.AbandonedLeases,
+                    cancellationToken,
+                    _warningLog,
+                    _debugLog);
+                _activeExplicitlyAbandoned.AddRange(processResult.AbandonedLeases);
+            }
+
+            if (processResult.ShouldAbandonRemainingLeases || processResult.HadTransientFailure)
+            {
+                var (abandonReason, failureCode) = processResult.HitRateLimitCooldown
+                    ? ("worker_rate_limit_deferred", "tomestone_rate_limited")
+                    : processResult.HitApiKeyRejected
+                        ? ("worker_api_key_rejected", "tomestone_api_key_rejected")
+                        : ("worker_transient_failure", "tomestone_transient_failure");
+                await _leaseAbandoner.AbandonUnprocessedLeasesAsync(
+                    _configuration,
+                    leaseSession,
+                    jobs,
+                    processResult.ProcessedResults,
+                    abandonReason,
+                    failureCode,
+                    cancellationToken,
+                    _warningLog,
+                    _debugLog,
+                    processResult.AbandonedLeases);
+            }
+
+            ClearActiveLeaseSession();
+        }
+        finally
+        {
+            _executionGate?.Release();
+        }
 
         if (submitAttempt.ShouldUseBaseDelayBeforeNextPoll)
         {

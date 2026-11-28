@@ -23,4 +23,6 @@ internal static class IngestRoutes
     internal static readonly IngestRoute TomestoneJobs = new("/contribute/tomestone/jobs");
     internal static readonly IngestRoute TomestoneResults = new("/contribute/tomestone/results");
     internal static readonly IngestRoute TomestoneLeasesAbandon = new("/contribute/tomestone/leases/abandon");
+    internal static readonly IngestRoute PluginListingsEnrichment = new("/api/plugin/listings-enrichment");
+    internal static readonly IngestRoute PluginPartyEnrichment = new("/api/plugin/party-enrichment");
 }

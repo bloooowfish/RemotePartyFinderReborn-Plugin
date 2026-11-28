@@ -60,10 +60,19 @@ public class Plugin : IDalamudPlugin {
 
     [PluginService]
     internal IDataManager DataManager { get; private init; }
+    [PluginService]
+    internal ITextureProvider TextureProvider { get; private init; }
 
     public Configuration Configuration { get; init; }
     public readonly WindowSystem WindowSystem = new("Remote Party Finder Reborn");
     private ConfigWindow ConfigWindow { get; init; }
+    private PfBrowserWindow PfBrowserWindow { get; init; }
+    private PfDetailWindow PfDetailWindow { get; init; }
+
+    internal PfIconCatalog PfIconCatalog { get; }
+    internal PfEnrichmentClient PfEnrichmentClient { get; }
+    internal PfLocalMirrorStore PfMirrorStore { get; }
+    internal NativePfBridge NativePfBridge { get; }
 
     internal Gatherer Gatherer { get; }
     internal PlayerLocalDatabase PlayerDatabase { get; }
@@ -196,9 +205,50 @@ public class Plugin : IDalamudPlugin {
 
             ValidateGameLogMessageCatalog();
 
+            this.PfIconCatalog = new PfIconCatalog(this.TextureProvider, this.DataManager);
+            this.PfEnrichmentClient = new PfEnrichmentClient(
+                this.Configuration,
+                httpSender: null,
+                workerRegionProvider: this.WorkerRegionProvider,
+                isPluginOperational: () => this.IsPluginOperational,
+                isFFLogsSelfLeaseAvailable: () => this.FFLogsCollector.IsSelfLeaseAvailable,
+                executeFFLogsSelfLeaseAsync: this.FFLogsCollector.ExecuteSelfLeasedJobsAsync,
+                isTomestoneSelfLeaseAvailable: () => this.TomestoneCollector.IsSelfLeaseAvailable,
+                executeTomestoneSelfLeaseAsync: this.TomestoneCollector.ExecuteSelfLeasedJobsAsync,
+                warningLog: message => Log.Warning(message),
+                debugLog: message => Log.Debug(message));
+            _cleanupActions.Push(_ => this.PfEnrichmentClient.Dispose());
+
+            this.PfMirrorStore = new PfLocalMirrorStore(this, this.PfIconCatalog, this.PlayerDatabase, this.PfEnrichmentClient);
+            _cleanupActions.Push(_ => this.PfMirrorStore.Dispose());
+
+            this.NativePfBridge = new NativePfBridge(this, this.PfMirrorStore);
+            _cleanupActions.Push(_ => this.NativePfBridge.Dispose());
+
+            var pfListPane = new PfListPane(
+                this.PfMirrorStore,
+                this.PfIconCatalog,
+                this.NativePfBridge,
+                () => this.Configuration.PfBlockedDisplayMode,
+                mode => {
+                    this.Configuration.PfBlockedDisplayMode = mode;
+                    this.Configuration.Save();
+                },
+                this.PfEnrichmentClient);
+            var pfDetailPane = new PfDetailPane(this.PfMirrorStore, this.PfIconCatalog, this.NativePfBridge, this.PfEnrichmentClient);
+            this.PfDetailWindow = new PfDetailWindow(this, pfDetailPane);
+            _cleanupActions.Push(_ => this.PfDetailWindow.Dispose());
+            this.PfBrowserWindow = new PfBrowserWindow(this, pfListPane, this.PfDetailWindow);
+            _cleanupActions.Push(_ => this.PfBrowserWindow.Dispose());
+
+            this.PartyDetailCaptureRuntime.DetailCaptured += OnPartyDetailCaptured;
+            _cleanupActions.Push(_ => this.PartyDetailCaptureRuntime.DetailCaptured -= OnPartyDetailCaptured);
+
             ConfigWindow = new ConfigWindow(this);
             _cleanupActions.Push(_ => ConfigWindow.Dispose());
             WindowSystem.AddWindow(ConfigWindow);
+            WindowSystem.AddWindow(PfBrowserWindow);
+            WindowSystem.AddWindow(PfDetailWindow);
             _cleanupActions.Push(_ => WindowSystem.RemoveAllWindows());
 
             PluginInterface.UiBuilder.Draw += DrawUI;
@@ -207,7 +257,7 @@ public class Plugin : IDalamudPlugin {
             _cleanupActions.Push(_ => PluginInterface.UiBuilder.OpenConfigUi -= ToggleConfigUI);
 
             CommandManager.AddHandler("/rpr", new CommandInfo(OnCommand) {
-                HelpMessage = "Open config UI. Args: players-upload, players-resync, details-upload"
+                HelpMessage = "Open config UI. Args: ui, players-upload, players-resync, details-upload"
             });
             _cleanupActions.Push(_ => CommandManager.RemoveHandler("/rpr"));
 
@@ -307,6 +357,11 @@ public class Plugin : IDalamudPlugin {
 
     private void OnCommand(string command, string args) {
         var normalizedArgs = (args ?? string.Empty).Trim().ToLowerInvariant();
+        if (normalizedArgs == "ui" || normalizedArgs == "pf") {
+            TogglePfBrowserUI();
+            return;
+        }
+
         if (normalizedArgs == "players-upload") {
             if (!IsPluginOperational) {
                 NotifyLockedAndOpenSettings();
@@ -440,7 +495,23 @@ public class Plugin : IDalamudPlugin {
         return new PartyDetailCaptureComposition(captureState, captureRuntime, collector);
     }
 
+    private void OnPartyDetailCaptured(UploadablePartyDetail detail) {
+        if (Volatile.Read(ref _disposed) != 0 || detail is null || detail.ListingId == 0) {
+            return;
+        }
+
+        this.PfMirrorStore.UpsertLiveDetail(detail);
+        this.NativePfBridge.NotifyDetailCaptured(detail.ListingId);
+        this.PfDetailWindow.NotifyLiveDetailArrived(detail);
+    }
+
+    internal uint? GetLocalPlayerClassJobId() {
+        return this.ObjectTable.LocalPlayer?.ClassJob.RowId;
+    }
+
     public void DrawUI() => WindowSystem.Draw();
 
     public void ToggleConfigUI() => ConfigWindow.Toggle();
+
+    public void TogglePfBrowserUI() => PfBrowserWindow.Toggle();
 }

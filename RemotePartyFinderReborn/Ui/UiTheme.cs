@@ -27,6 +27,66 @@ internal static class UiTheme {
     internal static readonly Vector4 DangerHeaderBg = new(0.30f, 0.14f, 0.15f, 0.95f);
     internal static readonly Vector4 SidebarSelectedBg = new(0.23f, 0.38f, 0.56f, 0.70f);
 
+    internal static readonly Vector4 RoleTank = new(0.27f, 0.51f, 0.90f, 1.0f);
+    internal static readonly Vector4 RoleHealer = new(0.27f, 0.70f, 0.35f, 1.0f);
+    internal static readonly Vector4 RoleDps = new(0.82f, 0.28f, 0.31f, 1.0f);
+    internal static readonly Vector4 RoleAny = new(0.62f, 0.65f, 0.71f, 1.0f);
+    internal static readonly Vector4 RoleCrafter = new(0.58f, 0.44f, 0.86f, 1.0f);
+    internal static readonly Vector4 RoleGatherer = new(0.80f, 0.70f, 0.30f, 1.0f);
+
+    internal static readonly Vector4 RowHoverBg = new(0.19f, 0.23f, 0.30f, 0.85f);
+    internal static readonly Vector4 RowSelectedBg = new(0.20f, 0.31f, 0.46f, 0.85f);
+    internal static readonly Vector4 EligibleHighlight = new(0.98f, 0.82f, 0.28f, 1.0f);
+    internal static readonly Vector4 EligibleSlotBg = new(0.26f, 0.22f, 0.11f, 0.65f);
+    internal static readonly Vector4 BlockedRowBg = new(0.18f, 0.10f, 0.11f, 0.78f);
+    internal static readonly Vector4 BlockedAccentBar = new(0.86f, 0.28f, 0.30f, 0.85f);
+    internal static readonly Vector4 BlockedText = new(0.46f, 0.44f, 0.46f, 1.0f);
+    internal static readonly Vector4 UnopenedRowBg = new(0.10f, 0.11f, 0.14f, 0.62f);
+    internal static readonly Vector4 UnopenedText = new(0.56f, 0.60f, 0.68f, 1.0f);
+    internal static readonly Vector4 UnopenedBadgeBg = new(0.18f, 0.21f, 0.27f, 0.92f);
+    internal static readonly Vector4 UnopenedBadgeFg = new(0.68f, 0.74f, 0.84f, 1.0f);
+    internal static readonly Vector4 PillBg = new(0.20f, 0.23f, 0.29f, 0.92f);
+
+    internal static readonly Vector4 ParseGray = new(0.60f, 0.62f, 0.67f, 1.0f);
+    internal static readonly Vector4 ParseGreen = new(0.12f, 1.00f, 0.00f, 1.0f);
+    internal static readonly Vector4 ParseBlue = new(0.00f, 0.44f, 1.00f, 1.0f);
+    internal static readonly Vector4 ParsePurple = new(0.64f, 0.21f, 0.93f, 1.0f);
+    internal static readonly Vector4 ParseOrange = new(1.00f, 0.50f, 0.00f, 1.0f);
+    internal static readonly Vector4 ParsePink = new(0.89f, 0.41f, 0.66f, 1.0f);
+    internal static readonly Vector4 ParseGold = new(0.90f, 0.80f, 0.50f, 1.0f);
+
+    internal static Vector4 GetParseColor(byte? percentile, bool hidden = false) {
+        if (hidden || !percentile.HasValue) {
+            return Muted;
+        }
+
+        return percentile.Value switch {
+            >= 100 => ParseGold,
+            >= 99 => ParsePink,
+            >= 95 => ParseOrange,
+            >= 75 => ParsePurple,
+            >= 50 => ParseBlue,
+            >= 25 => ParseGreen,
+            _ => ParseGray,
+        };
+    }
+
+    internal static void DrawPillTag(string text, Vector4 bgColor, Vector4 textColor, string? tooltip = null) {
+        var textSize = ImGui.CalcTextSize((ImU8String)text);
+        var padX = 6f;
+        var padY = 2f;
+        var size = new Vector2(textSize.X + (padX * 2f), textSize.Y + (padY * 2f));
+        var pos = ImGui.GetCursorScreenPos();
+        ImGui.Dummy(size);
+        var drawList = ImGui.GetWindowDrawList();
+        var max = new Vector2(pos.X + size.X, pos.Y + size.Y);
+        drawList.AddRectFilled(pos, max, ImGui.GetColorU32(bgColor), 4f);
+        drawList.AddText(new Vector2(pos.X + padX, pos.Y + padY), ImGui.GetColorU32(textColor), (ImU8String)text);
+        if (!string.IsNullOrWhiteSpace(tooltip) && ImGui.IsItemHovered()) {
+            ImGui.SetTooltip(tooltip);
+        }
+    }
+
     internal static Vector4 ToneColor(TomestoneStatusTone tone) => tone switch {
         TomestoneStatusTone.Healthy => Healthy,
         TomestoneStatusTone.Warning => Warning,

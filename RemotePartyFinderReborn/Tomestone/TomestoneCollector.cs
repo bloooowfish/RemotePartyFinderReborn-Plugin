@@ -27,9 +27,19 @@ internal sealed class TomestoneCollector : IDisposable
         public DateTime UtcNow => DateTime.UtcNow;
     }
 
+    private Configuration Configuration { get; set; }
+    private TomestoneCollectorSeams Seams { get; set; }
+    private TomestoneResultSubmitter ResultSubmitter { get; set; }
+    private TomestoneLeaseAbandoner LeaseAbandoner { get; set; }
+    private TomestoneBatchProcessor BatchProcessor { get; set; }
+    private Action<string> InfoLog { get; set; } = static _ => { };
     private Action<string> WarningLog { get; set; } = static _ => { };
+    private Action<string> ErrorLog { get; set; } = static _ => { };
+    private Action<string> DebugLog { get; set; } = static _ => { };
+    private Func<bool> IsPluginOperational { get; set; } = static () => true;
     private TomestoneBackgroundWorker BackgroundWorker { get; set; }
     private IReadOnlyList<IDisposable> OwnedDisposables { get; set; } = [];
+    private readonly SemaphoreSlim _executionGate = new(1, 1);
     private CancellationTokenSource Cts { get; set; } = new();
     private Task _workerTask = Task.CompletedTask;
     private int _shutdownSignaled;
@@ -168,7 +178,16 @@ internal sealed class TomestoneCollector : IDisposable
         bool startWorker,
         Func<bool> isPluginOperational)
     {
+        Configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
+        Seams = seams ?? throw new ArgumentNullException(nameof(seams));
+        ResultSubmitter = resultSubmitter ?? throw new ArgumentNullException(nameof(resultSubmitter));
+        LeaseAbandoner = leaseAbandoner ?? throw new ArgumentNullException(nameof(leaseAbandoner));
+        BatchProcessor = batchProcessor ?? throw new ArgumentNullException(nameof(batchProcessor));
+        InfoLog = infoLog ?? throw new ArgumentNullException(nameof(infoLog));
         WarningLog = warningLog ?? throw new ArgumentNullException(nameof(warningLog));
+        ErrorLog = errorLog ?? throw new ArgumentNullException(nameof(errorLog));
+        DebugLog = debugLog ?? throw new ArgumentNullException(nameof(debugLog));
+        IsPluginOperational = isPluginOperational ?? (static () => true);
         OwnedDisposables = ownedDisposables ?? throw new ArgumentNullException(nameof(ownedDisposables));
         BackgroundWorker = new TomestoneBackgroundWorker(
             configuration,
@@ -180,15 +199,148 @@ internal sealed class TomestoneCollector : IDisposable
             batchProcessor,
             resultSubmitter,
             leaseAbandoner,
-            infoLog,
+            InfoLog,
             WarningLog,
-            errorLog,
-            debugLog,
-            isPluginOperational);
+            ErrorLog,
+            DebugLog,
+            isPluginOperational,
+            _executionGate);
 
         if (startWorker)
         {
             _workerTask = Task.Run(() => BackgroundWorker.RunAsync(Cts.Token));
+        }
+    }
+
+    internal bool IsSelfLeaseAvailable
+    {
+        get
+        {
+            if (Volatile.Read(ref _disposed) != 0 || Volatile.Read(ref _shutdownSignaled) != 0)
+            {
+                return false;
+            }
+
+            if (IsPluginOperational != null && !IsPluginOperational())
+            {
+                return false;
+            }
+
+            if (Configuration == null || Seams == null)
+            {
+                return false;
+            }
+
+            if (!Configuration.EnableTomestoneProgressEnrichment || !Configuration.HasTomestoneApiKeyConfigured)
+            {
+                return false;
+            }
+
+            if (Seams.ApiCredentialStatus.Tomestone.State == ApiCredentialValidationState.Rejected)
+            {
+                return false;
+            }
+
+            return !Seams.ProgressionService.TryGetRateLimitRemaining(out _);
+        }
+    }
+
+    internal async Task<bool> ExecuteSelfLeasedJobsAsync(
+        UploadUrl uploadUrl,
+        IReadOnlyList<TomestoneJob> jobs,
+        CancellationToken cancellationToken)
+    {
+        if (jobs == null || jobs.Count == 0 || !IsSelfLeaseAvailable)
+        {
+            return false;
+        }
+
+        var targetUrl = uploadUrl
+                        ?? ProtectedIngestEndpointExecutor.SelectAvailableUploadUrl(
+                            Configuration,
+                            Seams.TimeProvider.UtcNow,
+                            WarningLog);
+        if (targetUrl == null)
+        {
+            return false;
+        }
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, Cts.Token);
+        var ct = linkedCts.Token;
+
+        await _executionGate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var leaseSession = new TomestoneLeaseSession(
+                targetUrl,
+                jobs is List<TomestoneJob> list ? list : new List<TomestoneJob>(jobs));
+
+            if (!IsSelfLeaseAvailable)
+            {
+                var (reason, code) = Seams.ApiCredentialStatus.Tomestone.State == ApiCredentialValidationState.Rejected
+                    ? ("worker_api_key_rejected", "tomestone_api_key_rejected")
+                    : ("worker_rate_limit_deferred", "tomestone_rate_limited");
+                await LeaseAbandoner.AbandonUnprocessedLeasesAsync(
+                    Configuration,
+                    leaseSession,
+                    leaseSession.Jobs,
+                    [],
+                    reason,
+                    code,
+                    ct,
+                    WarningLog,
+                    DebugLog).ConfigureAwait(false);
+                return false;
+            }
+
+            var processResult = await BatchProcessor.ProcessLeaseSessionAsync(leaseSession, ct).ConfigureAwait(false);
+            var submitAttempt = await ResultSubmitter.TrySubmitResultsAsync(
+                Configuration,
+                leaseSession,
+                processResult.ProcessedResults,
+                ct,
+                InfoLog,
+                WarningLog,
+                ErrorLog,
+                DebugLog).ConfigureAwait(false);
+
+            if (processResult.AbandonedLeases.Count > 0)
+            {
+                await LeaseAbandoner.AbandonLeasesAsync(
+                    Configuration,
+                    leaseSession.UploadUrl,
+                    processResult.AbandonedLeases,
+                    ct,
+                    WarningLog,
+                    DebugLog).ConfigureAwait(false);
+            }
+
+            if (processResult.ShouldAbandonRemainingLeases || processResult.HadTransientFailure)
+            {
+                var (abandonReason, failureCode) = processResult.HitRateLimitCooldown
+                    ? ("worker_rate_limit_deferred", "tomestone_rate_limited")
+                    : processResult.HitApiKeyRejected
+                        ? ("worker_api_key_rejected", "tomestone_api_key_rejected")
+                        : ("worker_transient_failure", "tomestone_transient_failure");
+                await LeaseAbandoner.AbandonUnprocessedLeasesAsync(
+                    Configuration,
+                    leaseSession,
+                    leaseSession.Jobs,
+                    processResult.ProcessedResults,
+                    abandonReason,
+                    failureCode,
+                    ct,
+                    WarningLog,
+                    DebugLog,
+                    processResult.AbandonedLeases).ConfigureAwait(false);
+            }
+
+            return !submitAttempt.HadTransientFailure
+                   && (processResult.ProcessedResults.Count > 0 || processResult.AbandonedLeases.Count > 0);
+        }
+        finally
+        {
+            _executionGate.Release();
         }
     }
 
